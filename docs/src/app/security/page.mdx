@@ -285,6 +285,8 @@ agent-browser --confirm-actions eval,download --confirm-interactive eval "docume
 # Prompts: Allow? [y/N]
 ```
 
+After approval, an ordinary command prints the executed command response rather than the confirmation envelope, and the process exit status reflects that inner result.
+
 Pending confirmations auto-deny after 60 seconds.
 
 > **Non-TTY behavior:** When `--confirm-interactive` is set but stdin is not a TTY (e.g., piped input or running inside an automated pipeline), actions are automatically denied. This prevents accidental approval in non-interactive contexts.

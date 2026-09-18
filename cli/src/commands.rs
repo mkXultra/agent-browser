@@ -2605,6 +2605,25 @@ fn parse_goal(rest: &[&str], id: &str) -> Result<Value, ParseError> {
     Ok(cmd)
 }
 
+/// Parse an already-cleaned `goal` argv without loading configuration or
+/// reading environment-backed defaults. MCP uses this fallible path when it
+/// only needs the effective local goal options for its child timeout.
+pub(crate) fn parse_goal_command_args(args: &[String]) -> Result<Value, ParseError> {
+    let Some(command) = args.first() else {
+        return Err(ParseError::MissingArguments {
+            context: "goal".to_string(),
+            usage: GOAL_USAGE,
+        });
+    };
+    if command != "goal" {
+        return Err(ParseError::UnknownCommand {
+            command: command.clone(),
+        });
+    }
+    let rest: Vec<&str> = args[1..].iter().map(String::as_str).collect();
+    parse_goal(&rest, "goal-options")
+}
+
 fn parse_react(rest: &[&str], id: &str) -> Result<Value, ParseError> {
     const VALID: &[&str] = &["tree", "inspect", "renders", "suspense"];
     let sub = rest.first().copied().ok_or(ParseError::MissingArguments {

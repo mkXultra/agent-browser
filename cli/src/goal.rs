@@ -1,7 +1,8 @@
 //! `agent-browser goal "<text>"`: goal-driven browsing with a System One evaluation model.
 //!
-//! Each step observes the current tab (one `snapshot -c` plus `get url` and
-//! `get title`), turns the accessibility tree into an indexed element table,
+//! Each step observes the current tab (one full `snapshot` plus `get url` and
+//! `get title`), turns the accessibility tree into an indexed element table
+//! and bounded, prioritized page text,
 //! and asks the evaluation model (`typesafe-ai/jev` on Vercel AI Gateway by
 //! default) two typed questions in one request: which operation to run next,
 //! and which element index that operation should target. Only observed
@@ -17,7 +18,7 @@
 //!
 //! The gateway key is read from `AI_GATEWAY_API_KEY`, the same as `chat`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::process::exit;
 use std::time::{Duration, Instant};
 
@@ -39,6 +40,8 @@ pub const DEFAULT_MAX_STEPS: u64 = 40;
 pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 
 const PAGE_TEXT_LIMIT: usize = 6000;
+const DIAGNOSTIC_TEXT_LIMIT: usize = 3000;
+const PARAGRAPH_TEXT_LIMIT: usize = 2000;
 const SCROLL_PX: u32 = 560;
 const WAIT_MS: u64 = 400;
 /// Pause after any action before observing, so animations and focus changes
@@ -151,6 +154,10 @@ pub(crate) struct Element {
     pub expanded: Option<bool>,
     pub selected: bool,
     pub disabled: bool,
+    /// Snapshot cursor classification for nonstandard DOM controls.
+    pub cursor_kind: Option<String>,
+    /// Snapshot cursor hints such as `onclick` and `contenteditable`.
+    pub cursor_hints: Vec<String>,
 }
 
 impl Element {
@@ -166,11 +173,25 @@ impl Element {
     }
 
     fn clickable(&self) -> bool {
-        !self.disabled && !NON_TARGET_ROLES.contains(&self.role.as_str())
+        if self.disabled {
+            return false;
+        }
+        let hinted_click = self.cursor_kind.as_deref() == Some("clickable")
+            && self
+                .cursor_hints
+                .iter()
+                .any(|hint| matches!(hint.as_str(), "onclick" | "cursor:pointer"));
+        hinted_click || !NON_TARGET_ROLES.contains(&self.role.as_str())
     }
 
     fn editable(&self) -> bool {
-        !self.disabled && EDITABLE_ROLES.contains(&self.role.as_str())
+        !self.disabled
+            && (EDITABLE_ROLES.contains(&self.role.as_str())
+                || self.cursor_kind.as_deref() == Some("editable")
+                || self
+                    .cursor_hints
+                    .iter()
+                    .any(|hint| hint == "contenteditable"))
     }
 
     /// One compact line for the model's element table. The per-operation
@@ -198,8 +219,16 @@ impl Element {
     }
 }
 
-/// A parsed snapshot line: role, accessible name, bracket attributes, trailing value.
-type SnapshotLine = (String, String, Vec<(String, String)>, Option<String>);
+/// A parsed snapshot line: role, accessible name, attributes, cursor kind,
+/// cursor hints, and trailing value.
+type SnapshotLine = (
+    String,
+    String,
+    Vec<(String, String)>,
+    Option<String>,
+    Vec<String>,
+    Option<String>,
+);
 
 /// Parse one snapshot line of the form `- role "name" [attrs]: value`.
 ///
@@ -254,18 +283,104 @@ fn parse_snapshot_line(line: &str) -> Option<SnapshotLine> {
         rest = after_bracket[end + 1..].trim_start();
     }
 
+    let mut cursor_kind = None;
+    let mut cursor_hints = Vec::new();
+    for kind in ["clickable", "focusable", "editable"] {
+        if let Some(after_kind) = rest.strip_prefix(kind) {
+            let after_kind = after_kind.trim_start();
+            if let Some(after_bracket) = after_kind.strip_prefix('[') {
+                let end = after_bracket.find(']')?;
+                cursor_kind = Some(kind.to_string());
+                cursor_hints = after_bracket[..end]
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|hint| !hint.is_empty())
+                    .map(ToString::to_string)
+                    .collect();
+                rest = after_bracket[end + 1..].trim_start();
+            }
+            break;
+        }
+    }
+
     let value = rest.strip_prefix(':').map(|v| v.trim().to_string());
-    Some((role, name, attrs, value))
+    Some((role, name, attrs, cursor_kind, cursor_hints, value))
 }
 
-/// Build the element table and the visible page text from a compact snapshot.
+fn truncate_head_and_tail(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    if limit == 0 {
+        return String::new();
+    }
+    const MARKER: &str = "\n[...]\n";
+    if limit <= MARKER.len() {
+        let mut end = limit;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        return text[..end].to_string();
+    }
+    let available = limit - MARKER.len();
+    let mut head = available / 2;
+    while !text.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = text.len() - (available - head);
+    while !text.is_char_boundary(tail) {
+        tail += 1;
+    }
+    format!("{}{}{}", &text[..head], MARKER, &text[tail..])
+}
+
+fn append_text_group(output: &mut String, lines: &[String], limit: usize) {
+    if lines.is_empty() || output.len() >= PAGE_TEXT_LIMIT || limit == 0 {
+        return;
+    }
+    let available = (PAGE_TEXT_LIMIT - output.len()).min(limit);
+    let fragment = truncate_head_and_tail(&lines.join("\n"), available);
+    if fragment.is_empty() {
+        return;
+    }
+    if !output.is_empty() && output.len() < PAGE_TEXT_LIMIT {
+        output.push('\n');
+    }
+    let remaining = PAGE_TEXT_LIMIT - output.len();
+    output.push_str(&truncate_head_and_tail(&fragment, remaining));
+}
+
+/// Build the element table and bounded visible page text from a snapshot.
+/// Alert, status, and log subtrees are retained first, then paragraph text;
+/// remaining context uses a head-and-tail sample. Exact descendant text that
+/// duplicates a named actionable ancestor is omitted, while diagnostic text
+/// and descriptions under unnamed controls are always eligible for context.
 pub(crate) fn parse_snapshot(snapshot: &str) -> (Vec<Element>, String) {
     let mut elements = Vec::new();
-    let mut text = String::new();
+    let mut diagnostic_text = Vec::new();
+    let mut paragraph_text = Vec::new();
+    let mut ordinary_text = Vec::new();
+    let mut seen_text = HashSet::new();
+    let mut priority_stack: Vec<u8> = Vec::new();
+    let mut actionable_name_stack: Vec<Option<String>> = Vec::new();
     for line in snapshot.lines() {
-        let Some((role, name, attrs, value)) = parse_snapshot_line(line) else {
+        let indentation = line.len() - line.trim_start().len();
+        let depth = indentation / 2;
+        let Some((role, name, attrs, cursor_kind, cursor_hints, value)) = parse_snapshot_line(line)
+        else {
             continue;
         };
+        priority_stack.truncate(depth);
+        actionable_name_stack.truncate(depth);
+        let inherited_priority = priority_stack.last().copied().unwrap_or(0);
+        let own_priority = match role.as_str() {
+            "alert" | "status" | "log" => 2,
+            "paragraph" => 1,
+            _ => 0,
+        };
+        let text_priority = inherited_priority.max(own_priority);
+        priority_stack.push(text_priority);
+
         let attr = |key: &str| {
             attrs
                 .iter()
@@ -273,46 +388,57 @@ pub(crate) fn parse_snapshot(snapshot: &str) -> (Vec<Element>, String) {
                 .map(|(_, v)| v.as_str())
         };
         let ref_id = attr("ref").map(|r| r.to_string());
-        if !name.is_empty() && role != "generic" && text.len() < PAGE_TEXT_LIMIT {
-            if !text.is_empty() {
-                text.push('\n');
+        let mut actionable = false;
+        if let Some(ref_id) = ref_id {
+            let element = Element {
+                index: elements.len() + 1,
+                ref_id,
+                role: role.clone(),
+                name: name.clone(),
+                value: value.clone(),
+                checked: attr("checked").map(|v| v == "true"),
+                expanded: attr("expanded").map(|v| v == "true"),
+                selected: attr("selected").is_some(),
+                disabled: attr("disabled").is_some(),
+                cursor_kind,
+                cursor_hints,
+            };
+            actionable = element.clickable() || element.editable();
+            // Wrappers, text, and disabled controls stay out of the element
+            // table: every offered index must map to a possible action.
+            if actionable {
+                elements.push(element);
             }
-            text.push_str(&name);
-            if let Some(v) = &value {
-                if !v.is_empty() {
-                    text.push_str(": ");
-                    text.push_str(v);
+        }
+        let represented_by_ancestor = !name.is_empty()
+            && actionable_name_stack
+                .iter()
+                .flatten()
+                .any(|element_name| element_name.trim() == name.trim());
+        let represented_by_element = (actionable && !name.is_empty()) || represented_by_ancestor;
+        actionable_name_stack.push((actionable && !name.is_empty()).then(|| name.clone()));
+
+        if (text_priority == 2 || !represented_by_element) && !name.is_empty() && role != "generic"
+        {
+            let mut line = name;
+            if let Some(value) = value.filter(|value| !value.is_empty()) {
+                line.push_str(": ");
+                line.push_str(&value);
+            }
+            if seen_text.insert((text_priority, line.clone())) {
+                match text_priority {
+                    2 => diagnostic_text.push(line),
+                    1 => paragraph_text.push(line),
+                    _ => ordinary_text.push(line),
                 }
             }
         }
-        let Some(ref_id) = ref_id else {
-            continue;
-        };
-        let element = Element {
-            index: elements.len() + 1,
-            ref_id,
-            role,
-            name,
-            value,
-            checked: attr("checked").map(|v| v == "true"),
-            expanded: attr("expanded").map(|v| v == "true"),
-            selected: attr("selected").is_some(),
-            disabled: attr("disabled").is_some(),
-        };
-        // Wrappers, text, and disabled controls stay in the page text but
-        // never in the element table: the model can only act on what it is
-        // offered, and every offered index must map to a possible action.
-        if element.clickable() || element.editable() {
-            elements.push(element);
-        }
     }
-    if text.len() > PAGE_TEXT_LIMIT {
-        let mut cut = PAGE_TEXT_LIMIT;
-        while !text.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        text.truncate(cut);
-    }
+
+    let mut text = String::new();
+    append_text_group(&mut text, &diagnostic_text, DIAGNOSTIC_TEXT_LIMIT);
+    append_text_group(&mut text, &paragraph_text, PARAGRAPH_TEXT_LIMIT);
+    append_text_group(&mut text, &ordinary_text, PAGE_TEXT_LIMIT);
     (elements, text)
 }
 
@@ -449,16 +575,39 @@ impl GoalConfig {
     }
 }
 
-/// Sends parsed CLI words through the normal command pipeline.
-pub(crate) type CommandRunner<'a> = dyn Fn(&[String]) -> Result<Response, String> + 'a;
+/// A command outcome that the goal loop must distinguish from an executed
+/// browser action. Denials and pre-dispatch deadline expiry never become
+/// entries in the executed step history.
+pub(crate) enum CommandRunError {
+    Failed(String),
+    Denied,
+    Timeout,
+}
+
+/// Sends parsed CLI words through the normal command pipeline. The loop's
+/// monotonic deadline is supplied so confirmation handling can reject an
+/// approval received after the goal budget expired.
+pub(crate) type CommandRunner<'a> =
+    dyn Fn(&[String], Instant) -> Result<Response, CommandRunError> + 'a;
 
 /// The two model calls the loop makes. Implemented by the gateway client and
 /// by test doubles.
 pub(crate) trait Oracle {
     /// One evaluation request; returns the raw gateway reply.
-    fn evaluate(&self, model: &str, state: &Value, questions: &Value) -> Result<Value, String>;
+    fn evaluate(
+        &self,
+        model: &str,
+        state: &Value,
+        questions: &Value,
+        remaining: Duration,
+    ) -> Result<Value, String>;
     /// The value to type into one field, or `None` when the goal does not say.
-    fn field_text(&self, model: &str, context: &Value) -> Result<Option<String>, String>;
+    fn field_text(
+        &self,
+        model: &str,
+        context: &Value,
+        remaining: Duration,
+    ) -> Result<Option<String>, String>;
 }
 
 struct Gateway {
@@ -488,12 +637,23 @@ impl Gateway {
         })
     }
 
-    fn post(&self, path: &str, headers: &[(&str, &str)], body: &Value) -> Result<Value, String> {
+    fn post(
+        &self,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &Value,
+        budget: Duration,
+    ) -> Result<Value, String> {
         let url = format!("{}{}", self.url, path);
         let client = chat::http_client();
         self.runtime.block_on(async {
+            let deadline = tokio::time::Instant::now() + budget;
             let mut attempt = 0;
             loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err("Goal time budget expired during model request".to_string());
+                }
                 let mut request = client
                     .post(&url)
                     .header("Authorization", format!("Bearer {}", self.api_key))
@@ -503,14 +663,19 @@ impl Gateway {
                 }
                 let response = request
                     .body(body.to_string())
-                    .timeout(Duration::from_secs(25))
+                    .timeout(remaining.min(Duration::from_secs(25)))
                     .send()
                     .await
                     .map_err(|e| format!("Gateway request failed: {}", e))?;
                 let status = response.status();
                 if matches!(status.as_u16(), 429 | 503 | 529) && attempt < 2 {
                     attempt += 1;
-                    tokio::time::sleep(Duration::from_millis(500 * (1 << attempt))).await;
+                    let backoff = Duration::from_millis(500 * (1 << attempt));
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining <= backoff {
+                        return Err("Goal time budget expired during model retry".to_string());
+                    }
+                    tokio::time::sleep(backoff).await;
                     continue;
                 }
                 let text = response
@@ -543,7 +708,13 @@ impl Gateway {
 impl Oracle for Gateway {
     /// Ask the evaluation model one request with an operation head and one
     /// target head per supported operation.
-    fn evaluate(&self, model: &str, state: &Value, questions: &Value) -> Result<Value, String> {
+    fn evaluate(
+        &self,
+        model: &str,
+        state: &Value,
+        questions: &Value,
+        remaining: Duration,
+    ) -> Result<Value, String> {
         let headers = [
             ("ai-gateway-protocol-version", EVAL_PROTOCOL_VERSION),
             ("ai-gateway-auth-method", "api-key"),
@@ -557,11 +728,17 @@ impl Oracle for Gateway {
             "/v4/ai/evaluation-model",
             &headers,
             &json!({ "state": state, "questions": questions }),
+            remaining,
         )
     }
 
     /// Ask the text model for the value of one field.
-    fn field_text(&self, model: &str, context: &Value) -> Result<Option<String>, String> {
+    fn field_text(
+        &self,
+        model: &str,
+        context: &Value,
+        remaining: Duration,
+    ) -> Result<Option<String>, String> {
         let body = json!({
             "model": model,
             "max_tokens": 1024,
@@ -572,7 +749,7 @@ impl Oracle for Gateway {
                 { "role": "user", "content": context.to_string() },
             ],
         });
-        let result = self.post("/v1/chat/completions", &[], &body)?;
+        let result = self.post("/v1/chat/completions", &[], &body, remaining)?;
         let content = result
             .get("choices")
             .and_then(|c| c.get(0))
@@ -693,22 +870,85 @@ fn data_str(resp: &Response, key: &str) -> String {
         .to_string()
 }
 
-fn run_or_error(run: &CommandRunner, parts: &[&str]) -> Result<Response, String> {
-    let resp = run(&words(parts))?;
+fn pending_confirmation_data(data: &Value) -> Option<&Value> {
+    if data
+        .get("confirmation_required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Some(data);
+    }
+    data.get("result")
+        .and_then(|result| result.get("data"))
+        .and_then(pending_confirmation_data)
+}
+
+fn pending_confirmation(resp: &Response) -> Option<Value> {
+    resp.data
+        .as_ref()
+        .and_then(pending_confirmation_data)
+        .cloned()
+}
+
+fn command_result_data(data: Value) -> Value {
+    data.get("result")
+        .and_then(|result| result.get("data"))
+        .cloned()
+        .map(command_result_data)
+        .unwrap_or(data)
+}
+
+fn timeout_error(timeout_ms: u64) -> String {
+    format!("Stopped after {} ms without reaching the goal", timeout_ms)
+}
+
+fn remaining(deadline: Instant) -> Result<Duration, String> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| "Goal time budget expired".to_string())
+}
+
+enum GoalLoopError {
+    Message(String),
+    Confirmation(Value),
+    Denied,
+    Timeout,
+}
+
+fn run_or_error(
+    run: &CommandRunner,
+    parts: &[&str],
+    deadline: Instant,
+) -> Result<Response, GoalLoopError> {
+    remaining(deadline).map_err(GoalLoopError::Message)?;
+    let resp = run(&words(parts), deadline).map_err(|error| match error {
+        CommandRunError::Failed(message) => GoalLoopError::Message(message),
+        CommandRunError::Denied => GoalLoopError::Denied,
+        CommandRunError::Timeout => GoalLoopError::Timeout,
+    })?;
+    remaining(deadline).map_err(GoalLoopError::Message)?;
+    if let Some(pending) = pending_confirmation(&resp) {
+        return Err(GoalLoopError::Confirmation(pending));
+    }
     if !resp.success {
-        return Err(resp
-            .error
-            .clone()
-            .unwrap_or_else(|| format!("{} failed", parts.join(" "))));
+        return Err(GoalLoopError::Message(
+            resp.error
+                .clone()
+                .unwrap_or_else(|| format!("{} failed", parts.join(" "))),
+        ));
     }
     Ok(resp)
 }
 
-fn observe(run: &CommandRunner) -> Result<Page, String> {
-    let snapshot = run_or_error(run, &["snapshot", "-c"])?;
+fn observe(run: &CommandRunner, deadline: Instant) -> Result<Page, GoalLoopError> {
+    // Use the full accessibility snapshot so ordinary StaticText, including
+    // validation and success messages, is eligible for the bounded,
+    // prioritized text selection. All actionable refs are retained.
+    let snapshot = run_or_error(run, &["snapshot"], deadline)?;
     let tree = data_str(&snapshot, "snapshot");
-    let url = data_str(&run_or_error(run, &["get", "url"])?, "url");
-    let title = data_str(&run_or_error(run, &["get", "title"])?, "title");
+    let url = data_str(&run_or_error(run, &["get", "url"], deadline)?, "url");
+    let title = data_str(&run_or_error(run, &["get", "title"], deadline)?, "title");
     let (elements, text) = parse_snapshot(&tree);
     Ok(Page {
         fingerprint: fingerprint(&url, &tree),
@@ -725,9 +965,17 @@ fn observe(run: &CommandRunner) -> Result<Page, String> {
 /// small polls, for autocomplete suggestions (`option` elements) to appear,
 /// because a typed query usually needs its suggestion selected next and an
 /// observation taken before the list opens would hide that choice.
-fn settle_and_observe(run: &CommandRunner, operation: &str) -> Result<Page, String> {
-    let _ = run_or_error(run, &["wait", &SETTLE_MS.to_string()]);
-    let mut page = observe(run)?;
+fn settle_and_observe(
+    run: &CommandRunner,
+    operation: &str,
+    deadline: Instant,
+) -> Result<Page, GoalLoopError> {
+    let wait_ms = remaining(deadline)
+        .map_err(GoalLoopError::Message)?
+        .as_millis()
+        .min(SETTLE_MS as u128) as u64;
+    std::thread::sleep(Duration::from_millis(wait_ms));
+    let mut page = observe(run, deadline)?;
     if operation != "TYPE_TEXT" {
         return Ok(page);
     }
@@ -735,8 +983,12 @@ fn settle_and_observe(run: &CommandRunner, operation: &str) -> Result<Page, Stri
     while !page.elements.iter().any(|e| e.role == "option")
         && started.elapsed() < Duration::from_millis(SUGGESTION_WAIT_MS)
     {
-        let _ = run_or_error(run, &["wait", &SUGGESTION_POLL_MS.to_string()]);
-        page = observe(run)?;
+        let wait_ms = remaining(deadline)
+            .map_err(GoalLoopError::Message)?
+            .as_millis()
+            .min(SUGGESTION_POLL_MS as u128) as u64;
+        std::thread::sleep(Duration::from_millis(wait_ms));
+        page = observe(run, deadline)?;
     }
     Ok(page)
 }
@@ -907,6 +1159,7 @@ fn decide(
     config: &GoalConfig,
     page: &Page,
     history: &[Step],
+    deadline: Instant,
 ) -> Result<Decision, String> {
     let (state, questions, targets) = build_request(&config.goal, page, history);
     if config.debug {
@@ -919,7 +1172,7 @@ fn decide(
         eprintln!("[goal] request body: {}", body);
     }
     let started = Instant::now();
-    let result = gateway.evaluate(&config.eval_model, &state, &questions);
+    let result = gateway.evaluate(&config.eval_model, &state, &questions, remaining(deadline)?);
     if config.debug {
         match &result {
             Ok(r) => eprintln!("[goal] reply: {}", r),
@@ -927,6 +1180,7 @@ fn decide(
         }
     }
     let result = result?;
+    remaining(deadline)?;
     let model_ms = started.elapsed().as_millis();
     let answers = result
         .get("answers")
@@ -996,6 +1250,8 @@ pub(crate) struct GoalOutcome {
     pub stale_decisions: usize,
     pub elapsed_ms: u128,
     pub error: Option<String>,
+    /// Normalized pending confirmation data when an action was not executed.
+    pub confirmation: Option<Value>,
 }
 
 /// Drive the browser toward `config.goal`, reporting each step through `on_step`.
@@ -1008,17 +1264,63 @@ pub(crate) fn run_goal_loop(
     let started = Instant::now();
     let deadline = started + Duration::from_millis(config.timeout_ms);
     let mut history: Vec<Step> = Vec::new();
-    let mut page = match observe(run) {
+    let mut page = match observe(run, deadline) {
         Ok(p) => p,
-        Err(e) => {
+        Err(GoalLoopError::Confirmation(pending)) => {
+            let confirmation_id = pending
+                .get("confirmation_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
             return GoalOutcome {
-                status: "error".into(),
+                status: "confirmation_required".into(),
                 url: String::new(),
                 steps: Vec::new(),
                 stale_decisions: 0,
                 elapsed_ms: started.elapsed().as_millis(),
-                error: Some(e),
-            }
+                error: Some(format!(
+                    "A goal observation requires confirmation. Run `agent-browser confirm {}` or `agent-browser deny {}`.",
+                    confirmation_id, confirmation_id
+                )),
+                confirmation: Some(pending),
+            };
+        }
+        Err(GoalLoopError::Denied) => {
+            return GoalOutcome {
+                status: "denied".into(),
+                url: String::new(),
+                steps: Vec::new(),
+                stale_decisions: 0,
+                elapsed_ms: started.elapsed().as_millis(),
+                error: Some("Action denied; no pending goal action was executed".into()),
+                confirmation: None,
+            };
+        }
+        Err(GoalLoopError::Timeout) => {
+            return GoalOutcome {
+                status: "timeout".into(),
+                url: String::new(),
+                steps: Vec::new(),
+                stale_decisions: 0,
+                elapsed_ms: started.elapsed().as_millis(),
+                error: Some(timeout_error(config.timeout_ms)),
+                confirmation: None,
+            };
+        }
+        Err(GoalLoopError::Message(e)) => {
+            let timed_out = Instant::now() >= deadline;
+            return GoalOutcome {
+                status: if timed_out { "timeout" } else { "error" }.into(),
+                url: String::new(),
+                steps: Vec::new(),
+                stale_decisions: 0,
+                elapsed_ms: started.elapsed().as_millis(),
+                error: Some(if timed_out {
+                    timeout_error(config.timeout_ms)
+                } else {
+                    e
+                }),
+                confirmation: None,
+            };
         }
     };
 
@@ -1033,8 +1335,27 @@ pub(crate) fn run_goal_loop(
                 stale_decisions: stale,
                 elapsed_ms: started.elapsed().as_millis(),
                 error,
+                confirmation: None,
             }
         };
+    let finish_confirmation = |page: &Page, history: &[Step], stale: usize, pending: Value| {
+        let confirmation_id = pending
+            .get("confirmation_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        GoalOutcome {
+                status: "confirmation_required".into(),
+                url: page.url.clone(),
+                steps: history.iter().map(Step::to_json).collect(),
+                stale_decisions: stale,
+                elapsed_ms: started.elapsed().as_millis(),
+                error: Some(format!(
+                    "The next goal command requires confirmation and was not executed. Run `agent-browser confirm {}` or `agent-browser deny {}`.",
+                    confirmation_id, confirmation_id
+                )),
+                confirmation: Some(pending),
+            }
+    };
 
     loop {
         if Instant::now() >= deadline {
@@ -1049,20 +1370,34 @@ pub(crate) fn run_goal_loop(
                 )),
             );
         }
-        if history.len() as u64 >= config.max_steps {
+        // The action budget is checked after this evaluation. This permits a
+        // final DONE or BLOCKED assessment after action N, but action N+1 is
+        // never executed.
+        let decision = match decide(gateway, config, &page, &history, deadline) {
+            Ok(d) => d,
+            Err(e) => {
+                if Instant::now() >= deadline {
+                    return finish(
+                        "timeout",
+                        &page,
+                        &history,
+                        stale_total,
+                        Some(timeout_error(config.timeout_ms)),
+                    );
+                }
+                return finish("error", &page, &history, stale_total, Some(e));
+            }
+        };
+
+        if Instant::now() >= deadline {
             return finish(
-                "blocked",
+                "timeout",
                 &page,
                 &history,
                 stale_total,
-                Some(format!("Stopped at the {}-step budget", config.max_steps)),
+                Some(timeout_error(config.timeout_ms)),
             );
         }
-
-        let decision = match decide(gateway, config, &page, &history) {
-            Ok(d) => d,
-            Err(e) => return finish("error", &page, &history, stale_total, Some(e)),
-        };
 
         match decision.operation.as_str() {
             "DONE" => return finish("done", &page, &history, stale_total, None),
@@ -1076,6 +1411,16 @@ pub(crate) fn run_goal_loop(
                 )
             }
             _ => {}
+        }
+
+        if history.len() as u64 >= config.max_steps {
+            return finish(
+                "blocked",
+                &page,
+                &history,
+                stale_total,
+                Some(format!("Stopped at the {}-step budget", config.max_steps)),
+            );
         }
 
         let target = decision
@@ -1102,7 +1447,22 @@ pub(crate) fn run_goal_loop(
                 "recent_actions": history.iter().rev().take(6).rev().map(|h| json!({ "action": h.action_label(), "text": h.text })).collect::<Vec<_>>(),
             });
             let started_text = Instant::now();
-            match gateway.field_text(&config.text_model, &context) {
+            match gateway.field_text(
+                &config.text_model,
+                &context,
+                match remaining(deadline) {
+                    Ok(remaining) => remaining,
+                    Err(_) => {
+                        return finish(
+                            "timeout",
+                            &page,
+                            &history,
+                            stale_total,
+                            Some(timeout_error(config.timeout_ms)),
+                        )
+                    }
+                },
+            ) {
                 Ok(Some(value)) => text = Some(value),
                 Ok(None) => {
                     return finish(
@@ -1116,10 +1476,30 @@ pub(crate) fn run_goal_loop(
                         )),
                     )
                 }
-                Err(e) => return finish("error", &page, &history, stale_total, Some(e)),
+                Err(e) => {
+                    if Instant::now() >= deadline {
+                        return finish(
+                            "timeout",
+                            &page,
+                            &history,
+                            stale_total,
+                            Some(timeout_error(config.timeout_ms)),
+                        );
+                    }
+                    return finish("error", &page, &history, stale_total, Some(e));
+                }
             }
             text_ms = started_text.elapsed().as_millis();
             text_model = Some(config.text_model.clone());
+            if Instant::now() >= deadline {
+                return finish(
+                    "timeout",
+                    &page,
+                    &history,
+                    stale_total,
+                    Some(timeout_error(config.timeout_ms)),
+                );
+            }
         }
 
         let command: Vec<String> = match (decision.operation.as_str(), &target) {
@@ -1143,8 +1523,17 @@ pub(crate) fn run_goal_loop(
             }
         };
 
+        if Instant::now() >= deadline {
+            return finish(
+                "timeout",
+                &page,
+                &history,
+                stale_total,
+                Some(timeout_error(config.timeout_ms)),
+            );
+        }
         let started_execute = Instant::now();
-        let executed = run(&command);
+        let executed = run(&command, deadline);
         let execute_ms = started_execute.elapsed().as_millis();
         let mut step = Step {
             step: history.len() + 1,
@@ -1161,23 +1550,94 @@ pub(crate) fn run_goal_loop(
             page_changed: None,
             url: page.url.clone(),
         };
+        let mut action_response = None;
         let failure = match executed {
-            Ok(resp) if resp.success => None,
+            Ok(resp) if pending_confirmation(&resp).is_some() => {
+                let pending = pending_confirmation(&resp).unwrap();
+                return finish_confirmation(&page, &history, stale_total, pending);
+            }
+            Ok(resp) if resp.success => {
+                action_response = resp.data.map(command_result_data);
+                None
+            }
             Ok(resp) => Some(
                 resp.error
                     .unwrap_or_else(|| format!("{} failed", command.join(" "))),
             ),
-            Err(e) => Some(e),
+            Err(CommandRunError::Denied) => {
+                return finish(
+                    "denied",
+                    &page,
+                    &history,
+                    stale_total,
+                    Some("Action denied; the pending goal action was not executed".into()),
+                );
+            }
+            Err(CommandRunError::Timeout) => {
+                return finish(
+                    "timeout",
+                    &page,
+                    &history,
+                    stale_total,
+                    Some(timeout_error(config.timeout_ms)),
+                );
+            }
+            Err(CommandRunError::Failed(error)) => Some(error),
         };
+        if Instant::now() >= deadline {
+            if failure.is_none() {
+                history.push(step.clone());
+                on_step(&step);
+            }
+            return finish(
+                "timeout",
+                &page,
+                &history,
+                stale_total,
+                Some(timeout_error(config.timeout_ms)),
+            );
+        }
         if let Some(error) = failure {
             if is_stale_error(&error) && stale_run < MAX_STALE_DECISIONS {
                 // The target moved between snapshot and action. Nothing was
                 // executed, so observe again and let the model decide afresh.
                 stale_run += 1;
                 stale_total += 1;
-                page = match observe(run) {
+                page = match observe(run, deadline) {
                     Ok(p) => p,
-                    Err(e) => return finish("error", &page, &history, stale_total, Some(e)),
+                    Err(GoalLoopError::Confirmation(pending)) => {
+                        return finish_confirmation(&page, &history, stale_total, pending);
+                    }
+                    Err(GoalLoopError::Denied) => {
+                        return finish(
+                            "denied",
+                            &page,
+                            &history,
+                            stale_total,
+                            Some("Action denied; no pending goal action was executed".into()),
+                        );
+                    }
+                    Err(GoalLoopError::Timeout) => {
+                        return finish(
+                            "timeout",
+                            &page,
+                            &history,
+                            stale_total,
+                            Some(timeout_error(config.timeout_ms)),
+                        );
+                    }
+                    Err(GoalLoopError::Message(e)) => {
+                        if Instant::now() >= deadline {
+                            return finish(
+                                "timeout",
+                                &page,
+                                &history,
+                                stale_total,
+                                Some(timeout_error(config.timeout_ms)),
+                            );
+                        }
+                        return finish("error", &page, &history, stale_total, Some(e));
+                    }
                 };
                 continue;
             }
@@ -1187,15 +1647,56 @@ pub(crate) fn run_goal_loop(
         }
         stale_run = 0;
 
-        let next = match settle_and_observe(run, &decision.operation) {
+        let next = match settle_and_observe(run, &decision.operation, deadline) {
             Ok(p) => p,
-            Err(e) => {
+            Err(GoalLoopError::Confirmation(pending)) => {
                 history.push(step.clone());
                 on_step(&step);
+                return finish_confirmation(&page, &history, stale_total, pending);
+            }
+            Err(GoalLoopError::Denied) => {
+                history.push(step.clone());
+                on_step(&step);
+                return finish(
+                    "denied",
+                    &page,
+                    &history,
+                    stale_total,
+                    Some("Action denied during observation; no later action was executed".into()),
+                );
+            }
+            Err(GoalLoopError::Timeout) => {
+                history.push(step.clone());
+                on_step(&step);
+                return finish(
+                    "timeout",
+                    &page,
+                    &history,
+                    stale_total,
+                    Some(timeout_error(config.timeout_ms)),
+                );
+            }
+            Err(GoalLoopError::Message(e)) => {
+                history.push(step.clone());
+                on_step(&step);
+                if Instant::now() >= deadline {
+                    return finish(
+                        "timeout",
+                        &page,
+                        &history,
+                        stale_total,
+                        Some(timeout_error(config.timeout_ms)),
+                    );
+                }
                 return finish("error", &page, &history, stale_total, Some(e));
             }
         };
-        step.page_changed = Some(next.fingerprint != page.fingerprint);
+        let scroll_moved = action_response
+            .as_ref()
+            .and_then(|data| data.get("moved"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        step.page_changed = Some(next.fingerprint != page.fingerprint || scroll_moved);
         step.url = next.url.clone();
         on_step(&step);
         history.push(step);
@@ -1260,6 +1761,7 @@ pub fn run_goal(flags: &Flags, _daemon_opts: &DaemonOptions, cmd: &Value, run: &
 
     let success = outcome.status == "done";
     if json_mode {
+        let confirmation = outcome.confirmation.clone();
         println!(
             "{}",
             json!({
@@ -1272,6 +1774,12 @@ pub fn run_goal(flags: &Flags, _daemon_opts: &DaemonOptions, cmd: &Value, run: &
                     "staleDecisions": outcome.stale_decisions,
                     "model": config.eval_model,
                     "textModel": config.text_model,
+                    "confirmation_required": confirmation.is_some(),
+                    "confirmation_id": confirmation.as_ref().and_then(|c| c.get("confirmation_id")).and_then(Value::as_str),
+                    "action": confirmation.as_ref().and_then(|c| c.get("action")).and_then(Value::as_str),
+                    "category": confirmation.as_ref().and_then(|c| c.get("category")).and_then(Value::as_str),
+                    "description": confirmation.as_ref().and_then(|c| c.get("description")).and_then(Value::as_str),
+                    "confirmation": confirmation,
                 },
                 "error": outcome.error,
             })
@@ -1295,6 +1803,24 @@ pub fn run_goal(flags: &Flags, _daemon_opts: &DaemonOptions, cmd: &Value, run: &
         );
         if !outcome.url.is_empty() {
             eprintln!("  {}", outcome.url);
+        }
+        if let Some(confirmation) = outcome.confirmation {
+            let action = confirmation
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let description = confirmation
+                .get("description")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(action);
+            let confirmation_id = confirmation
+                .get("confirmation_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            eprintln!("  Confirmation required: {}", description);
+            eprintln!("  Run: agent-browser confirm {}", confirmation_id);
+            eprintln!("  Or:  agent-browser deny {}", confirmation_id);
         }
     }
     if !success {
@@ -1352,7 +1878,10 @@ mod tests {
         );
         assert!(text.contains("Flights"), "heading text is still context");
         assert!(text.contains("Find and book cheap flights"));
-        assert!(text.contains("Where to? : London"));
+        assert!(
+            !text.contains("Where to?"),
+            "actionable labels are already present in the element table"
+        );
     }
 
     #[test]
@@ -1369,6 +1898,107 @@ mod tests {
             all.is_empty(),
             "headings, disabled controls, and containers are never targets"
         );
+    }
+
+    #[test]
+    fn cursor_hints_make_only_genuinely_actionable_nonstandard_elements_targets() {
+        let snapshot = r#"- generic "Custom action" [ref=e1] clickable [onclick]
+- gridcell "September 23" [ref=e2] clickable [cursor:pointer]
+- generic "Focus wrapper" [ref=e3] focusable [tabindex]
+- generic "Disabled action" [disabled, ref=e4] clickable [onclick]
+- generic "Notes" [ref=e5] editable [tabindex, contenteditable]: draft
+- paragraph "Wrapper" [ref=e6]
+"#;
+        let (elements, _) = parse_snapshot(snapshot);
+        let refs: Vec<&str> = elements
+            .iter()
+            .map(|element| element.ref_id.as_str())
+            .collect();
+        assert_eq!(refs, vec!["e1", "e2", "e5"]);
+        let notes = elements
+            .iter()
+            .find(|element| element.ref_id == "e5")
+            .unwrap();
+        assert!(notes.editable());
+        assert_eq!(notes.value.as_deref(), Some("draft"));
+        assert_eq!(notes.cursor_hints, vec!["tabindex", "contenteditable"]);
+    }
+
+    #[test]
+    fn full_snapshot_text_preserves_validation_and_success_messages() {
+        // These are the ordinary StaticText lines emitted by render_tree.
+        // compact_tree drops them because they have neither a ref nor a value.
+        let snapshot = "- paragraph\n  - StaticText \"Invalid email\"\n- status\n  - StaticText \"Submission successful\"\n";
+        let (_, text) = parse_snapshot(snapshot);
+        assert!(text.contains("Invalid email"));
+        assert!(text.contains("Submission successful"));
+    }
+
+    #[test]
+    fn diagnostic_text_survives_long_actionable_navigation() {
+        let mut snapshot: String = (1..=250)
+            .map(|i| {
+                format!(
+                    "- link \"Navigation item {i} with a deliberately long repeated label\" [ref=e{i}]\n"
+                )
+            })
+            .collect();
+        assert!(snapshot.len() > PAGE_TEXT_LIMIT);
+        snapshot.push_str("- status\n  - StaticText \"Invalid email\"\n");
+
+        let (elements, text) = parse_snapshot(&snapshot);
+
+        assert_eq!(elements.len(), 250);
+        assert!(text.contains("Invalid email"));
+        assert!(
+            !text.contains("Navigation item"),
+            "control labels must not consume the separate page-text budget"
+        );
+        assert!(text.len() <= PAGE_TEXT_LIMIT);
+    }
+
+    #[test]
+    fn actionable_ancestor_suppression_keeps_descriptions_and_diagnostics() {
+        let snapshot = r#"- generic [ref=e1] clickable [cursor:pointer]
+  - StaticText "Zurich to London"
+  - StaticText "CHF 128, 1 stop"
+- generic "Dismiss" [ref=e2] clickable [onclick]
+  - status
+    - StaticText "Invalid email"
+  - alert
+    - StaticText "Payment failed"
+- link "Pricing" [ref=e3]
+  - StaticText "Pricing"
+"#;
+
+        let (elements, text) = parse_snapshot(snapshot);
+
+        assert_eq!(elements.len(), 3);
+        assert!(text.contains("Zurich to London"));
+        assert!(text.contains("CHF 128, 1 stop"));
+        assert!(text.contains("Invalid email"));
+        assert!(text.contains("Payment failed"));
+        assert!(!text.lines().any(|line| line == "Pricing"));
+    }
+
+    #[test]
+    fn prioritized_page_text_remains_within_the_total_budget() {
+        let diagnostic = format!("diagnostic-head-{}-diagnostic-tail", "d".repeat(7000));
+        let paragraph = format!("paragraph-head-{}-paragraph-tail", "p".repeat(5000));
+        let ordinary = format!("ordinary-head-{}-ordinary-tail", "o".repeat(5000));
+        let snapshot = format!(
+            "- status\n  - StaticText \"{diagnostic}\"\n- paragraph\n  - StaticText \"{paragraph}\"\n- StaticText \"{ordinary}\"\n"
+        );
+
+        let (_, text) = parse_snapshot(&snapshot);
+
+        assert_eq!(text.len(), PAGE_TEXT_LIMIT);
+        assert!(text.contains("diagnostic-head"));
+        assert!(text.contains("diagnostic-tail"));
+        assert!(text.contains("paragraph-head"));
+        assert!(text.contains("paragraph-tail"));
+        assert!(text.contains("ordinary-head"));
+        assert!(text.contains("ordinary-tail"));
     }
 
     #[test]
@@ -1541,6 +2171,7 @@ mod tests {
         pages: Vec<&'static str>,
         served: std::cell::Cell<usize>,
         commands: std::cell::RefCell<Vec<String>>,
+        requests: std::cell::RefCell<Vec<String>>,
         fail_on: Option<&'static str>,
         fail_error: &'static str,
     }
@@ -1551,14 +2182,16 @@ mod tests {
                 pages,
                 served: std::cell::Cell::new(0),
                 commands: std::cell::RefCell::new(Vec::new()),
+                requests: std::cell::RefCell::new(Vec::new()),
                 fail_on: None,
                 fail_error: "Could not locate element",
             }
         }
 
-        fn runner(&self) -> impl Fn(&[String]) -> Result<Response, String> + '_ {
-            move |w: &[String]| {
+        fn runner(&self) -> impl Fn(&[String], Instant) -> Result<Response, CommandRunError> + '_ {
+            move |w: &[String], _deadline: Instant| {
                 let joined = w.join(" ");
+                self.requests.borrow_mut().push(joined.clone());
                 let ok = |data: Value| {
                     Ok(Response {
                         success: true,
@@ -1604,6 +2237,8 @@ mod tests {
             std::cell::RefCell<std::collections::VecDeque<(&'static str, Option<&'static str>)>>,
         text: Result<Option<String>, String>,
         seen: std::cell::RefCell<Vec<Value>>,
+        evaluate_delay: Duration,
+        text_delay: Duration,
     }
 
     impl FakeOracle {
@@ -1612,6 +2247,8 @@ mod tests {
                 answers: std::cell::RefCell::new(answers.into()),
                 text: Ok(Some("Zurich".into())),
                 seen: std::cell::RefCell::new(Vec::new()),
+                evaluate_delay: Duration::ZERO,
+                text_delay: Duration::ZERO,
             }
         }
     }
@@ -1622,7 +2259,9 @@ mod tests {
             _model: &str,
             state: &Value,
             questions: &Value,
+            _remaining: Duration,
         ) -> Result<Value, String> {
+            std::thread::sleep(self.evaluate_delay);
             self.seen.borrow_mut().push(state.clone());
             let (operation, target) = self
                 .answers
@@ -1681,7 +2320,13 @@ mod tests {
             )
         }
 
-        fn field_text(&self, _model: &str, _context: &Value) -> Result<Option<String>, String> {
+        fn field_text(
+            &self,
+            _model: &str,
+            _context: &Value,
+            _remaining: Duration,
+        ) -> Result<Option<String>, String> {
+            std::thread::sleep(self.text_delay);
             self.text.clone()
         }
     }
@@ -1734,6 +2379,21 @@ mod tests {
     }
 
     #[test]
+    fn loop_observes_full_snapshot_text_instead_of_compact_snapshot() {
+        let page = "- paragraph\n  - StaticText \"Invalid email\"\n- button \"Retry\" [ref=e1]\n";
+        let daemon = FakeDaemon::new(vec![page]);
+        let oracle = FakeOracle::new(vec![("DONE", None)]);
+        let outcome = run_goal_loop(&config("fix email"), &oracle, &daemon.runner(), |_| {});
+
+        assert_eq!(outcome.status, "done");
+        assert_eq!(daemon.requests.borrow().first().unwrap(), "snapshot");
+        assert!(oracle.seen.borrow()[0]["page"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Invalid email"));
+    }
+
+    #[test]
     fn loop_reports_blocked_when_the_model_says_so() {
         let daemon = FakeDaemon::new(vec![FORM]);
         let oracle = FakeOracle::new(vec![("BLOCKED", None)]);
@@ -1743,12 +2403,173 @@ mod tests {
     }
 
     #[test]
+    fn loop_stops_on_pending_confirmation_without_recording_or_observing_again() {
+        let daemon = FakeDaemon::new(vec![FORM]);
+        let oracle = FakeOracle::new(vec![("CLICK", Some("2"))]);
+        let runner = |words: &[String], deadline: Instant| {
+            if words.first().map(String::as_str) == Some("click") {
+                return Ok(Response {
+                    success: true,
+                    data: Some(json!({
+                        "confirmation_required": true,
+                        "confirmation_id": "confirm-1",
+                        "action": "click"
+                    })),
+                    error: None,
+                    code: None,
+                    warning: None,
+                });
+            }
+            daemon.runner()(words, deadline)
+        };
+        let outcome = run_goal_loop(&config("fly"), &oracle, &runner, |_| {});
+
+        assert_eq!(outcome.status, "confirmation_required");
+        assert!(outcome.steps.is_empty());
+        assert_eq!(
+            outcome.confirmation.unwrap()["confirmation_id"],
+            "confirm-1"
+        );
+        assert_eq!(daemon.served.get(), 0, "pending action was not executed");
+    }
+
+    #[test]
+    fn denied_confirmation_is_not_recorded_as_an_executed_step() {
+        let daemon = FakeDaemon::new(vec![FORM]);
+        let oracle = FakeOracle::new(vec![("CLICK", Some("2"))]);
+        let runner = |words: &[String], deadline: Instant| {
+            if words.first().map(String::as_str) == Some("click") {
+                return Err(CommandRunError::Denied);
+            }
+            daemon.runner()(words, deadline)
+        };
+        let mut emitted_steps = 0;
+
+        let outcome = run_goal_loop(&config("fly"), &oracle, &runner, |_| emitted_steps += 1);
+
+        assert_eq!(outcome.status, "denied");
+        assert!(outcome.steps.is_empty());
+        assert_eq!(emitted_steps, 0);
+        assert!(outcome.error.unwrap().contains("not executed"));
+        assert_eq!(daemon.served.get(), 0);
+    }
+
+    #[test]
+    fn confirmation_timeout_is_not_recorded_as_an_executed_step() {
+        let daemon = FakeDaemon::new(vec![FORM]);
+        let oracle = FakeOracle::new(vec![("CLICK", Some("2"))]);
+        let runner = |words: &[String], deadline: Instant| {
+            if words.first().map(String::as_str) == Some("click") {
+                assert!(deadline > Instant::now());
+                return Err(CommandRunError::Timeout);
+            }
+            daemon.runner()(words, deadline)
+        };
+
+        let outcome = run_goal_loop(&config("fly"), &oracle, &runner, |_| {});
+
+        assert_eq!(outcome.status, "timeout");
+        assert!(outcome.steps.is_empty());
+        assert_eq!(daemon.served.get(), 0);
+    }
+
+    #[test]
+    fn nested_confirmation_payloads_are_detected() {
+        let resp = Response {
+            success: true,
+            data: Some(json!({
+                "result": { "data": {
+                    "confirmation_required": true,
+                    "confirmation_id": "nested-1",
+                    "action": "plugin.run"
+                }}
+            })),
+            error: None,
+            code: None,
+            warning: None,
+        };
+        assert_eq!(
+            pending_confirmation(&resp).unwrap()["confirmation_id"],
+            "nested-1"
+        );
+    }
+
+    #[test]
     fn loop_stops_after_three_actions_that_do_not_change_the_page() {
         let daemon = FakeDaemon::new(vec![FORM]);
         let oracle = FakeOracle::new(vec![("CLICK", Some("2")); 4]);
         let outcome = run_goal_loop(&config("fly"), &oracle, &daemon.runner(), |_| {});
         assert_eq!(outcome.status, "blocked");
         assert_eq!(daemon.commands.borrow().len(), 3);
+        assert!(outcome.error.unwrap().contains("did not change"));
+    }
+
+    #[test]
+    fn repeated_scrolls_with_real_movement_do_not_trigger_stall_protection() {
+        let commands = std::cell::RefCell::new(Vec::new());
+        let runner = |words: &[String], _deadline: Instant| {
+            let ok = |data: Value| {
+                Ok(Response {
+                    success: true,
+                    data: Some(data),
+                    error: None,
+                    code: None,
+                    warning: None,
+                })
+            };
+            match words[0].as_str() {
+                "snapshot" => ok(json!({ "snapshot": FORM })),
+                "get" if words[1] == "url" => ok(json!({ "url": "https://example.com" })),
+                "get" => ok(json!({ "title": "T" })),
+                "wait" => ok(json!({})),
+                _ => {
+                    commands.borrow_mut().push(words.join(" "));
+                    ok(json!({ "scrolled": true, "moved": true }))
+                }
+            }
+        };
+        let oracle = FakeOracle::new(vec![
+            ("SCROLL_DOWN", None),
+            ("SCROLL_DOWN", None),
+            ("SCROLL_DOWN", None),
+            ("DONE", None),
+        ]);
+
+        let outcome = run_goal_loop(&config("scroll"), &oracle, &runner, |_| {});
+        assert_eq!(outcome.status, "done");
+        assert_eq!(commands.borrow().len(), 3);
+        assert!(outcome.steps.iter().all(|step| step["pageChanged"] == true));
+    }
+
+    #[test]
+    fn end_of_page_scroll_noops_still_trigger_stall_protection() {
+        let commands = std::cell::RefCell::new(Vec::new());
+        let runner = |words: &[String], _deadline: Instant| {
+            let ok = |data: Value| {
+                Ok(Response {
+                    success: true,
+                    data: Some(data),
+                    error: None,
+                    code: None,
+                    warning: None,
+                })
+            };
+            match words[0].as_str() {
+                "snapshot" => ok(json!({ "snapshot": FORM })),
+                "get" if words[1] == "url" => ok(json!({ "url": "https://example.com" })),
+                "get" => ok(json!({ "title": "T" })),
+                "wait" => ok(json!({})),
+                _ => {
+                    commands.borrow_mut().push(words.join(" "));
+                    ok(json!({ "scrolled": true, "moved": false }))
+                }
+            }
+        };
+        let oracle = FakeOracle::new(vec![("SCROLL_DOWN", None); 4]);
+
+        let outcome = run_goal_loop(&config("scroll"), &oracle, &runner, |_| {});
+        assert_eq!(outcome.status, "blocked");
+        assert_eq!(commands.borrow().len(), 3);
         assert!(outcome.error.unwrap().contains("did not change"));
     }
 
@@ -1767,6 +2588,31 @@ mod tests {
     }
 
     #[test]
+    fn final_assessment_can_return_done_after_last_allowed_action() {
+        let daemon = FakeDaemon::new(vec![FORM, RESULTS]);
+        let oracle = FakeOracle::new(vec![("CLICK", Some("2")), ("DONE", None)]);
+        let mut cfg = config("fly");
+        cfg.max_steps = 1;
+
+        let outcome = run_goal_loop(&cfg, &oracle, &daemon.runner(), |_| {});
+        assert_eq!(outcome.status, "done");
+        assert_eq!(*daemon.commands.borrow(), vec!["click @e4"]);
+    }
+
+    #[test]
+    fn final_assessment_never_executes_an_action_past_the_budget() {
+        let daemon = FakeDaemon::new(vec![FORM, RESULTS]);
+        let oracle = FakeOracle::new(vec![("CLICK", Some("2")), ("CLICK", Some("2"))]);
+        let mut cfg = config("fly");
+        cfg.max_steps = 1;
+
+        let outcome = run_goal_loop(&cfg, &oracle, &daemon.runner(), |_| {});
+        assert_eq!(outcome.status, "blocked");
+        assert_eq!(*daemon.commands.borrow(), vec!["click @e4"]);
+        assert!(outcome.error.unwrap().contains("1-step budget"));
+    }
+
+    #[test]
     fn loop_stops_when_the_text_model_has_no_value() {
         let daemon = FakeDaemon::new(vec![FORM]);
         let mut oracle = FakeOracle::new(vec![("TYPE_TEXT", Some("1"))]);
@@ -1776,6 +2622,84 @@ mod tests {
         assert!(
             daemon.commands.borrow().is_empty(),
             "nothing is typed without a value"
+        );
+    }
+
+    #[test]
+    fn timeout_after_evaluation_rejects_done_and_stops_before_actions() {
+        let daemon = FakeDaemon::new(vec![FORM]);
+        let mut oracle = FakeOracle::new(vec![("DONE", None)]);
+        oracle.evaluate_delay = Duration::from_millis(100);
+        let mut cfg = config("fly");
+        cfg.timeout_ms = 50;
+
+        let outcome = run_goal_loop(&cfg, &oracle, &daemon.runner(), |_| {});
+        assert_eq!(outcome.status, "timeout");
+        assert!(daemon.commands.borrow().is_empty());
+    }
+
+    #[test]
+    fn timeout_after_field_text_stops_before_fill() {
+        let daemon = FakeDaemon::new(vec![FORM]);
+        let mut oracle = FakeOracle::new(vec![("TYPE_TEXT", Some("1"))]);
+        oracle.text_delay = Duration::from_millis(100);
+        let mut cfg = config("fly");
+        cfg.timeout_ms = 50;
+
+        let outcome = run_goal_loop(&cfg, &oracle, &daemon.runner(), |_| {});
+        assert_eq!(outcome.status, "timeout");
+        assert!(daemon.commands.borrow().is_empty());
+    }
+
+    #[test]
+    fn timeout_after_browser_command_stops_before_settling_or_reassessment() {
+        let daemon = FakeDaemon::new(vec![FORM, RESULTS]);
+        let oracle = FakeOracle::new(vec![("CLICK", Some("2")), ("DONE", None)]);
+        let runner = |words: &[String], deadline: Instant| {
+            if words.first().map(String::as_str) == Some("click") {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            daemon.runner()(words, deadline)
+        };
+        let mut cfg = config("fly");
+        cfg.timeout_ms = 50;
+
+        let outcome = run_goal_loop(&cfg, &oracle, &runner, |_| {});
+        assert_eq!(outcome.status, "timeout");
+        assert_eq!(outcome.steps.len(), 1, "the command itself did execute");
+        assert_eq!(oracle.seen.borrow().len(), 1, "no later model request ran");
+        assert_eq!(
+            daemon
+                .requests
+                .borrow()
+                .iter()
+                .filter(|request| request.starts_with("snapshot"))
+                .count(),
+            1,
+            "no settling observation ran after the deadline"
+        );
+    }
+
+    #[test]
+    fn command_failure_returned_after_deadline_is_still_a_timeout() {
+        let mut daemon = FakeDaemon::new(vec![FORM]);
+        daemon.fail_on = Some("click");
+        daemon.fail_error = "late command failure";
+        let oracle = FakeOracle::new(vec![("CLICK", Some("2"))]);
+        let runner = |words: &[String], deadline: Instant| {
+            if words.first().map(String::as_str) == Some("click") {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            daemon.runner()(words, deadline)
+        };
+        let mut cfg = config("fly");
+        cfg.timeout_ms = 50;
+
+        let outcome = run_goal_loop(&cfg, &oracle, &runner, |_| {});
+        assert_eq!(outcome.status, "timeout");
+        assert!(
+            outcome.steps.is_empty(),
+            "the failed action was not executed"
         );
     }
 

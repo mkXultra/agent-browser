@@ -72,7 +72,7 @@ agent-browser check @e1           # Check checkbox
 agent-browser uncheck @e1         # Uncheck checkbox
 agent-browser select @e1 "value"  # Select by value or visible label
 agent-browser select @e1 "a" "b"  # Select multiple options
-agent-browser scroll down 500     # Scroll page (default: down 300px)
+agent-browser scroll down 500     # Scroll page; JSON includes before/after coordinates and moved state
 agent-browser scrollintoview @e1  # Scroll element into view (alias: scrollinto)
 agent-browser drag @e1 @e2        # Drag and drop
 agent-browser upload @e1 file.pdf # Upload files
@@ -404,7 +404,7 @@ agent-browser -v goal "<goal>"                               # Probability, conf
 agent-browser --json goal "<goal>"                           # {status, url, elapsedMs, steps[...]} for agents
 ```
 
-Requires `AI_GATEWAY_API_KEY`. Each step sends the current `snapshot -c` as a numbered element table plus the visible text and recent actions to the evaluation model, which answers two typed questions in one request: the next operation (`CLICK`, `TYPE_TEXT`, `SCROLL_UP`, `SCROLL_DOWN`, `WAIT`, `DONE`, `BLOCKED`) and the element index for it. Indices map back to `@eN` refs and run as `click`, `fill`, `scroll`, or `wait` through the normal pipeline. `TYPE_TEXT` asks the text model for the value, which must come from the goal; a missing value stops the run as `blocked`. Stops on `DONE`, `BLOCKED`, budgets, or three unchanged pages in a row. Exit `0` only on `DONE`. Verify the result yourself.
+Requires `AI_GATEWAY_API_KEY`. Each step sends bounded text from the full accessibility snapshot, a numbered element table, and recent actions to the evaluation model, which answers two typed questions in one request: the next operation (`CLICK`, `TYPE_TEXT`, `SCROLL_UP`, `SCROLL_DOWN`, `WAIT`, `DONE`, `BLOCKED`) and the element index for it. Diagnostic and paragraph text is prioritized within the bound, remaining text is sampled from both ends, and actionable labels already in the table are omitted from page text. Indices map back to `@eN` refs and run as `click`, `fill`, `scroll`, or `wait` through the normal pipeline. Cursor and editability hints preserve actionable custom controls without exposing structural wrappers. `TYPE_TEXT` asks the text model for the value, which must come from the goal; a missing value stops the run as `blocked`. A pending confirmation is not an executed step. Without `--confirm-interactive`, the run returns `confirmation_required` with the confirmation ID. With that flag, a TTY prompts; non-TTY stdin auto-denies and goal returns `denied`. Approval after the deadline triggers denial cleanup and returns `timeout` without dispatching the action. For ordinary commands approved with `--confirm-interactive`, output and exit status come from the executed inner command rather than the confirmation envelope. The last allowed action receives a final terminal assessment, but no extra action can run. Stops on `DONE`, `BLOCKED`, budgets, or three actions without DOM, URL, or measured scroll progress. Exit `0` only on `DONE`. Verify the result yourself.
 
 ## MCP Server
 

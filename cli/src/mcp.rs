@@ -914,7 +914,7 @@ fn tools() -> Vec<Value> {
         tool(
             TOOL_SCROLL,
             "Scroll page",
-            "Scroll the page or an element.",
+            "Scroll the page or an element and report whether it actually moved.",
             json!({
                 "direction": { "type": "string", "enum": ["up", "down", "left", "right"], "default": "down" },
                 "amount": { "type": "integer", "default": 300, "description": "Pixels to scroll." },
@@ -1898,11 +1898,11 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_GOAL,
             "Goal",
-            "Drive the open page toward one natural-language goal. An evaluation model picks an operation and an observed element on every step; actions run through the normal command pipeline. Requires AI_GATEWAY_API_KEY. Verify the outcome afterwards; DONE is the model's opinion.",
+            "Drive the open page toward one natural-language goal. An evaluation model picks an operation and an observed element on every step; actions run through the normal command pipeline. Pending confirmations stop safely and are returned with their confirmation ID. Requires AI_GATEWAY_API_KEY. Verify the outcome afterwards; DONE is the model's opinion.",
             json!({
                 "goal": { "type": "string", "description": "What to achieve on the open page, including when to stop." },
                 "maxSteps": { "type": "integer", "minimum": 1, "description": "Action budget (default 40)." },
-                "timeoutMs": { "type": "integer", "minimum": 1, "description": "Time budget in milliseconds (default 120000)." },
+                "timeoutMs": { "type": "integer", "minimum": 1, "default": 120000, "description": "Goal time budget in milliseconds. The MCP subprocess receives an additional 10000 ms so the goal can return its structured timeout result." },
                 "evalModel": { "type": "string", "description": "Evaluation model (default typesafe-ai/jev)." },
                 "textModel": { "type": "string", "description": "Text model for TYPE_TEXT (default inception/mercury-2.5)." }
             }),
@@ -2060,15 +2060,14 @@ fn tool(name: &str, title: &str, description: &str, properties: Value, required:
             "description": "Advanced: extra CLI arguments for this command, preserving full CLI parity."
         }),
     );
-    props.insert(
-        "timeoutMs".to_string(),
+    props.entry("timeoutMs".to_string()).or_insert_with(|| {
         json!({
             "type": "integer",
             "minimum": 1,
             "default": DEFAULT_TIMEOUT_MS,
             "description": "Maximum time to wait for this tool call."
-        }),
-    );
+        })
+    });
 
     let mut schema = serde_json::Map::new();
     schema.insert("type".to_string(), json!("object"));
@@ -2396,7 +2395,7 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
         TOOL_INSTALL => call_install(arguments),
         TOOL_UPGRADE => call_literal(arguments, &["upgrade"]),
         TOOL_CHAT => call_chat(arguments),
-        TOOL_GOAL => call_cli_tool(arguments, goal_args(arguments)?, None),
+        TOOL_GOAL => call_goal(arguments),
         TOOL_EVAL => call_eval(arguments),
         TOOL_CLOSE => call_close(arguments),
         _ => unreachable!("known MCP tool missing call handler: {}", name),
@@ -3683,6 +3682,31 @@ fn goal_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
     Ok(args)
 }
 
+/// Run goal with enough MCP subprocess time for the goal loop to emit its own
+/// structured timeout result. Using the exact same deadline would race the
+/// child process before it can serialize that result.
+fn call_goal(arguments: &Value) -> Result<Value, ProtocolError> {
+    validate_arguments_object(arguments)?;
+    let session = optional_string(arguments, "session")?;
+    let cli_args = cli_tool_args(arguments, goal_args(arguments)?, session.as_deref())?;
+    let subprocess_timeout = goal_subprocess_timeout(&cli_args)?;
+    let run = run_cli(&cli_args, None, subprocess_timeout).map_err(|e| {
+        ProtocolError::invalid_params(format!("Failed to run agent-browser: {}", e))
+    })?;
+    Ok(tool_result_from_run(run))
+}
+
+fn goal_subprocess_timeout(cli_args: &[String]) -> Result<u64, ProtocolError> {
+    let cleaned = crate::flags::clean_args(cli_args);
+    let command = crate::commands::parse_goal_command_args(&cleaned)
+        .map_err(|error| ProtocolError::invalid_params(error.format()))?;
+    let goal_timeout = command
+        .get("timeoutMs")
+        .and_then(Value::as_u64)
+        .unwrap_or(crate::goal::DEFAULT_TIMEOUT_MS);
+    Ok(goal_timeout.saturating_add(10_000))
+}
+
 fn call_eval(arguments: &Value) -> Result<Value, ProtocolError> {
     let script = required_string(arguments, "script")?;
     call_cli_tool(
@@ -4791,6 +4815,68 @@ mod tests {
         assert_eq!(parsed["timeoutMs"], 30000);
         assert_eq!(parsed["model"], "typesafe-ai/jev");
         assert_eq!(parsed["textModel"], "inception/mercury-2.5");
+        assert_eq!(
+            goal_subprocess_timeout(&[
+                "--json".to_string(),
+                "goal".to_string(),
+                "Open the pricing page".to_string(),
+            ])
+            .unwrap(),
+            130_000
+        );
+        assert_eq!(goal_subprocess_timeout(&args).unwrap(), 40_000);
+
+        let arguments = json!({
+            "goal": "Open the pricing page",
+            "timeoutMs": 30_000,
+            "extraArgs": ["--timeout", "600000"]
+        });
+        let cli_args = cli_tool_args(&arguments, goal_args(&arguments).unwrap(), None).unwrap();
+        let flags = crate::flags::parse_flags(&cli_args);
+        let parsed =
+            crate::commands::parse_command(&crate::flags::clean_args(&cli_args), &flags).unwrap();
+        assert_eq!(parsed["timeoutMs"], 600_000);
+        assert_eq!(goal_subprocess_timeout(&cli_args).unwrap(), 610_000);
+
+        let nonexistent_config = [
+            "--json",
+            "--config",
+            "/definitely/nonexistent/agent-browser.json",
+            "goal",
+            "Open the pricing page",
+        ]
+        .map(str::to_string);
+        assert!(crate::flags::load_config(&nonexistent_config).is_err());
+        assert_eq!(
+            goal_subprocess_timeout(&nonexistent_config).unwrap(),
+            130_000,
+            "timeout derivation must not load or exit on child config"
+        );
+
+        let timeout_as_another_flag_value =
+            ["--session", "--timeout", "goal", "Open the pricing page"].map(str::to_string);
+        assert_eq!(
+            goal_subprocess_timeout(&timeout_as_another_flag_value).unwrap(),
+            130_000
+        );
+
+        let malformed_timeout =
+            ["goal", "Open the pricing page", "--timeout", "not-a-number"].map(str::to_string);
+        assert!(goal_subprocess_timeout(&malformed_timeout).is_err());
+
+        let missing_timeout = ["goal", "Open the pricing page", "--timeout"].map(str::to_string);
+        assert!(goal_subprocess_timeout(&missing_timeout).is_err());
+
+        let goal_tool = tools()
+            .into_iter()
+            .find(|tool| tool["name"] == TOOL_GOAL)
+            .unwrap();
+        assert!(
+            goal_tool["inputSchema"]["properties"]["timeoutMs"]["description"]
+                .as_str()
+                .unwrap()
+                .starts_with("Goal time budget")
+        );
         assert!(goal_args(&json!({})).is_err());
     }
 

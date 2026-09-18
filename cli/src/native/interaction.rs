@@ -384,6 +384,58 @@ pub async fn press_key_with_modifiers(
     Ok(())
 }
 
+/// Actual scroll coordinates returned after the browser has applied a scroll.
+pub struct ScrollResult {
+    pub before_x: f64,
+    pub before_y: f64,
+    pub after_x: f64,
+    pub after_y: f64,
+}
+
+const SCROLL_SETTLE_TIMEOUT_MS: u64 = 150;
+
+fn element_scroll_function() -> String {
+    format!(
+        r#"async function(dx, dy) {{
+            const beforeX = this.scrollLeft;
+            const beforeY = this.scrollTop;
+            this.scrollBy(dx, dy);
+            const frameSettle = typeof requestAnimationFrame === 'function'
+                ? new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+                : new Promise(() => {{}});
+            await Promise.race([
+                frameSettle,
+                new Promise(resolve => setTimeout(resolve, {SCROLL_SETTLE_TIMEOUT_MS}))
+            ]);
+            return {{ beforeX, beforeY, afterX: this.scrollLeft, afterY: this.scrollTop }};
+        }}"#
+    )
+}
+
+fn window_scroll_expression(delta_x: f64, delta_y: f64) -> String {
+    format!(
+        r#"(async () => {{
+                const beforeX = window.scrollX;
+                const beforeY = window.scrollY;
+                window.scrollBy({delta_x}, {delta_y});
+                const frameSettle = typeof requestAnimationFrame === 'function'
+                    ? new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+                    : new Promise(() => {{}});
+                await Promise.race([
+                    frameSettle,
+                    new Promise(resolve => setTimeout(resolve, {SCROLL_SETTLE_TIMEOUT_MS}))
+                ]);
+                return {{ beforeX, beforeY, afterX: window.scrollX, afterY: window.scrollY }};
+            }})()"#
+    )
+}
+
+impl ScrollResult {
+    pub fn moved(&self) -> bool {
+        self.before_x != self.after_x || self.before_y != self.after_y
+    }
+}
+
 pub async fn scroll(
     client: &CdpClient,
     session_id: &str,
@@ -392,13 +444,13 @@ pub async fn scroll(
     delta_x: f64,
     delta_y: f64,
     iframe_sessions: &HashMap<String, String>,
-) -> Result<(), String> {
-    if let Some(sel) = selector_or_ref {
+) -> Result<ScrollResult, String> {
+    let result: EvaluateResult = if let Some(sel) = selector_or_ref {
         let (object_id, effective_session_id) =
             resolve_element_object_id(client, session_id, ref_map, sel, iframe_sessions).await?;
-        let js = "function(dx, dy) { this.scrollBy(dx, dy); }".to_string();
+        let js = element_scroll_function();
         client
-            .send_command_typed::<_, Value>(
+            .send_command_typed(
                 "Runtime.callFunctionOn",
                 &CallFunctionOnParams {
                     function_declaration: js,
@@ -414,26 +466,44 @@ pub async fn scroll(
                         },
                     ]),
                     return_by_value: Some(true),
-                    await_promise: Some(false),
+                    await_promise: Some(true),
                 },
                 Some(&effective_session_id),
             )
-            .await?;
+            .await?
     } else {
-        let js = format!("window.scrollBy({}, {})", delta_x, delta_y);
+        let js = window_scroll_expression(delta_x, delta_y);
         client
-            .send_command_typed::<_, Value>(
+            .send_command_typed(
                 "Runtime.evaluate",
                 &EvaluateParams {
                     expression: js,
                     return_by_value: Some(true),
-                    await_promise: Some(false),
+                    await_promise: Some(true),
                 },
                 Some(session_id),
             )
-            .await?;
+            .await?
+    };
+    if let Some(details) = result.exception_details {
+        return Err(format!("Scroll evaluation failed: {}", details.text));
     }
-    Ok(())
+    let value = result
+        .result
+        .value
+        .ok_or_else(|| "Scroll did not return its position".to_string())?;
+    let number = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_f64)
+            .ok_or_else(|| format!("Scroll result missing {}", key))
+    };
+    Ok(ScrollResult {
+        before_x: number("beforeX")?,
+        before_y: number("beforeY")?,
+        after_x: number("afterX")?,
+        after_y: number("afterY")?,
+    })
 }
 
 pub async fn select_option(
@@ -1275,6 +1345,37 @@ fn named_key_info(key: &str) -> (String, String, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scroll_result_distinguishes_movement_from_a_boundary_noop() {
+        assert!(ScrollResult {
+            before_x: 0.0,
+            before_y: 100.0,
+            after_x: 0.0,
+            after_y: 660.0,
+        }
+        .moved());
+        assert!(!ScrollResult {
+            before_x: 0.0,
+            before_y: 1000.0,
+            after_x: 0.0,
+            after_y: 1000.0,
+        }
+        .moved());
+    }
+
+    #[test]
+    fn scroll_measurement_has_a_bounded_animation_frame_fallback() {
+        for script in [
+            element_scroll_function(),
+            window_scroll_expression(0.0, 560.0),
+        ] {
+            assert!(script.contains("Promise.race"));
+            assert!(script.contains("typeof requestAnimationFrame === 'function'"));
+            assert!(script.contains("new Promise(() => {})"));
+            assert!(script.contains(&format!("setTimeout(resolve, {SCROLL_SETTLE_TIMEOUT_MS})")));
+        }
+    }
 
     /// Verify that `char_to_key_info` returns the correct (key, code,
     /// windowsVirtualKeyCode) triple for every character in Playwright's

@@ -20,7 +20,7 @@ agent-browser focus <sel>             # Focus element
 agent-browser select <sel> <val>      # Select dropdown by value or visible label
 agent-browser check <sel>             # Check checkbox
 agent-browser uncheck <sel>           # Uncheck checkbox
-agent-browser scroll <dir> [px]       # Scroll (up/down/left/right, --selector <sel>)
+agent-browser scroll <dir> [px]       # Scroll; JSON reports before/after coordinates and moved state
 agent-browser scrollintoview <sel>    # Scroll element into view
 agent-browser drag <src> <dst>        # Drag and drop
 agent-browser upload <sel> <files>    # Upload files
@@ -529,7 +529,7 @@ Chat-specific options:
 
 ## Goal
 
-Give the open page one natural-language goal and let an evaluation model choose every action. On each step the `goal` command sends the current snapshot as a numbered element table to the model (`typesafe-ai/jev` on the AI Gateway by default), which answers two typed questions in one request: the next operation and the element index it targets. Only observed elements are offered, so the model never produces a selector, a URL, or a script. When the operation is `TYPE_TEXT`, a small text model writes the field value from the goal. Requires `AI_GATEWAY_API_KEY` to be set.
+Give the open page one natural-language goal and let an evaluation model choose every action. On each step the `goal` command sends bounded text from the full accessibility snapshot plus a numbered element table to the model (`typesafe-ai/jev` on the AI Gateway by default), which answers two typed questions in one request: the next operation and the element index it targets. Alert, status, log, and paragraph text is prioritized, remaining text is sampled from both ends, and actionable labels already present in the element table are not duplicated. Only observed elements are offered, so the model never produces a selector, a URL, or a script. When the operation is `TYPE_TEXT`, a small text model writes the field value from the goal. Requires `AI_GATEWAY_API_KEY` to be set.
 
 ```bash
 agent-browser open https://www.google.com/travel/flights
@@ -540,7 +540,7 @@ agent-browser -q goal "Accept the cookie banner"             # Only the final re
 agent-browser --json goal "Accept the cookie banner"         # Structured output with every step and timing
 ```
 
-Actions run through the normal command pipeline as `click @eN`, `fill @eN`, `scroll`, and `wait`, so action policies, `--confirm-actions`, `--allowed-domains`, and session isolation apply unchanged. The run stops on `DONE`, `BLOCKED`, the step budget, the time budget, or three consecutive actions that do not change the page. The exit code is `0` only on `DONE`. `DONE` is the model's opinion, not proof, so verify the outcome with `snapshot`, `get url`, or a screenshot. Start from a page that is already open; `goal` does not navigate on its own, and it cannot see inside iframes, shadow roots, or canvas.
+Actions run through the normal command pipeline as `click @eN`, `fill @eN`, `scroll`, and `wait`, so action policies, `--confirm-actions`, `--allowed-domains`, and session isolation apply unchanged. Without `--confirm-interactive`, a pending action stops the run with `status: "confirmation_required"` plus its confirmation ID. With that flag, a TTY uses the normal prompt; non-TTY stdin retains the CLI's auto-denial and goal returns `status: "denied"`. A denial or an approval received after the deadline never dispatches or records the pending action. The run stops on `DONE`, `BLOCKED`, the step budget, the time budget, or three consecutive actions without DOM, URL, or measured scroll progress. One terminal assessment is allowed after the last action in the budget, but no additional action can run. The exit code is `0` only on `DONE`. `DONE` is the model's opinion, not proof, so verify the outcome with `snapshot`, `get url`, or a screenshot. Start from a page that is already open; `goal` does not navigate on its own, and it cannot see inside iframes, shadow roots, or canvas.
 
 Goal-specific options:
 
@@ -571,7 +571,7 @@ Goal-specific options:
   </tbody>
 </table>
 
-`--debug` additionally writes every model request and reply to stderr, which is the quickest way to see what the model was offered on a step that went wrong. The `--json` result carries `status` (`done`, `blocked`, `timeout`, or `error`), the final `url`, `elapsedMs`, and one entry per step with the operation, the target ref, role and name, any typed text, the target probability, the model's confidence, the operation distribution, and per-phase timings.
+`--debug` additionally writes every model request and reply to stderr, which is the quickest way to see what the model was offered on a step that went wrong. The `--json` result carries `status` (`done`, `blocked`, `denied`, `timeout`, `confirmation_required`, or `error`), the final `url`, `elapsedMs`, pending confirmation fields when applicable, and one entry per executed step with the operation, the target ref, role and name, any typed text, the target probability, the model's confidence, the operation distribution, and per-phase timings.
 
 ## Navigation
 

@@ -6326,7 +6326,7 @@ async fn handle_scroll(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         }
     }
 
-    interaction::scroll(
+    let scroll = interaction::scroll(
         &mgr.client,
         &session_id,
         &state.ref_map,
@@ -6336,7 +6336,14 @@ async fn handle_scroll(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         &state.iframe_sessions,
     )
     .await?;
-    Ok(json!({ "scrolled": true }))
+    // Report measured movement so multi-step callers can distinguish useful
+    // scrolling from an end-of-page no-op without weakening stall detection.
+    Ok(json!({
+        "scrolled": true,
+        "moved": scroll.moved(),
+        "before": { "x": scroll.before_x, "y": scroll.before_y },
+        "after": { "x": scroll.after_x, "y": scroll.after_y }
+    }))
 }
 
 async fn handle_select(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {

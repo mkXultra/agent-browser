@@ -26,6 +26,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{exit, Command};
+use std::time::Instant;
 
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::CloseHandle;
@@ -372,11 +373,95 @@ fn confirmation_prompt_from_response(resp: &Response) -> Option<ConfirmationProm
     resp.data.as_ref().and_then(confirmation_prompt_from_data)
 }
 
+fn unwrap_confirmed_response(resp: Response) -> Response {
+    let nested = resp.data.as_ref().and_then(|data| {
+        data.get("confirmed")
+            .and_then(|value| value.as_bool())
+            .filter(|confirmed| *confirmed)
+            .and_then(|_| data.get("result"))
+            .and_then(|result| serde_json::from_value::<Response>(result.clone()).ok())
+    });
+    nested.unwrap_or(resp)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ConfirmationResolutionError {
+    Denied,
+    DeadlineExpired,
+    Command(String),
+}
+
+impl ConfirmationResolutionError {
+    fn message(self) -> String {
+        match self {
+            Self::Denied => "Action denied".to_string(),
+            Self::DeadlineExpired => {
+                "Goal time budget expired while awaiting confirmation".to_string()
+            }
+            Self::Command(message) => message,
+        }
+    }
+}
+
+fn confirmation_resolution_command(
+    prompt: &ConfirmationPrompt,
+    approved: bool,
+    deadline: Option<Instant>,
+) -> (serde_json::Value, bool) {
+    let expired_approval = approved && deadline.is_some_and(|end| Instant::now() >= end);
+    let action = if approved && !expired_approval {
+        "confirm"
+    } else {
+        "deny"
+    };
+    (
+        json!({
+            "id": gen_id(),
+            "action": action,
+            "confirmationId": prompt.confirmation_id
+        }),
+        expired_approval,
+    )
+}
+
 fn run_interactive_confirmations(
-    mut resp: Response,
+    resp: Response,
     flags: &Flags,
     output_opts: &OutputOptions,
 ) -> Response {
+    let resp = match resolve_interactive_confirmations(resp, flags) {
+        Ok(resp) => resp,
+        Err(e) => {
+            eprintln!("{} {}", color::error_indicator(), e);
+            exit(1);
+        }
+    };
+
+    print_response_with_opts(&resp, None, output_opts);
+    resp
+}
+
+/// Resolve every top-level or nested confirmation produced by one command.
+/// This is shared by ordinary commands and multi-command drivers such as
+/// `goal`, so `--confirm-interactive` has identical, never-auto-approve
+/// behavior on both paths.
+fn resolve_interactive_confirmations(resp: Response, flags: &Flags) -> Result<Response, String> {
+    resolve_interactive_confirmations_before(resp, flags, None)
+        .map_err(ConfirmationResolutionError::message)
+}
+
+/// Resolve confirmation envelopes until the underlying command completes.
+/// When `deadline` belongs to a goal run, an approval received after that
+/// instant is converted to a denial before any executing `confirm` command is
+/// sent. Ordinary CLI commands pass no deadline and retain their existing
+/// interactive and non-TTY auto-denial behavior. After ordinary interactive
+/// approval, callers print the executed inner response and derive their exit
+/// status from that response rather than the confirmation envelope.
+fn resolve_interactive_confirmations_before(
+    mut resp: Response,
+    flags: &Flags,
+    deadline: Option<Instant>,
+) -> Result<Response, ConfirmationResolutionError> {
     while let Some(prompt) = confirmation_prompt_from_response(&resp) {
         eprintln!("[agent-browser] Action requires confirmation:");
         if prompt.category.is_empty() {
@@ -394,37 +479,31 @@ fn run_interactive_confirmations(
             false
         };
 
-        let confirm_cmd = if approved {
-            json!({
-                "id": gen_id(),
-                "action": "confirm",
-                "confirmationId": prompt.confirmation_id
-            })
-        } else {
-            json!({
-                "id": gen_id(),
-                "action": "deny",
-                "confirmationId": prompt.confirmation_id
-            })
-        };
+        let (confirm_cmd, expired_approval) =
+            confirmation_resolution_command(&prompt, approved, deadline);
 
-        match send_command(confirm_cmd, &flags.session) {
-            Ok(next_resp) => {
-                if !approved {
-                    eprintln!("{} Action denied", color::error_indicator());
-                    exit(1);
-                }
-                resp = next_resp;
-            }
-            Err(e) => {
-                eprintln!("{} {}", color::error_indicator(), e);
-                exit(1);
-            }
+        if expired_approval {
+            // Clear the pending action with a best-effort denial. Never send
+            // `confirm` after the deadline, even if the user approved at the
+            // prompt before noticing the goal had expired.
+            let _ = send_command(confirm_cmd, &flags.session);
+            return Err(ConfirmationResolutionError::DeadlineExpired);
         }
+        if !approved {
+            return match send_command(confirm_cmd, &flags.session) {
+                Ok(_) => Err(ConfirmationResolutionError::Denied),
+                Err(_) if deadline.is_some() => Err(ConfirmationResolutionError::Denied),
+                Err(message) => Err(ConfirmationResolutionError::Command(message)),
+            };
+        }
+        let next_resp = send_command(confirm_cmd, &flags.session)
+            .map_err(ConfirmationResolutionError::Command)?;
+        // Unwrap exactly the confirmation envelope returned for this
+        // approval. The executed command's own `data.result` is page or
+        // command data and must never be interpreted as another Response.
+        resp = unwrap_confirmed_response(next_resp);
     }
-
-    print_response_with_opts(&resp, None, output_opts);
-    resp
+    Ok(resp)
 }
 
 struct ParsedProxy {
@@ -2079,7 +2158,25 @@ fn main() {
     // Handle goal command: the loop runs here in the CLI and drives the
     // daemon through the same parse/attach/send path as every other command.
     if cmd.get("action").and_then(|v| v.as_str()) == Some("goal") {
-        let runner = |words: &[String]| run_words(words, &flags, &daemon_opts);
+        let runner = |words: &[String], deadline: Instant| {
+            let resp =
+                run_words(words, &flags, &daemon_opts).map_err(goal::CommandRunError::Failed)?;
+            if flags.confirm_interactive && confirmation_prompt_from_response(&resp).is_some() {
+                resolve_interactive_confirmations_before(resp, &flags, Some(deadline)).map_err(
+                    |error| match error {
+                        ConfirmationResolutionError::Denied => goal::CommandRunError::Denied,
+                        ConfirmationResolutionError::DeadlineExpired => {
+                            goal::CommandRunError::Timeout
+                        }
+                        ConfirmationResolutionError::Command(message) => {
+                            goal::CommandRunError::Failed(message)
+                        }
+                    },
+                )
+            } else {
+                Ok(resp)
+            }
+        };
         goal::run_goal(&flags, &daemon_opts, &cmd, &runner);
         return;
     }
@@ -3010,5 +3107,88 @@ mod tests {
         assert_eq!(prompt.action, "plugin:stealth:launch.mutate");
         assert_eq!(prompt.description, "plugin:stealth:launch.mutate");
         assert_eq!(prompt.confirmation_id, "original-command");
+    }
+
+    #[test]
+    fn test_unwrap_confirmed_response_returns_the_executed_command_response() {
+        let resp = Response {
+            success: true,
+            code: None,
+            data: Some(json!({
+                "confirmed": true,
+                "result": {
+                    "success": false,
+                    "error": "Navigation blocked by domain allowlist"
+                }
+            })),
+            error: None,
+            warning: None,
+        };
+
+        let unwrapped = unwrap_confirmed_response(resp);
+        assert!(!unwrapped.success);
+        assert_eq!(
+            unwrapped.error.as_deref(),
+            Some("Navigation blocked by domain allowlist")
+        );
+    }
+
+    #[test]
+    fn test_unwrap_confirmed_response_never_unwraps_page_controlled_eval_result() {
+        let resp = Response {
+            success: true,
+            code: None,
+            data: Some(json!({
+                "confirmed": true,
+                "action": "eval",
+                "result": {
+                    "success": true,
+                    "data": {
+                        "result": {
+                            "success": false,
+                            "error": "page controlled"
+                        },
+                        "origin": "https://example.com"
+                    }
+                }
+            })),
+            error: None,
+            warning: None,
+        };
+
+        let unwrapped = unwrap_confirmed_response(resp);
+        assert!(unwrapped.success);
+        assert_eq!(
+            unwrapped.data.as_ref().unwrap()["result"],
+            json!({ "success": false, "error": "page controlled" })
+        );
+        assert_eq!(
+            unwrapped.data.as_ref().unwrap()["origin"],
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn test_expired_goal_approval_is_converted_to_deny_before_dispatch() {
+        let prompt = ConfirmationPrompt {
+            action: "click".into(),
+            category: "external_action".into(),
+            description: "Click Purchase".into(),
+            confirmation_id: "confirm-1".into(),
+        };
+
+        let (command, expired) = confirmation_resolution_command(
+            &prompt,
+            true,
+            Some(Instant::now() - std::time::Duration::from_millis(1)),
+        );
+
+        assert!(expired);
+        assert_eq!(command["action"], "deny");
+        assert_eq!(command["confirmationId"], "confirm-1");
+
+        let (ordinary_command, expired) = confirmation_resolution_command(&prompt, true, None);
+        assert!(!expired);
+        assert_eq!(ordinary_command["action"], "confirm");
     }
 }

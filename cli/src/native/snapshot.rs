@@ -1751,4 +1751,18 @@ mod tests {
 
         assert_eq!(nodes[0].role, "LabelText"); // unchanged
     }
+
+    #[test]
+    fn compact_snapshot_drops_ordinary_static_text_rendered_by_snapshot() {
+        let mut paragraph = make_node("paragraph", "", Some(1));
+        paragraph.children.push(1);
+        let mut message = make_node("StaticText", "Invalid email", Some(2));
+        message.parent_idx = Some(0);
+        let nodes = vec![paragraph, message];
+        let mut rendered = String::new();
+        render_tree(&nodes, 0, 0, &mut rendered, &SnapshotOptions::default());
+
+        assert!(rendered.contains("- StaticText \"Invalid email\""));
+        assert!(compact_tree(&rendered, false).is_empty());
+    }
 }

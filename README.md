@@ -132,7 +132,7 @@ agent-browser hover <sel>             # Hover element
 agent-browser select <sel> <val>      # Select dropdown by value or visible label
 agent-browser check <sel>             # Check checkbox
 agent-browser uncheck <sel>           # Uncheck checkbox
-agent-browser scroll <dir> [px]       # Scroll (up/down/left/right, --selector <sel>)
+agent-browser scroll <dir> [px]       # Scroll; JSON reports before/after coordinates and moved state
 agent-browser scrollintoview <sel>    # Scroll element into view (alias: scrollinto)
 agent-browser drag <src> <tgt>        # Drag and drop
 agent-browser upload <sel> <files>    # Upload files
@@ -875,7 +875,7 @@ agent-browser includes security features for safe AI agent deployments. All feat
 - **Content Boundary Markers**: Wrap page output in delimiters so LLMs can distinguish tool output from untrusted content: `--content-boundaries`
 - **Domain Allowlist**: Restrict navigation to trusted domains (wildcards like `*.example.com` also match the bare domain): `--allowed-domains "example.com,*.example.com"`. Sub-resource requests (scripts, images, fetch), WebSocket/EventSource connections, and `sendBeacon` calls to non-allowed domains are blocked. WebRTC peer connections are disabled in supported Chromium sessions while the allowlist is active to prevent STUN, TURN, and DNS traffic from bypassing HTTP interception. Dedicated and shared workers are guarded with a bootstrap wrapper; if a page CSP forbids that wrapper, the worker fails closed rather than running without the allowlist guard. Pre-existing CDP sessions, auto-connect, Chrome profiles, direct-page provider plugins, agent-browser restore or state-file replay, raw Chrome args that select profiles, restore sessions, or open startup pages, iOS, and Safari reject this option because agent-browser cannot install equivalent containment before page scripts run. Include any CDN domains your target pages depend on (e.g., `*.cdn.example.com`).
 - **Action Policy**: Gate destructive actions with a static policy file: `--action-policy ./policy.json`
-- **Action Confirmation**: Require explicit approval for sensitive action categories: `--confirm-actions eval,download`
+- **Action Confirmation**: Require explicit approval for sensitive action categories: `--confirm-actions eval,download`. With `--confirm-interactive`, an approved ordinary command prints the executed command response rather than the confirmation envelope, and its exit status reflects that inner result.
 - **Output Length Limits**: Prevent context flooding: `--max-output 50000`
 
 | Variable                            | Description                              |
@@ -1161,7 +1161,7 @@ The `chat` command translates natural language instructions into agent-browser c
 
 **Goal mode:**
 
-`goal` is the fast sibling of `chat`. Instead of a chat model writing commands, a System One evaluation model (`typesafe-ai/jev` on the AI Gateway by default) answers two typed questions on every step: which operation comes next and which element from the current snapshot it targets. Only observed elements are offered, so the model never produces a selector, a URL, or a script. When it picks `TYPE_TEXT`, a small text model (`inception/mercury-2.5` by default) writes the field value from the goal. One decision costs one gateway request and typically well under a second.
+`goal` is the fast sibling of `chat`. Instead of a chat model writing commands, a System One evaluation model (`typesafe-ai/jev` on the AI Gateway by default) answers two typed questions on every step: which operation comes next and which element from the current snapshot it targets. It receives bounded text from the full accessibility snapshot. Alert, status, log, and paragraph text is prioritized, remaining text is sampled from both ends, and actionable labels already present in the element table are not duplicated. Only observed elements are offered, so the model never produces a selector, a URL, or a script. When it picks `TYPE_TEXT`, a small text model (`inception/mercury-2.5` by default) writes the field value from the goal. One decision costs one gateway request and typically well under a second.
 
 ```bash
 agent-browser open https://www.google.com/travel/flights
@@ -1171,7 +1171,7 @@ agent-browser -v goal "Accept the cookie banner"             # Show probability,
 agent-browser --json goal "Accept the cookie banner"         # Every step with timings, for agents
 ```
 
-Every action runs through the normal command pipeline (`click @eN`, `fill @eN`, `scroll`, `wait`), so action policies, `--confirm-actions`, `--allowed-domains`, and session isolation apply unchanged. The run stops on `DONE`, `BLOCKED`, the step budget, the time budget, or three consecutive actions that do not change the page, and exits `0` only on `DONE`. `DONE` is the model's opinion, not proof: verify the outcome with `snapshot`, `get url`, or a screenshot. Start from a page that is already open; `goal` does not navigate on its own, and it does not see inside iframes, shadow roots, or canvas.
+Every action runs through the normal command pipeline (`click @eN`, `fill @eN`, `scroll`, `wait`), so action policies, `--confirm-actions`, `--allowed-domains`, and session isolation apply unchanged. Without `--confirm-interactive`, a pending action stops the run with `status: "confirmation_required"` and actionable confirmation data. With that flag, a TTY uses the normal prompt; non-TTY stdin retains the CLI's documented auto-denial and goal returns `status: "denied"`. A denial or an approval received after the goal deadline never dispatches or records the pending action. The run stops on `DONE`, `BLOCKED`, the step budget, the time budget, or three consecutive actions without DOM, URL, or measured scroll progress, and exits `0` only on `DONE`. The model gets one terminal assessment after the last allowed action but cannot execute another action. The time budget covers model requests, settling, observations, and action dispatch as far as each underlying operation permits. `DONE` is the model's opinion, not proof: verify the outcome with `snapshot`, `get url`, or a screenshot. Start from a page that is already open; `goal` does not navigate on its own, and it does not see inside iframes, shadow roots, or canvas.
 
 Goal options and environment variables:
 

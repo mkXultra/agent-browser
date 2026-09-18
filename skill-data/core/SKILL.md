@@ -155,7 +155,7 @@ agent-browser uncheck @e3                 # uncheck
 agent-browser select @e4 "option-value"   # select by value or visible label
 agent-browser select @e4 "a" "b"          # select multiple
 agent-browser upload @e5 file1.pdf        # upload file(s)
-agent-browser scroll down 500             # scroll page (up/down/left/right)
+agent-browser scroll down 500             # scroll page; JSON reports actual movement
 agent-browser scrollintoview @e1          # scroll element into view
 agent-browser drag @e1 @e2                # drag and drop
 agent-browser drag @e1 @e2 --human        # drag with curved, eased movement
@@ -196,7 +196,7 @@ agent-browser goal "Find one-way flights from Zurich to London on 20 September f
 agent-browser --json goal "Accept the cookie banner and open the pricing page"
 ```
 
-It needs `AI_GATEWAY_API_KEY`. On every step the model sees the current snapshot as a numbered element table and returns an operation (`CLICK`, `TYPE_TEXT`, `SCROLL_UP`, `SCROLL_DOWN`, `WAIT`, `DONE`, `BLOCKED`) plus an element index; the CLI maps the index back to a `@ref` and runs the normal command, so policies and confirmations still apply. Say in the goal when to stop. Exit code `0` means the model said `DONE`, which is its opinion: verify with `snapshot -i`, `get url`, or a screenshot before you report success. Log in first with `auth login`; never put a password in a goal. It cannot see into iframes, shadow roots, or canvas, so fall back to refs there.
+It needs `AI_GATEWAY_API_KEY`. On every step the model sees bounded text from the full accessibility snapshot plus a numbered element table and returns an operation (`CLICK`, `TYPE_TEXT`, `SCROLL_UP`, `SCROLL_DOWN`, `WAIT`, `DONE`, `BLOCKED`) and an element index; the CLI maps the index back to a `@ref` and runs the normal command, so policies and confirmations still apply. Diagnostic and paragraph text is prioritized within the bound, and actionable labels already in the table are not duplicated. A pending confirmation is not an executed step. Without `--confirm-interactive`, the run stops with `confirmation_required` and a confirmation ID for `confirm` or `deny`. With that flag, use a terminal for the prompt; non-TTY stdin auto-denies and goal returns `denied`. An approval received after the goal deadline triggers denial cleanup and returns `timeout` without dispatching the action. For ordinary commands approved with `--confirm-interactive`, output and exit status come from the executed inner command rather than the confirmation envelope. The model may assess `DONE` after the last allowed action but cannot exceed the action budget. Say in the goal when to stop. Exit code `0` means the model said `DONE`, which is its opinion: verify with `snapshot -i`, `get url`, or a screenshot before you report success. Log in first with `auth login`; never put a password in a goal. It cannot see into iframes, shadow roots, or canvas, so fall back to refs there.
 
 ## Waiting (read this)
 

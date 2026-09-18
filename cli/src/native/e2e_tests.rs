@@ -3130,7 +3130,7 @@ async fn e2e_hover_scroll_press() {
     assert_success(&resp);
 
     let html = concat!(
-        "data:text/html,<html><body style='height:3000px'>",
+        "data:text/html,<html style='scroll-behavior:smooth'><body style='height:3000px'>",
         "<button id='btn' onmouseover=\"this.textContent='hovered'\">Hover me</button>",
         "<input id='input' onkeydown=\"this.dataset.key=event.key\">",
         "</body></html>"
@@ -3152,12 +3152,19 @@ async fn e2e_hover_scroll_press() {
     assert_success(&resp);
 
     // Scroll
+    let scroll_started = std::time::Instant::now();
     let resp = execute_command(
         &json!({ "id": "4", "action": "scroll", "y": 500 }),
         &mut state,
     )
     .await;
     assert_success(&resp);
+    assert!(
+        scroll_started.elapsed() < std::time::Duration::from_secs(2),
+        "scroll position measurement should settle promptly"
+    );
+    assert_eq!(get_data(&resp)["moved"], true);
+    assert!(get_data(&resp)["after"]["y"].as_f64().unwrap() > 0.0);
 
     let resp = execute_command(
         &json!({ "id": "5", "action": "evaluate", "script": "window.scrollY" }),
@@ -3167,6 +3174,59 @@ async fn e2e_hover_scroll_press() {
     assert_success(&resp);
     let scroll_y = get_data(&resp)["result"].as_f64().unwrap();
     assert!(scroll_y > 0.0, "Should have scrolled down");
+
+    let resp = execute_command(
+        &json!({
+            "id": "7",
+            "action": "evaluate",
+            "script": "document.documentElement.style.scrollBehavior = 'auto'; true"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "8", "action": "scroll", "y": 10000 }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let bottom = get_data(&resp)["after"]["y"].as_f64().unwrap();
+
+    let resp = execute_command(
+        &json!({ "id": "9", "action": "scroll", "y": 500 }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["moved"], false);
+    assert_eq!(get_data(&resp)["before"]["y"].as_f64().unwrap(), bottom);
+    assert_eq!(get_data(&resp)["after"]["y"].as_f64().unwrap(), bottom);
+
+    let resp = execute_command(
+        &json!({
+            "id": "10",
+            "action": "evaluate",
+            "script": "Object.defineProperty(window, 'requestAnimationFrame', { value: undefined, configurable: true }); true"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let fallback_started = std::time::Instant::now();
+    let resp = execute_command(
+        &json!({ "id": "11", "action": "scroll", "y": -100 }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["moved"], true);
+    assert!(
+        fallback_started.elapsed() < std::time::Duration::from_secs(2),
+        "scroll should use its bounded timeout when requestAnimationFrame is absent"
+    );
 
     // Press key
     let resp = execute_command(

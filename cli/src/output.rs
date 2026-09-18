@@ -2073,7 +2073,8 @@ agent-browser scroll - Scroll the page
 
 Usage: agent-browser scroll [direction] [amount] [options]
 
-Scrolls the page or a specific element in the specified direction.
+Scrolls the page or a specific element in the specified direction. JSON output
+includes before/after coordinates and whether the scroll actually moved.
 
 Arguments:
   direction            up, down, left, right (default: down)
@@ -2813,6 +2814,9 @@ Usage:
 When --confirm-actions is set, certain action categories return a
 confirmation_required response with a confirmation ID. Use confirm/deny
 to approve or reject the action.
+
+With --confirm-interactive, approval prints the executed command response, not
+the confirmation envelope. The process exit status reflects that inner result.
 
 Pending confirmations auto-deny after 60 seconds.
 
@@ -3620,9 +3624,11 @@ Usage:
                      [--eval-model <model>] [--text-model <model>]
 
 Gives one natural-language goal to a System One evaluation model (Jev on the
-Vercel AI Gateway by default). On every step the model receives the current
-accessibility snapshot as a numbered element table and answers two typed
-questions in one request: which operation comes next (CLICK, TYPE_TEXT,
+Vercel AI Gateway by default). On every step the model receives bounded page
+text from the current full accessibility snapshot plus a numbered element
+table. Diagnostic and paragraph text is prioritized, and actionable labels
+already in the table are not duplicated. The model answers two typed questions
+in one request: which operation comes next (CLICK, TYPE_TEXT,
 SCROLL_UP, SCROLL_DOWN, WAIT, DONE, BLOCKED) and which element index that
 operation targets. Only observed elements are offered, so the model never
 produces a selector, URL, or script. When it picks TYPE_TEXT, a small text
@@ -3632,6 +3638,13 @@ Actions run through the normal command pipeline (click @eN, fill @eN, scroll,
 wait), so action policies, --confirm-actions, --allowed-domains, and session
 isolation apply unchanged. The run stops on DONE, BLOCKED, the step budget,
 the time budget, or three consecutive actions that do not change the page.
+After the last allowed action, one final model assessment may return DONE but
+no further action can run. Scroll movement counts as page progress. A pending
+confirmation is never counted as an executed step. Without
+--confirm-interactive, the goal stops with the confirmation ID. With that flag,
+a TTY uses the normal prompt; non-TTY stdin keeps the CLI's auto-denial behavior
+and goal returns denied. Approval after the goal deadline triggers safe denial
+cleanup, returns timeout, and does not dispatch the pending action.
 DONE is the model's opinion: verify the outcome with snapshot or get url.
 
 Requires AI_GATEWAY_API_KEY. Start from a page that is already open in the
@@ -3647,7 +3660,7 @@ Goal Options:
   --debug                Also write every model request and reply to stderr
 
 Global Options:
-  --json                 Structured output with every step, probabilities, and timings
+  --json                 Structured output with every step, timings, and pending confirmation data
   --session <name>       Target session for commands
 
 Exit status is 0 only when the model reports DONE.
