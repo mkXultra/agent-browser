@@ -319,10 +319,14 @@ These environment variables configure additional daemon and runtime behavior:
     <tr><td><code>AGENT_BROWSER_COLOR</code></td><td>Enable colored CLI output when truthy.</td><td>(disabled)</td></tr>
     <tr><td><code>NO_COLOR</code></td><td>Disable colored output when present.</td><td>(not set)</td></tr>
     <tr><td><code>AI_GATEWAY_URL</code></td><td>Vercel AI Gateway base URL.</td><td><code>https://ai-gateway.vercel.sh</code></td></tr>
-    <tr><td><code>AI_GATEWAY_API_KEY</code></td><td>API key for the Vercel AI Gateway. Required to enable AI chat and the <code>goal</code> command.</td><td>(none)</td></tr>
+    <tr><td><code>AI_GATEWAY_API_KEY</code></td><td>API key for Vercel AI Gateway. Required for AI chat and Vercel goal mode.</td><td>(none)</td></tr>
     <tr><td><code>AI_GATEWAY_MODEL</code></td><td>Default AI model for dashboard chat.</td><td><code>anthropic/claude-sonnet-4.6</code></td></tr>
-    <tr><td><code>AGENT_BROWSER_GOAL_MODEL</code></td><td>Evaluation model for the <code>goal</code> command.</td><td><code>typesafe-ai/jev</code></td></tr>
-    <tr><td><code>AGENT_BROWSER_GOAL_TEXT_MODEL</code></td><td>Text model that writes <code>TYPE_TEXT</code> values for the <code>goal</code> command.</td><td><code>inception/mercury-2.5</code></td></tr>
+    <tr><td><code>AGENT_BROWSER_GOAL_PROVIDER</code></td><td>Provider for the <code>goal</code> command: <code>vercel</code> or <code>cloudflare</code>.</td><td><code>vercel</code></td></tr>
+    <tr><td><code>AGENT_BROWSER_GOAL_MODEL</code></td><td>Evaluation model for the <code>goal</code> command.</td><td>Provider default: <code>typesafe-ai/jev</code> or <code>typesafe/jev</code></td></tr>
+    <tr><td><code>AGENT_BROWSER_GOAL_TEXT_MODEL</code></td><td>Text model that writes <code>TYPE_TEXT</code> values for the <code>goal</code> command.</td><td>Provider default: <code>inception/mercury-2.5</code> or <code>@cf/qwen/qwen3-30b-a3b-fp8</code></td></tr>
+    <tr><td><code>CLOUDFLARE_ACCOUNT_ID</code></td><td>Cloudflare account ID for Cloudflare goal mode.</td><td>(none)</td></tr>
+    <tr><td><code>CLOUDFLARE_API_TOKEN</code></td><td>Cloudflare API token with Account &gt; Workers AI &gt; Read permission for Cloudflare goal mode.</td><td>(none)</td></tr>
+    <tr><td><code>CLOUDFLARE_AI_GATEWAY_ID</code></td><td>AI Gateway ID used for Cloudflare goal requests.</td><td><code>default</code></td></tr>
   </tbody>
 </table>
 

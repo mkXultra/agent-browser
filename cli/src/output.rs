@@ -3623,8 +3623,9 @@ Usage:
   agent-browser goal <text> [--max-steps <n>] [--timeout <ms>]
                      [--eval-model <model>] [--text-model <model>]
 
-Gives one natural-language goal to a System One evaluation model (Jev on the
-Vercel AI Gateway by default). On every step the model receives bounded page
+Gives one natural-language goal to a System One evaluation model. Vercel AI
+Gateway is the default provider; set AGENT_BROWSER_GOAL_PROVIDER=cloudflare to
+use Cloudflare Jev and Workers AI. On every step the model receives bounded page
 text from the current full accessibility snapshot plus a numbered element
 table. Diagnostic and paragraph text is prioritized, and actionable labels
 already in the table are not duplicated. The model answers two typed questions
@@ -3647,14 +3648,15 @@ and goal returns denied. Approval after the goal deadline triggers safe denial
 cleanup, returns timeout, and does not dispatch the pending action.
 DONE is the model's opinion: verify the outcome with snapshot or get url.
 
-Requires AI_GATEWAY_API_KEY. Start from a page that is already open in the
-session; goal does not navigate on its own.
+Vercel requires AI_GATEWAY_API_KEY. Cloudflare requires CLOUDFLARE_ACCOUNT_ID
+and CLOUDFLARE_API_TOKEN with Workers AI Read permission. Start from a page that
+is already open in the session; goal does not navigate on its own.
 
 Goal Options:
   --max-steps <n>        Action budget (default: 40)
   --timeout <ms>         Time budget in milliseconds (default: 120000)
-  --eval-model <model>   Evaluation model (or AGENT_BROWSER_GOAL_MODEL env, default: typesafe-ai/jev)
-  --text-model <model>   Text model for TYPE_TEXT (or AGENT_BROWSER_GOAL_TEXT_MODEL env, default: inception/mercury-2.5)
+  --eval-model <model>   Evaluation model (or AGENT_BROWSER_GOAL_MODEL; Vercel default: typesafe-ai/jev, Cloudflare: typesafe/jev)
+  --text-model <model>   TYPE_TEXT model (or AGENT_BROWSER_GOAL_TEXT_MODEL; Vercel default: inception/mercury-2.5, Cloudflare: @cf/qwen/qwen3-30b-a3b-fp8)
   -v, --verbose          Show probability, confidence, and page-change per step
   -q, --quiet            Print only the final result
   --debug                Also write every model request and reply to stderr
@@ -4228,10 +4230,14 @@ Environment:
   AGENT_BROWSER_SCREENSHOT_QUALITY JPEG quality 0-100
   AGENT_BROWSER_SCREENSHOT_FORMAT Screenshot format: png, jpeg
   AI_GATEWAY_URL                 Vercel AI Gateway base URL (default: https://ai-gateway.vercel.sh)
-  AI_GATEWAY_API_KEY             API key for the AI Gateway (enables chat and goal commands and dashboard AI chat)
+  AI_GATEWAY_API_KEY             Vercel AI Gateway key (enables chat, dashboard AI chat, and Vercel goal mode)
   AI_GATEWAY_MODEL               Default AI model (default: anthropic/claude-sonnet-4.6, or --model flag)
-  AGENT_BROWSER_GOAL_MODEL       Evaluation model for goal (default: typesafe-ai/jev, or --eval-model)
-  AGENT_BROWSER_GOAL_TEXT_MODEL  Text model for goal TYPE_TEXT (default: inception/mercury-2.5, or --text-model)
+  AGENT_BROWSER_GOAL_PROVIDER    Goal provider: vercel (default) or cloudflare
+  AGENT_BROWSER_GOAL_MODEL       Evaluation model for goal (provider default, or --eval-model)
+  AGENT_BROWSER_GOAL_TEXT_MODEL  Text model for goal TYPE_TEXT (provider default, or --text-model)
+  CLOUDFLARE_ACCOUNT_ID          Cloudflare account for cloudflare goal mode
+  CLOUDFLARE_API_TOKEN           Cloudflare token with Workers AI Read permission for goal mode
+  CLOUDFLARE_AI_GATEWAY_ID       Cloudflare AI Gateway ID for goal mode (default: default)
 
 Install:
   npm install -g agent-browser           # npm

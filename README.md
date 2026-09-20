@@ -1161,7 +1161,23 @@ The `chat` command translates natural language instructions into agent-browser c
 
 **Goal mode:**
 
-`goal` is the fast sibling of `chat`. Instead of a chat model writing commands, a System One evaluation model (`typesafe-ai/jev` on the AI Gateway by default) answers two typed questions on every step: which operation comes next and which element from the current snapshot it targets. It receives bounded text from the full accessibility snapshot. Alert, status, log, and paragraph text is prioritized, remaining text is sampled from both ends, and actionable labels already present in the element table are not duplicated. Only observed elements are offered, so the model never produces a selector, a URL, or a script. When it picks `TYPE_TEXT`, a small text model (`inception/mercury-2.5` by default) writes the field value from the goal. One decision costs one gateway request and typically well under a second.
+`goal` is the fast sibling of `chat`. Instead of a chat model writing commands, a System One evaluation model answers two typed questions on every step: which operation comes next and which element from the current snapshot it targets. Vercel AI Gateway remains the default provider, using `typesafe-ai/jev` for evaluation and `inception/mercury-2.5` for field text. Set `AGENT_BROWSER_GOAL_PROVIDER=cloudflare` to use Cloudflare with `typesafe/jev` and `@cf/qwen/qwen3-30b-a3b-fp8` by default. The model receives bounded text from the full accessibility snapshot. Alert, status, log, and paragraph text is prioritized, remaining text is sampled from both ends, and actionable labels already present in the element table are not duplicated. Only observed elements are offered, so the model never produces a selector, a URL, or a script. One decision costs one provider request and typically well under a second.
+
+Configure exactly one goal provider in the shell environment:
+
+```bash
+# Vercel, the default
+export AGENT_BROWSER_GOAL_PROVIDER=vercel
+export AI_GATEWAY_API_KEY=gw_your_key_here
+
+# Cloudflare
+export AGENT_BROWSER_GOAL_PROVIDER=cloudflare
+export CLOUDFLARE_ACCOUNT_ID=your_account_id
+export CLOUDFLARE_API_TOKEN=your_workers_ai_read_token
+export CLOUDFLARE_AI_GATEWAY_ID=default                    # optional
+```
+
+Cloudflare tokens need Account > Workers AI > Read permission; an AI Gateway-only token is not sufficient. `goal` does not load `.env` files automatically. Export the values directly, or explicitly load a trusted file into the current shell with `set -a; source .env; set +a` before invoking the command. Cloudflare credentials are used only by Cloudflare goal mode and are never sent to `AI_GATEWAY_URL`. This provider selection does not change `chat`, which continues to use Vercel AI Gateway.
 
 ```bash
 agent-browser open https://www.google.com/travel/flights
@@ -1178,9 +1194,11 @@ Goal options and environment variables:
 ```bash
 --max-steps <n>          # Action budget (default: 40)
 --timeout <ms>           # Time budget in milliseconds (default: 120000)
---eval-model <model>     # Evaluation model (or AGENT_BROWSER_GOAL_MODEL, default: typesafe-ai/jev)
---text-model <model>     # Text model for TYPE_TEXT (or AGENT_BROWSER_GOAL_TEXT_MODEL, default: inception/mercury-2.5)
+--eval-model <model>     # Evaluation model (or AGENT_BROWSER_GOAL_MODEL, then provider default)
+--text-model <model>     # Text model for TYPE_TEXT (or AGENT_BROWSER_GOAL_TEXT_MODEL, then provider default)
 ```
+
+Command-line model options take precedence over their environment variables. The environment variables take precedence over the selected provider's defaults. JSON output includes the selected `provider`, `model`, and `textModel`.
 
 **Dashboard usage:**
 

@@ -529,7 +529,23 @@ Chat-specific options:
 
 ## Goal
 
-Give the open page one natural-language goal and let an evaluation model choose every action. On each step the `goal` command sends bounded text from the full accessibility snapshot plus a numbered element table to the model (`typesafe-ai/jev` on the AI Gateway by default), which answers two typed questions in one request: the next operation and the element index it targets. Alert, status, log, and paragraph text is prioritized, remaining text is sampled from both ends, and actionable labels already present in the element table are not duplicated. Only observed elements are offered, so the model never produces a selector, a URL, or a script. When the operation is `TYPE_TEXT`, a small text model writes the field value from the goal. Requires `AI_GATEWAY_API_KEY` to be set.
+Give the open page one natural-language goal and let an evaluation model choose every action. On each step the `goal` command sends bounded text from the full accessibility snapshot plus a numbered element table to the model, which answers two typed questions in one request: the next operation and the element index it targets. Alert, status, log, and paragraph text is prioritized, remaining text is sampled from both ends, and actionable labels already present in the element table are not duplicated. Only observed elements are offered, so the model never produces a selector, a URL, or a script. When the operation is `TYPE_TEXT`, a small text model writes the field value from the goal.
+
+Vercel AI Gateway is the default goal provider. Set `AGENT_BROWSER_GOAL_PROVIDER=cloudflare` to use Cloudflare instead:
+
+```bash
+# Vercel
+export AGENT_BROWSER_GOAL_PROVIDER=vercel
+export AI_GATEWAY_API_KEY=gw_your_key_here
+
+# Cloudflare
+export AGENT_BROWSER_GOAL_PROVIDER=cloudflare
+export CLOUDFLARE_ACCOUNT_ID=your_account_id
+export CLOUDFLARE_API_TOKEN=your_workers_ai_read_token
+export CLOUDFLARE_AI_GATEWAY_ID=default                    # optional
+```
+
+The Cloudflare token needs Account > Workers AI > Read permission; an AI Gateway-only token is not sufficient. The CLI does not load `.env` automatically. Export variables directly, or load a trusted file into the current shell with `set -a; source .env; set +a`. Cloudflare goal credentials are never sent to the Vercel gateway, and selecting Cloudflare for `goal` does not change `chat`.
 
 ```bash
 agent-browser open https://www.google.com/travel/flights
@@ -562,16 +578,16 @@ Goal-specific options:
     </tr>
     <tr>
       <td><code>--eval-model &lt;model&gt;</code></td>
-      <td>Evaluation model, or <code>AGENT_BROWSER_GOAL_MODEL</code> (default: <code>typesafe-ai/jev</code>)</td>
+      <td>Evaluation model, or <code>AGENT_BROWSER_GOAL_MODEL</code> (Vercel default: <code>typesafe-ai/jev</code>; Cloudflare default: <code>typesafe/jev</code>)</td>
     </tr>
     <tr>
       <td><code>--text-model &lt;model&gt;</code></td>
-      <td>Text model for <code>TYPE_TEXT</code>, or <code>AGENT_BROWSER_GOAL_TEXT_MODEL</code> (default: <code>inception/mercury-2.5</code>)</td>
+      <td>Text model for <code>TYPE_TEXT</code>, or <code>AGENT_BROWSER_GOAL_TEXT_MODEL</code> (Vercel default: <code>inception/mercury-2.5</code>; Cloudflare default: <code>@cf/qwen/qwen3-30b-a3b-fp8</code>)</td>
     </tr>
   </tbody>
 </table>
 
-`--debug` additionally writes every model request and reply to stderr, which is the quickest way to see what the model was offered on a step that went wrong. The `--json` result carries `status` (`done`, `blocked`, `denied`, `timeout`, `confirmation_required`, or `error`), the final `url`, `elapsedMs`, pending confirmation fields when applicable, and one entry per executed step with the operation, the target ref, role and name, any typed text, the target probability, the model's confidence, the operation distribution, and per-phase timings.
+Command-line model options override `AGENT_BROWSER_GOAL_MODEL` and `AGENT_BROWSER_GOAL_TEXT_MODEL`; those environment variables override the selected provider's defaults. `--debug` additionally writes every model request and reply to stderr, which is the quickest way to see what the model was offered on a step that went wrong. The `--json` result carries the selected `provider`, `model`, and `textModel`, plus `status` (`done`, `blocked`, `denied`, `timeout`, `confirmation_required`, or `error`), the final `url`, `elapsedMs`, pending confirmation fields when applicable, and one entry per executed step with the operation, the target ref, role and name, any typed text, the target probability, the model's confidence, the operation distribution, and per-phase timings.
 
 ## Navigation
 

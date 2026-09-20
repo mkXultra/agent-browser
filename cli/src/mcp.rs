@@ -1898,13 +1898,13 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_GOAL,
             "Goal",
-            "Drive the open page toward one natural-language goal. An evaluation model picks an operation and an observed element on every step; actions run through the normal command pipeline. Pending confirmations stop safely and are returned with their confirmation ID. Requires AI_GATEWAY_API_KEY. Verify the outcome afterwards; DONE is the model's opinion.",
+            "Drive the open page toward one natural-language goal. An evaluation model picks an operation and an observed element on every step; actions run through the normal command pipeline. Pending confirmations stop safely and are returned with their confirmation ID. Uses the goal provider selected by AGENT_BROWSER_GOAL_PROVIDER: Vercel by default, or Cloudflare. Verify the outcome afterwards; DONE is the model's opinion.",
             json!({
                 "goal": { "type": "string", "description": "What to achieve on the open page, including when to stop." },
                 "maxSteps": { "type": "integer", "minimum": 1, "description": "Action budget (default 40)." },
                 "timeoutMs": { "type": "integer", "minimum": 1, "default": 120000, "description": "Goal time budget in milliseconds. The MCP subprocess receives an additional 10000 ms so the goal can return its structured timeout result." },
-                "evalModel": { "type": "string", "description": "Evaluation model (default typesafe-ai/jev)." },
-                "textModel": { "type": "string", "description": "Text model for TYPE_TEXT (default inception/mercury-2.5)." }
+                "evalModel": { "type": "string", "description": "Evaluation model (Vercel default typesafe-ai/jev; Cloudflare default typesafe/jev)." },
+                "textModel": { "type": "string", "description": "Text model for TYPE_TEXT (Vercel default inception/mercury-2.5; Cloudflare default @cf/qwen/qwen3-30b-a3b-fp8)." }
             }),
             &["goal"],
         ),
@@ -4876,6 +4876,22 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .starts_with("Goal time budget")
+        );
+        assert!(goal_tool["description"]
+            .as_str()
+            .unwrap()
+            .contains("AGENT_BROWSER_GOAL_PROVIDER"));
+        assert!(
+            goal_tool["inputSchema"]["properties"]["evalModel"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Cloudflare default typesafe/jev")
+        );
+        assert!(
+            goal_tool["inputSchema"]["properties"]["textModel"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("@cf/qwen/qwen3-30b-a3b-fp8")
         );
         assert!(goal_args(&json!({})).is_err());
     }
