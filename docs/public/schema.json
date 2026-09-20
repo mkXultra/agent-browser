@@ -218,6 +218,54 @@
       "type": "string",
       "description": "AI model for chat command (e.g., 'openai/gpt-4o')."
     },
+    "goal": {
+      "type": "object",
+      "description": "Goal-command provider, model, and credential settings. Credentials are plaintext; prefer the user config with mode 600 and never commit secrets in a project config.",
+      "properties": {
+        "provider": {
+          "type": "string",
+          "enum": ["vercel", "cloudflare"],
+          "description": "Goal provider. Defaults to vercel. AGENT_BROWSER_GOAL_PROVIDER overrides this value."
+        },
+        "evalModel": {
+          "type": "string",
+          "description": "Evaluation model. The command-local --eval-model option and AGENT_BROWSER_GOAL_MODEL take precedence."
+        },
+        "textModel": {
+          "type": "string",
+          "description": "Text model for TYPE_TEXT. The command-local --text-model option and AGENT_BROWSER_GOAL_TEXT_MODEL take precedence."
+        },
+        "cloudflare": {
+          "type": "object",
+          "properties": {
+            "accountId": {
+              "type": "string",
+              "description": "Cloudflare account ID. CLOUDFLARE_ACCOUNT_ID takes precedence."
+            },
+            "apiToken": {
+              "type": "string",
+              "description": "Cloudflare API token with Workers AI Read permission, stored as plaintext. CLOUDFLARE_API_TOKEN takes precedence."
+            },
+            "gatewayId": {
+              "type": "string",
+              "description": "Cloudflare AI Gateway ID. Defaults to default; CLOUDFLARE_AI_GATEWAY_ID takes precedence."
+            }
+          },
+          "additionalProperties": true
+        },
+        "vercel": {
+          "type": "object",
+          "properties": {
+            "apiKey": {
+              "type": "string",
+              "description": "Vercel AI Gateway API key for goal mode, stored as plaintext. AI_GATEWAY_API_KEY takes precedence."
+            }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
     "noAutoDialog": {
       "type": "boolean",
       "description": "Disable automatic dismissal of alert/beforeunload dialogs."

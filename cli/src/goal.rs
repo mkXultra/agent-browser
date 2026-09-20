@@ -23,6 +23,7 @@
 //! are held by separate clients and are never forwarded to the other service.
 
 use std::collections::{BTreeMap, HashSet};
+use std::fmt;
 use std::process::exit;
 use std::time::{Duration, Instant};
 
@@ -31,7 +32,7 @@ use sha2::{Digest, Sha256};
 
 use crate::color;
 use crate::connection::{DaemonOptions, Response};
-use crate::flags::Flags;
+use crate::flags::{Flags, GoalSettings};
 use crate::native::stream::chat;
 
 /// Evaluation model that picks the operation and target on every step.
@@ -542,7 +543,8 @@ struct Decision {
     model_ms: u128,
 }
 
-/// Configuration parsed from the `goal` command and environment.
+/// Configuration resolved once from command-local options, environment, and
+/// the merged config file settings carried by [`Flags`].
 #[derive(Debug)]
 pub(crate) struct GoalConfig {
     pub goal: String,
@@ -551,8 +553,43 @@ pub(crate) struct GoalConfig {
     pub provider: GoalProvider,
     pub eval_model: String,
     pub text_model: String,
+    backend: GoalBackend,
     /// With `--debug`, every model request and reply is written to stderr.
     pub debug: bool,
+}
+
+enum GoalBackend {
+    Vercel {
+        api_key: Option<String>,
+        url: String,
+    },
+    Cloudflare {
+        account_id: Option<String>,
+        api_token: Option<String>,
+        gateway_id: String,
+    },
+}
+
+impl fmt::Debug for GoalBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Vercel { api_key, url } => f
+                .debug_struct("Vercel")
+                .field("api_key", &api_key.as_ref().map(|_| "[REDACTED]"))
+                .field("url", &(!url.is_empty()).then_some("[CONFIGURED]"))
+                .finish(),
+            Self::Cloudflare {
+                account_id,
+                api_token,
+                gateway_id,
+            } => f
+                .debug_struct("Cloudflare")
+                .field("account_id", account_id)
+                .field("api_token", &api_token.as_ref().map(|_| "[REDACTED]"))
+                .field("gateway_id", gateway_id)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -562,17 +599,24 @@ pub(crate) enum GoalProvider {
 }
 
 impl GoalProvider {
-    fn from_env() -> Result<Self, String> {
-        match std::env::var("AGENT_BROWSER_GOAL_PROVIDER")
-            .unwrap_or_else(|_| "vercel".to_string())
-            .trim()
-        {
+    fn from_value(value: &str, source: &str) -> Result<Self, String> {
+        match value.trim() {
             "vercel" => Ok(Self::Vercel),
             "cloudflare" => Ok(Self::Cloudflare),
             value => Err(format!(
-                "Invalid AGENT_BROWSER_GOAL_PROVIDER {:?}; expected vercel or cloudflare",
-                value
+                "Invalid goal provider {:?} from {}; expected vercel or cloudflare",
+                value, source
             )),
+        }
+    }
+
+    fn resolve(settings: &GoalSettings) -> Result<Self, String> {
+        match std::env::var("AGENT_BROWSER_GOAL_PROVIDER") {
+            Ok(value) => Self::from_value(&value, "AGENT_BROWSER_GOAL_PROVIDER"),
+            Err(_) => match settings.provider.as_deref() {
+                Some(value) => Self::from_value(value, "config goal.provider"),
+                None => Ok(Self::Vercel),
+            },
         }
     }
 
@@ -599,13 +643,50 @@ impl GoalProvider {
 }
 
 impl GoalConfig {
-    pub(crate) fn from_command(cmd: &Value) -> Result<Self, String> {
-        let provider = GoalProvider::from_env()?;
-        let env_model = |key: &str, default: &str| {
-            std::env::var(key)
-                .ok()
-                .filter(|v| !v.trim().is_empty())
-                .unwrap_or_else(|| default.to_string())
+    pub(crate) fn from_command(cmd: &Value, settings: &GoalSettings) -> Result<Self, String> {
+        let provider = GoalProvider::resolve(settings)?;
+        let resolve_model =
+            |command_key: &str, env_key: &str, configured: Option<&String>, default: &str| {
+                cmd.get(command_key)
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| nonempty_env(env_key))
+                    .or_else(|| configured.filter(|value| !value.trim().is_empty()).cloned())
+                    .unwrap_or_else(|| default.to_string())
+            };
+        let backend = match provider {
+            GoalProvider::Vercel => GoalBackend::Vercel {
+                api_key: nonempty_env("AI_GATEWAY_API_KEY").or_else(|| {
+                    settings
+                        .vercel
+                        .as_ref()
+                        .and_then(|vercel| nonempty_value(vercel.api_key.as_ref()))
+                }),
+                url: std::env::var("AI_GATEWAY_URL")
+                    .unwrap_or_else(|_| chat::DEFAULT_AI_GATEWAY_URL.to_string()),
+            },
+            GoalProvider::Cloudflare => GoalBackend::Cloudflare {
+                account_id: nonempty_env("CLOUDFLARE_ACCOUNT_ID").or_else(|| {
+                    settings
+                        .cloudflare
+                        .as_ref()
+                        .and_then(|cloudflare| nonempty_value(cloudflare.account_id.as_ref()))
+                }),
+                api_token: nonempty_env("CLOUDFLARE_API_TOKEN").or_else(|| {
+                    settings
+                        .cloudflare
+                        .as_ref()
+                        .and_then(|cloudflare| nonempty_value(cloudflare.api_token.as_ref()))
+                }),
+                gateway_id: nonempty_env("CLOUDFLARE_AI_GATEWAY_ID")
+                    .or_else(|| {
+                        settings
+                            .cloudflare
+                            .as_ref()
+                            .and_then(|cloudflare| nonempty_value(cloudflare.gateway_id.as_ref()))
+                    })
+                    .unwrap_or_else(|| DEFAULT_CLOUDFLARE_GATEWAY_ID.to_string()),
+            },
         };
         Ok(GoalConfig {
             goal: cmd
@@ -622,26 +703,32 @@ impl GoalConfig {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(DEFAULT_TIMEOUT_MS),
             provider,
-            eval_model: cmd
-                .get("model")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| {
-                    env_model("AGENT_BROWSER_GOAL_MODEL", provider.default_eval_model())
-                }),
-            text_model: cmd
-                .get("textModel")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| {
-                    env_model(
-                        "AGENT_BROWSER_GOAL_TEXT_MODEL",
-                        provider.default_text_model(),
-                    )
-                }),
+            eval_model: resolve_model(
+                "model",
+                "AGENT_BROWSER_GOAL_MODEL",
+                settings.eval_model.as_ref(),
+                provider.default_eval_model(),
+            ),
+            text_model: resolve_model(
+                "textModel",
+                "AGENT_BROWSER_GOAL_TEXT_MODEL",
+                settings.text_model.as_ref(),
+                provider.default_text_model(),
+            ),
+            backend,
             debug: false,
         })
     }
+}
+
+fn nonempty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn nonempty_value(value: Option<&String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty()).cloned()
 }
 
 /// A command outcome that the goal loop must distinguish from an executed
@@ -695,25 +782,38 @@ struct Gateway {
 }
 
 impl Gateway {
-    fn from_env(provider: GoalProvider) -> Result<Self, String> {
-        match provider {
-            GoalProvider::Vercel => {
-                let api_key = required_env("AI_GATEWAY_API_KEY", "Vercel goal provider")?;
-                let url = std::env::var("AI_GATEWAY_URL")
-                    .unwrap_or_else(|_| chat::DEFAULT_AI_GATEWAY_URL.to_string());
-                Self::new(GatewayProvider::Vercel, url, api_key)
+    fn from_config(config: &GoalConfig) -> Result<Self, String> {
+        match &config.backend {
+            GoalBackend::Vercel { api_key, url } => {
+                let api_key = required_setting(
+                    api_key,
+                    "AI_GATEWAY_API_KEY",
+                    "goal.vercel.apiKey",
+                    "Vercel goal provider",
+                )?;
+                Self::new(GatewayProvider::Vercel, url.clone(), api_key)
             }
-            GoalProvider::Cloudflare => {
-                let account_id = required_env("CLOUDFLARE_ACCOUNT_ID", "Cloudflare goal provider")?;
-                let api_key = required_env("CLOUDFLARE_API_TOKEN", "Cloudflare goal provider")?;
-                let gateway_id = std::env::var("CLOUDFLARE_AI_GATEWAY_ID")
-                    .ok()
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or_else(|| DEFAULT_CLOUDFLARE_GATEWAY_ID.to_string());
+            GoalBackend::Cloudflare {
+                account_id,
+                api_token,
+                gateway_id,
+            } => {
+                let account_id = required_setting(
+                    account_id,
+                    "CLOUDFLARE_ACCOUNT_ID",
+                    "goal.cloudflare.accountId",
+                    "Cloudflare goal provider",
+                )?;
+                let api_key = required_setting(
+                    api_token,
+                    "CLOUDFLARE_API_TOKEN",
+                    "goal.cloudflare.apiToken",
+                    "Cloudflare goal provider",
+                )?;
                 Self::new(
                     GatewayProvider::Cloudflare {
                         account_id,
-                        gateway_id,
+                        gateway_id: gateway_id.clone(),
                     },
                     DEFAULT_CLOUDFLARE_API_URL.to_string(),
                     api_key,
@@ -753,6 +853,13 @@ impl Gateway {
     #[cfg(test)]
     fn vercel_for_test(url: String, api_key: &str) -> Result<Self, String> {
         Self::new(GatewayProvider::Vercel, url, api_key.to_string())
+    }
+
+    #[cfg(test)]
+    fn from_config_with_url_for_test(config: &GoalConfig, url: String) -> Result<Self, String> {
+        let mut gateway = Self::from_config(config)?;
+        gateway.url = url.trim_end_matches('/').to_string();
+        Ok(gateway)
     }
 
     fn provider_name(&self) -> &'static str {
@@ -900,11 +1007,15 @@ impl Gateway {
     }
 }
 
-fn required_env(name: &str, provider: &str) -> Result<String, String> {
-    std::env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| format!("{} not set. {} requires {}.", name, provider, name))
+fn required_setting(
+    value: &Option<String>,
+    env_name: &str,
+    config_name: &str,
+    provider: &str,
+) -> Result<String, String> {
+    value
+        .clone()
+        .ok_or_else(|| format!("{} requires {} or {}.", provider, env_name, config_name))
 }
 
 fn api_error_detail(text: &str) -> Option<String> {
@@ -2013,7 +2124,7 @@ pub(crate) fn run_goal_loop(
 
 /// Entry point from `main`: runs the goal and prints the result.
 pub fn run_goal(flags: &Flags, _daemon_opts: &DaemonOptions, cmd: &Value, run: &CommandRunner) {
-    let mut config = match GoalConfig::from_command(cmd) {
+    let mut config = match GoalConfig::from_command(cmd, &flags.goal) {
         Ok(config) => config,
         Err(error) => fail(flags.json, &error),
     };
@@ -2021,7 +2132,7 @@ pub fn run_goal(flags: &Flags, _daemon_opts: &DaemonOptions, cmd: &Value, run: &
     if config.goal.trim().is_empty() {
         fail(flags.json, "goal requires a goal sentence, for example: agent-browser goal \"Open the pricing page\"");
     }
-    let gateway = match Gateway::from_env(config.provider) {
+    let gateway = match Gateway::from_config(&config) {
         Ok(g) => g,
         Err(e) => fail(flags.json, &e),
     };
@@ -2463,18 +2574,28 @@ mod tests {
         guard.remove("AGENT_BROWSER_GOAL_PROVIDER");
         guard.remove("AGENT_BROWSER_GOAL_MODEL");
         guard.remove("AGENT_BROWSER_GOAL_TEXT_MODEL");
-        let config =
-            GoalConfig::from_command(&json!({ "goal": "g", "maxSteps": 5, "timeoutMs": 1000 }))
-                .unwrap();
+        guard.remove("AI_GATEWAY_API_KEY");
+        guard.remove("AI_GATEWAY_URL");
+        guard.remove("CLOUDFLARE_ACCOUNT_ID");
+        guard.remove("CLOUDFLARE_API_TOKEN");
+        guard.remove("CLOUDFLARE_AI_GATEWAY_ID");
+        let settings = GoalSettings::default();
+        let config = GoalConfig::from_command(
+            &json!({ "goal": "g", "maxSteps": 5, "timeoutMs": 1000 }),
+            &settings,
+        )
+        .unwrap();
         assert_eq!(config.goal, "g");
         assert_eq!(config.max_steps, 5);
         assert_eq!(config.timeout_ms, 1000);
         assert_eq!(config.provider, GoalProvider::Vercel);
         assert_eq!(config.eval_model, DEFAULT_EVAL_MODEL);
         assert_eq!(config.text_model, DEFAULT_TEXT_MODEL);
-        let config =
-            GoalConfig::from_command(&json!({ "goal": "g", "model": "m", "textModel": "t" }))
-                .unwrap();
+        let config = GoalConfig::from_command(
+            &json!({ "goal": "g", "model": "m", "textModel": "t" }),
+            &settings,
+        )
+        .unwrap();
         assert_eq!(
             (config.eval_model.as_str(), config.text_model.as_str()),
             ("m", "t")
@@ -2482,27 +2603,170 @@ mod tests {
         assert_eq!(config.max_steps, DEFAULT_MAX_STEPS);
 
         guard.set("AGENT_BROWSER_GOAL_PROVIDER", "cloudflare");
-        let config = GoalConfig::from_command(&json!({ "goal": "g" })).unwrap();
+        let config = GoalConfig::from_command(&json!({ "goal": "g" }), &settings).unwrap();
         assert_eq!(config.provider, GoalProvider::Cloudflare);
         assert_eq!(config.eval_model, DEFAULT_CLOUDFLARE_EVAL_MODEL);
         assert_eq!(config.text_model, DEFAULT_CLOUDFLARE_TEXT_MODEL);
 
         guard.set("AGENT_BROWSER_GOAL_MODEL", "env-eval");
         guard.set("AGENT_BROWSER_GOAL_TEXT_MODEL", "env-text");
-        let config = GoalConfig::from_command(&json!({ "goal": "g" })).unwrap();
+        let config = GoalConfig::from_command(&json!({ "goal": "g" }), &settings).unwrap();
         assert_eq!(config.eval_model, "env-eval");
         assert_eq!(config.text_model, "env-text");
         let config = GoalConfig::from_command(
             &json!({ "goal": "g", "model": "cli-eval", "textModel": "cli-text" }),
+            &settings,
         )
         .unwrap();
         assert_eq!(config.eval_model, "cli-eval");
         assert_eq!(config.text_model, "cli-text");
 
         guard.set("AGENT_BROWSER_GOAL_PROVIDER", "unknown");
-        assert!(GoalConfig::from_command(&json!({ "goal": "g" }))
+        assert!(GoalConfig::from_command(&json!({ "goal": "g" }), &settings)
             .unwrap_err()
             .contains("expected vercel or cloudflare"));
+    }
+
+    #[test]
+    fn goal_config_precedence_and_provider_credentials_are_resolved_once() {
+        let guard = crate::test_utils::EnvGuard::new(&[
+            "AGENT_BROWSER_GOAL_PROVIDER",
+            "AGENT_BROWSER_GOAL_MODEL",
+            "AGENT_BROWSER_GOAL_TEXT_MODEL",
+            "AI_GATEWAY_API_KEY",
+            "AI_GATEWAY_URL",
+            "CLOUDFLARE_ACCOUNT_ID",
+            "CLOUDFLARE_API_TOKEN",
+            "CLOUDFLARE_AI_GATEWAY_ID",
+        ]);
+        for name in [
+            "AGENT_BROWSER_GOAL_PROVIDER",
+            "AGENT_BROWSER_GOAL_MODEL",
+            "AGENT_BROWSER_GOAL_TEXT_MODEL",
+            "AI_GATEWAY_API_KEY",
+            "AI_GATEWAY_URL",
+            "CLOUDFLARE_ACCOUNT_ID",
+            "CLOUDFLARE_API_TOKEN",
+            "CLOUDFLARE_AI_GATEWAY_ID",
+        ] {
+            guard.remove(name);
+        }
+        let settings: GoalSettings = serde_json::from_value(json!({
+            "provider": "cloudflare",
+            "evalModel": "config-eval",
+            "textModel": "config-text",
+            "cloudflare": {
+                "accountId": "config-account",
+                "apiToken": "config-token",
+                "gatewayId": "config-gateway"
+            },
+            "vercel": { "apiKey": "config-vercel-key" }
+        }))
+        .unwrap();
+
+        let config = GoalConfig::from_command(&json!({ "goal": "g" }), &settings).unwrap();
+        assert_eq!(config.provider, GoalProvider::Cloudflare);
+        assert_eq!(config.eval_model, "config-eval");
+        assert_eq!(config.text_model, "config-text");
+        match &config.backend {
+            GoalBackend::Cloudflare {
+                account_id,
+                api_token,
+                gateway_id,
+            } => {
+                assert_eq!(account_id.as_deref(), Some("config-account"));
+                assert_eq!(api_token.as_deref(), Some("config-token"));
+                assert_eq!(gateway_id, "config-gateway");
+            }
+            GoalBackend::Vercel { .. } => panic!("wrong provider"),
+        }
+
+        guard.set("AGENT_BROWSER_GOAL_MODEL", "env-eval");
+        guard.set("AGENT_BROWSER_GOAL_TEXT_MODEL", "env-text");
+        guard.set("CLOUDFLARE_ACCOUNT_ID", "env-account");
+        guard.set("CLOUDFLARE_API_TOKEN", "env-token");
+        guard.set("CLOUDFLARE_AI_GATEWAY_ID", "env-gateway");
+        let config = GoalConfig::from_command(
+            &json!({ "goal": "g", "model": "cli-eval", "textModel": "cli-text" }),
+            &settings,
+        )
+        .unwrap();
+        assert_eq!(config.eval_model, "cli-eval");
+        assert_eq!(config.text_model, "cli-text");
+        match &config.backend {
+            GoalBackend::Cloudflare {
+                account_id,
+                api_token,
+                gateway_id,
+            } => {
+                assert_eq!(account_id.as_deref(), Some("env-account"));
+                assert_eq!(api_token.as_deref(), Some("env-token"));
+                assert_eq!(gateway_id, "env-gateway");
+            }
+            GoalBackend::Vercel { .. } => panic!("wrong provider"),
+        }
+
+        guard.set("AGENT_BROWSER_GOAL_MODEL", "");
+        guard.set("AGENT_BROWSER_GOAL_TEXT_MODEL", "");
+        let config = GoalConfig::from_command(&json!({ "goal": "g" }), &settings).unwrap();
+        assert_eq!(config.eval_model, "config-eval");
+        assert_eq!(config.text_model, "config-text");
+
+        guard.set("AGENT_BROWSER_GOAL_PROVIDER", "vercel");
+        let config = GoalConfig::from_command(&json!({ "goal": "g" }), &settings).unwrap();
+        assert_eq!(config.provider, GoalProvider::Vercel);
+        match &config.backend {
+            GoalBackend::Vercel { api_key, .. } => {
+                assert_eq!(api_key.as_deref(), Some("config-vercel-key"))
+            }
+            GoalBackend::Cloudflare { .. } => panic!("wrong provider"),
+        }
+        assert!(Gateway::from_config(&config).is_ok());
+    }
+
+    #[test]
+    fn goal_config_debug_redacts_selected_provider_secret() {
+        let guard = crate::test_utils::EnvGuard::new(&[
+            "AGENT_BROWSER_GOAL_PROVIDER",
+            "AGENT_BROWSER_GOAL_MODEL",
+            "AGENT_BROWSER_GOAL_TEXT_MODEL",
+            "CLOUDFLARE_ACCOUNT_ID",
+            "CLOUDFLARE_API_TOKEN",
+            "CLOUDFLARE_AI_GATEWAY_ID",
+        ]);
+        for name in [
+            "AGENT_BROWSER_GOAL_PROVIDER",
+            "AGENT_BROWSER_GOAL_MODEL",
+            "AGENT_BROWSER_GOAL_TEXT_MODEL",
+            "CLOUDFLARE_ACCOUNT_ID",
+            "CLOUDFLARE_API_TOKEN",
+            "CLOUDFLARE_AI_GATEWAY_ID",
+        ] {
+            guard.remove(name);
+        }
+        let settings: GoalSettings = serde_json::from_value(json!({
+            "provider": "cloudflare",
+            "cloudflare": {
+                "accountId": "account",
+                "apiToken": "never-print-this-token"
+            }
+        }))
+        .unwrap();
+        let config = GoalConfig::from_command(&json!({ "goal": "g" }), &settings).unwrap();
+        let debug = format!("{config:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("never-print-this-token"));
+    }
+
+    #[test]
+    fn invalid_provider_in_goal_config_fails_closed() {
+        let guard = crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_GOAL_PROVIDER"]);
+        guard.remove("AGENT_BROWSER_GOAL_PROVIDER");
+        let settings: GoalSettings =
+            serde_json::from_value(json!({ "provider": "CloudFlare" })).unwrap();
+        let error = GoalConfig::from_command(&json!({ "goal": "g" }), &settings).unwrap_err();
+        assert!(error.contains("config goal.provider"));
+        assert!(error.contains("expected vercel or cloudflare"));
     }
 
     fn mock_http_server(
@@ -2663,6 +2927,94 @@ mod tests {
                 },
             })
         );
+    }
+
+    #[test]
+    fn explicit_config_only_cloudflare_settings_reach_the_transport() {
+        let guard = crate::test_utils::EnvGuard::new(&[
+            "AGENT_BROWSER_CONFIG",
+            "AGENT_BROWSER_GOAL_PROVIDER",
+            "AGENT_BROWSER_GOAL_MODEL",
+            "AGENT_BROWSER_GOAL_TEXT_MODEL",
+            "AI_GATEWAY_MODEL",
+            "CLOUDFLARE_ACCOUNT_ID",
+            "CLOUDFLARE_API_TOKEN",
+            "CLOUDFLARE_AI_GATEWAY_ID",
+        ]);
+        for name in [
+            "AGENT_BROWSER_CONFIG",
+            "AGENT_BROWSER_GOAL_PROVIDER",
+            "AGENT_BROWSER_GOAL_MODEL",
+            "AGENT_BROWSER_GOAL_TEXT_MODEL",
+            "AI_GATEWAY_MODEL",
+            "CLOUDFLARE_ACCOUNT_ID",
+            "CLOUDFLARE_API_TOKEN",
+            "CLOUDFLARE_AI_GATEWAY_ID",
+        ] {
+            guard.remove(name);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("goal.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+                "goal": {
+                    "provider": "cloudflare",
+                    "cloudflare": {
+                        "accountId": "config-account",
+                        "apiToken": "config-token",
+                        "gatewayId": "config-gateway"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let cli_args = vec![
+            "--config".to_string(),
+            config_path.to_string_lossy().to_string(),
+            "goal".to_string(),
+            "finish".to_string(),
+        ];
+        let flags = crate::flags::parse_flags(&cli_args);
+        assert_eq!(flags.model, None, "goal config must not configure chat");
+        let config = GoalConfig::from_command(&json!({ "goal": "finish" }), &flags.goal).unwrap();
+        assert_eq!(config.provider, GoalProvider::Cloudflare);
+        assert_eq!(config.eval_model, DEFAULT_CLOUDFLARE_EVAL_MODEL);
+        assert_eq!(config.text_model, DEFAULT_CLOUDFLARE_TEXT_MODEL);
+
+        let raw = json!({
+            "model": "jev-1.13.0",
+            "answers": { "operation": { "choice": "DONE" } }
+        });
+        let (url, request, server) = mock_http_server(
+            200,
+            json!({
+                "success": true,
+                "result": { "state": "Completed", "result": raw },
+                "errors": [],
+                "messages": []
+            }),
+            Duration::ZERO,
+        );
+        let gateway =
+            Gateway::from_config_with_url_for_test(&config, format!("{url}/client/v4")).unwrap();
+        assert_eq!(
+            gateway
+                .evaluate(
+                    &config.eval_model,
+                    &json!({ "page": "state" }),
+                    &json!({ "operation": { "type": "choice" } }),
+                    Duration::from_secs(2),
+                )
+                .unwrap(),
+            raw
+        );
+        let captured = request.recv_timeout(Duration::from_secs(1)).unwrap();
+        server.join().unwrap();
+        let lower = captured.to_ascii_lowercase();
+        assert!(lower.starts_with("post /client/v4/accounts/config-account/ai/run http/1.1"));
+        assert!(lower.contains("authorization: bearer config-token"));
+        assert!(lower.contains("cf-aig-gateway-id: config-gateway"));
     }
 
     #[test]
@@ -2967,6 +3319,7 @@ mod tests {
     #[test]
     fn provider_credentials_are_required_without_cross_provider_fallback() {
         let guard = crate::test_utils::EnvGuard::new(&[
+            "AGENT_BROWSER_GOAL_PROVIDER",
             "AI_GATEWAY_API_KEY",
             "AI_GATEWAY_URL",
             "CLOUDFLARE_ACCOUNT_ID",
@@ -2977,23 +3330,50 @@ mod tests {
         guard.remove("CLOUDFLARE_ACCOUNT_ID");
         guard.remove("CLOUDFLARE_API_TOKEN");
         guard.remove("CLOUDFLARE_AI_GATEWAY_ID");
-        assert!(Gateway::from_env(GoalProvider::Vercel)
+        guard.remove("AGENT_BROWSER_GOAL_PROVIDER");
+        let empty = GoalSettings::default();
+        let only_cloudflare_credentials: GoalSettings = serde_json::from_value(json!({
+            "vercel": {},
+            "cloudflare": { "accountId": "acct", "apiToken": "cf-only" }
+        }))
+        .unwrap();
+        let vercel =
+            GoalConfig::from_command(&json!({ "goal": "g" }), &only_cloudflare_credentials)
+                .unwrap();
+        assert!(Gateway::from_config(&vercel)
             .err()
             .unwrap()
             .contains("AI_GATEWAY_API_KEY"));
 
+        let incomplete_cloudflare: GoalSettings = serde_json::from_value(json!({
+            "provider": "cloudflare",
+            "cloudflare": { "accountId": "config-account" },
+            "vercel": { "apiKey": "wrong-provider-key" }
+        }))
+        .unwrap();
+        let cloudflare =
+            GoalConfig::from_command(&json!({ "goal": "g" }), &incomplete_cloudflare).unwrap();
+        let error = Gateway::from_config(&cloudflare).err().unwrap();
+        assert!(error.contains("CLOUDFLARE_API_TOKEN"));
+        assert!(error.contains("goal.cloudflare.apiToken"));
+        assert!(!error.contains("wrong-provider-key"));
+
         guard.set("AI_GATEWAY_API_KEY", "vercel-only");
-        assert!(Gateway::from_env(GoalProvider::Cloudflare)
+        guard.set("AGENT_BROWSER_GOAL_PROVIDER", "cloudflare");
+        let cloudflare = GoalConfig::from_command(&json!({ "goal": "g" }), &empty).unwrap();
+        assert!(Gateway::from_config(&cloudflare)
             .err()
             .unwrap()
             .contains("CLOUDFLARE_ACCOUNT_ID"));
         guard.set("CLOUDFLARE_ACCOUNT_ID", "acct");
-        assert!(Gateway::from_env(GoalProvider::Cloudflare)
+        let cloudflare = GoalConfig::from_command(&json!({ "goal": "g" }), &empty).unwrap();
+        assert!(Gateway::from_config(&cloudflare)
             .err()
             .unwrap()
             .contains("CLOUDFLARE_API_TOKEN"));
         guard.set("CLOUDFLARE_API_TOKEN", "cf-token");
-        let gateway = Gateway::from_env(GoalProvider::Cloudflare).unwrap();
+        let cloudflare = GoalConfig::from_command(&json!({ "goal": "g" }), &empty).unwrap();
+        let gateway = Gateway::from_config(&cloudflare).unwrap();
         match gateway.provider {
             GatewayProvider::Cloudflare { gateway_id, .. } => {
                 assert_eq!(gateway_id, DEFAULT_CLOUDFLARE_GATEWAY_ID)
@@ -3001,7 +3381,8 @@ mod tests {
             GatewayProvider::Vercel => panic!("wrong provider"),
         }
         guard.set("CLOUDFLARE_AI_GATEWAY_ID", "custom");
-        let gateway = Gateway::from_env(GoalProvider::Cloudflare).unwrap();
+        let cloudflare = GoalConfig::from_command(&json!({ "goal": "g" }), &empty).unwrap();
+        let gateway = Gateway::from_config(&cloudflare).unwrap();
         match gateway.provider {
             GatewayProvider::Cloudflare { gateway_id, .. } => assert_eq!(gateway_id, "custom"),
             GatewayProvider::Vercel => panic!("wrong provider"),
@@ -3239,6 +3620,10 @@ mod tests {
             provider: GoalProvider::Vercel,
             eval_model: "m".into(),
             text_model: "t".into(),
+            backend: GoalBackend::Vercel {
+                api_key: Some("test-key".into()),
+                url: chat::DEFAULT_AI_GATEWAY_URL.into(),
+            },
             debug: false,
         }
     }

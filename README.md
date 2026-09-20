@@ -1089,8 +1089,8 @@ This is useful for multimodal AI models that can reason about visual layout, unl
 | `--no-auto-dialog` | Disable automatic dismissal of `alert`/`beforeunload` dialogs (or `AGENT_BROWSER_NO_AUTO_DIALOG` env) |
 | `--model <name>` | AI model for chat command (or `AI_GATEWAY_MODEL` env) |
 | `--max-steps <n>` | Action budget for the goal command (default: 40) |
-| `--eval-model <model>` | Evaluation model for the goal command (or `AGENT_BROWSER_GOAL_MODEL` env) |
-| `--text-model <model>` | Text model for the goal command's `TYPE_TEXT` (or `AGENT_BROWSER_GOAL_TEXT_MODEL` env) |
+| `--eval-model <model>` | Evaluation model for goal; overrides `AGENT_BROWSER_GOAL_MODEL`, then `goal.evalModel` config |
+| `--text-model <model>` | Text model for goal `TYPE_TEXT`; overrides `AGENT_BROWSER_GOAL_TEXT_MODEL`, then `goal.textModel` config |
 | `-v`, `--verbose` | Show tool commands and their raw output (chat) |
 | `-q`, `--quiet` | Show only AI text responses, hide tool calls (chat) |
 | `--config <path>` | Use a custom config file (or `AGENT_BROWSER_CONFIG` env) |
@@ -1163,7 +1163,7 @@ The `chat` command translates natural language instructions into agent-browser c
 
 `goal` is the fast sibling of `chat`. Instead of a chat model writing commands, a System One evaluation model answers two typed questions on every step: which operation comes next and which element from the current snapshot it targets. Vercel AI Gateway remains the default provider, using `typesafe-ai/jev` for evaluation and `inception/mercury-2.5` for field text. Set `AGENT_BROWSER_GOAL_PROVIDER=cloudflare` to use Cloudflare with `typesafe/jev` and `@cf/qwen/qwen3-30b-a3b-fp8` by default. The model receives bounded text from the full accessibility snapshot. Alert, status, log, and paragraph text is prioritized, remaining text is sampled from both ends, and actionable labels already present in the element table are not duplicated. Only observed elements are offered, so the model never produces a selector, a URL, or a script. One decision costs one provider request and typically well under a second.
 
-Configure exactly one goal provider in the shell environment:
+Configure exactly one goal provider with environment variables or the nested `goal` config object. Environment-only usage remains supported:
 
 ```bash
 # Vercel, the default
@@ -1178,6 +1178,28 @@ export CLOUDFLARE_AI_GATEWAY_ID=default                    # optional
 ```
 
 Cloudflare tokens need Account > Workers AI > Read permission; an AI Gateway-only token is not sufficient. `goal` does not load `.env` files automatically. Export the values directly, or explicitly load a trusted file into the current shell with `set -a; source .env; set +a` before invoking the command. Cloudflare credentials are used only by Cloudflare goal mode and are never sent to `AI_GATEWAY_URL`. This provider selection does not change `chat`, which continues to use Vercel AI Gateway.
+
+The same goal settings can be stored through normal config discovery. Use this full credential-bearing shape only in a protected user or explicit config; a project `./agent-browser.json` should contain only nonsecret fields:
+
+```json
+{
+  "goal": {
+    "provider": "cloudflare",
+    "evalModel": "typesafe/jev",
+    "textModel": "@cf/qwen/qwen3-30b-a3b-fp8",
+    "cloudflare": {
+      "accountId": "ACCOUNT_ID",
+      "apiToken": "API_TOKEN",
+      "gatewayId": "default"
+    },
+    "vercel": {
+      "apiKey": "VERCEL_API_KEY"
+    }
+  }
+}
+```
+
+Credential fields in JSON are plaintext. Prefer the user config, run `chmod 600 ~/.agent-browser/config.json`, and never commit tokens in a project config. User and project goal objects merge field by field, including the nested provider objects. An explicit config file replaces automatic user and project discovery. Provider and credential environment variables override config. For models, command-local `--eval-model` and `--text-model` win, followed by nonempty environment variables, merged config, and the selected provider defaults. Selecting a different provider does not reset an explicit evaluation or text model ID; override those IDs too, or omit model settings to use the selected provider's defaults. `AI_GATEWAY_URL` remains environment-only, and goal config does not configure or authenticate `chat`.
 
 ```bash
 agent-browser open https://www.google.com/travel/flights
@@ -1194,11 +1216,11 @@ Goal options and environment variables:
 ```bash
 --max-steps <n>          # Action budget (default: 40)
 --timeout <ms>           # Time budget in milliseconds (default: 120000)
---eval-model <model>     # Evaluation model (or AGENT_BROWSER_GOAL_MODEL, then provider default)
---text-model <model>     # Text model for TYPE_TEXT (or AGENT_BROWSER_GOAL_TEXT_MODEL, then provider default)
+--eval-model <model>     # Evaluation model (then AGENT_BROWSER_GOAL_MODEL, goal.evalModel, provider default)
+--text-model <model>     # Text model for TYPE_TEXT (then AGENT_BROWSER_GOAL_TEXT_MODEL, goal.textModel, provider default)
 ```
 
-Command-line model options take precedence over their environment variables. The environment variables take precedence over the selected provider's defaults. JSON output includes the selected `provider`, `model`, and `textModel`.
+JSON output includes the selected `provider`, `model`, and `textModel`.
 
 **Dashboard usage:**
 
@@ -1225,6 +1247,9 @@ Create an `agent-browser.json` file to set persistent defaults instead of repeat
   "userAgent": "my-agent/1.0",
   "hideScrollbars": false,
   "ignoreHttpsErrors": true,
+  "goal": {
+    "provider": "cloudflare"
+  },
   "plugins": [
     {
       "name": "vault",
@@ -1253,7 +1278,7 @@ agent-browser --config ./ci-config.json open example.com
 AGENT_BROWSER_CONFIG=./ci-config.json agent-browser open example.com
 ```
 
-All options from the table above can be set in the config file using camelCase keys (e.g., `--executable-path` becomes `"executablePath"`, `--proxy-bypass` becomes `"proxyBypass"`). Plugins are configured with the `"plugins"` array shown above. Unknown keys are ignored for forward compatibility.
+All global options from the table above can be set in the config file using camelCase keys (e.g., `--executable-path` becomes `"executablePath"`, `--proxy-bypass` becomes `"proxyBypass"`). Goal provider settings use the nested `"goal"` object shown above so they do not collide with browser `"provider"` or chat `"model"`. Plugins are configured with the `"plugins"` array shown above. Unknown keys are ignored for forward compatibility.
 
 A [JSON Schema](agent-browser.schema.json) is available for IDE autocomplete and validation. Add a `$schema` key to your config file to enable it:
 
@@ -1266,9 +1291,9 @@ A [JSON Schema](agent-browser.schema.json) is available for IDE autocomplete and
 
 Boolean flags accept an optional `true`/`false` value to override config settings. For example, `--headed false` disables `"headed": true` from config. A bare `--headed` is equivalent to `--headed true`.
 
-Auto-discovered config files that are missing are silently ignored. If `--config <path>` points to a missing or invalid file, agent-browser exits with an error. Extensions from user and project configs are merged (concatenated), not replaced.
+Auto-discovered config files that are missing are silently ignored. If `--config <path>` points to a missing or invalid file, agent-browser exits with an error. Extensions are concatenated; nested goal settings merge field by field. An explicit `--config` or `AGENT_BROWSER_CONFIG` file replaces automatic user and project discovery.
 
-> **Tip:** If your project-level `agent-browser.json` contains environment-specific values (paths, proxies), consider adding it to `.gitignore`.
+> **Tip:** If your project-level `agent-browser.json` contains environment-specific values, consider adding it to `.gitignore`. Never store API tokens there if the file may be committed.
 
 ## Default Timeout
 

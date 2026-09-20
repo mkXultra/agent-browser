@@ -2790,6 +2790,56 @@ mod tests {
     }
 
     #[test]
+    fn test_published_schemas_define_matching_goal_configuration() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("cli should have a repository parent");
+        let root_schema: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(repo_root.join("agent-browser.schema.json")).unwrap(),
+        )
+        .unwrap();
+        let docs_schema: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(repo_root.join("docs/public/schema.json")).unwrap(),
+        )
+        .unwrap();
+
+        let goal = &root_schema["properties"]["goal"];
+        assert_eq!(goal, &docs_schema["properties"]["goal"]);
+        assert_eq!(goal["type"], "object");
+        assert_eq!(
+            goal["properties"]["provider"]["enum"],
+            json!(["vercel", "cloudflare"])
+        );
+        assert_eq!(
+            goal["properties"]["cloudflare"]["properties"]["apiToken"]["type"],
+            "string"
+        );
+        assert_eq!(
+            goal["properties"]["vercel"]["properties"]["apiKey"]["type"],
+            "string"
+        );
+
+        let example = json!({
+            "goal": {
+                "provider": "cloudflare",
+                "evalModel": "typesafe/jev",
+                "textModel": "@cf/qwen/qwen3-30b-a3b-fp8",
+                "cloudflare": {
+                    "accountId": "ACCOUNT_ID",
+                    "apiToken": "API_TOKEN",
+                    "gatewayId": "default"
+                },
+                "vercel": { "apiKey": "VERCEL_API_KEY" }
+            }
+        });
+        let parsed: crate::flags::Config = serde_json::from_value(example).unwrap();
+        assert!(
+            parsed.goal.is_some(),
+            "documented goal shape must deserialize"
+        );
+    }
+
+    #[test]
     fn test_allowed_domains_requests_local_launch_configuration() {
         let mut flags = neutral_launch_config_flags();
         let command = json!({ "action": "snapshot" });

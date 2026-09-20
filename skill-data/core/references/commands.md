@@ -405,7 +405,27 @@ agent-browser -v goal "<goal>"                               # Probability, conf
 agent-browser --json goal "<goal>"                           # {status, url, elapsedMs, steps[...]} for agents
 ```
 
-Vercel is the default provider and requires `AI_GATEWAY_API_KEY`. For Cloudflare, export `AGENT_BROWSER_GOAL_PROVIDER=cloudflare`, `CLOUDFLARE_ACCOUNT_ID`, and a `CLOUDFLARE_API_TOKEN` with Workers AI Read permission; `CLOUDFLARE_AI_GATEWAY_ID` optionally overrides the `default` gateway. The CLI does not load `.env`, so export variables or explicitly source a trusted file in the current shell. Vercel defaults are `typesafe-ai/jev` and `inception/mercury-2.5`; Cloudflare defaults are `typesafe/jev` and `@cf/qwen/qwen3-30b-a3b-fp8`. `--eval-model` and `--text-model` override the matching `AGENT_BROWSER_GOAL_*_MODEL` variable, which overrides the provider default. Cloudflare credentials are never sent to the Vercel URL, and this selection does not affect `chat`. Each step sends bounded text from the full accessibility snapshot, a numbered element table, and recent actions to the evaluation model, which answers two typed questions in one request: the next operation (`CLICK`, `TYPE_TEXT`, `SCROLL_UP`, `SCROLL_DOWN`, `WAIT`, `DONE`, `BLOCKED`) and the element index for it. Diagnostic and paragraph text is prioritized within the bound, remaining text is sampled from both ends, and actionable labels already in the table are omitted from page text. Indices map back to `@eN` refs and run as `click`, `fill`, `scroll`, or `wait` through the normal pipeline. Cursor and editability hints preserve actionable custom controls without exposing structural wrappers. `TYPE_TEXT` asks the text model for the value, which must come from the goal; a missing value stops the run as `blocked`. A pending confirmation is not an executed step. Without `--confirm-interactive`, the run returns `confirmation_required` with the confirmation ID. With that flag, a TTY prompts; non-TTY stdin auto-denies and goal returns `denied`. Approval after the deadline triggers denial cleanup and returns `timeout` without dispatching the action. For ordinary commands approved with `--confirm-interactive`, output and exit status come from the executed inner command rather than the confirmation envelope. The last allowed action receives a final terminal assessment, but no extra action can run. Stops on `DONE`, `BLOCKED`, budgets, or three actions without DOM, URL, or measured scroll progress. JSON output includes the selected provider and models. Exit `0` only on `DONE`. Verify the result yourself.
+Vercel is the default provider and requires `AI_GATEWAY_API_KEY`. For Cloudflare, export `AGENT_BROWSER_GOAL_PROVIDER=cloudflare`, `CLOUDFLARE_ACCOUNT_ID`, and a `CLOUDFLARE_API_TOKEN` with Workers AI Read permission; `CLOUDFLARE_AI_GATEWAY_ID` optionally overrides the `default` gateway. The CLI does not load `.env`, so export variables or explicitly source a trusted file in the current shell. Vercel defaults are `typesafe-ai/jev` and `inception/mercury-2.5`; Cloudflare defaults are `typesafe/jev` and `@cf/qwen/qwen3-30b-a3b-fp8`. Goal settings may also use the nested config object below. User and project objects merge field by field, including partial provider objects; an explicit `--config` or `AGENT_BROWSER_CONFIG` file replaces automatic discovery. Provider and credential environment variables override config. Model precedence is command-local flag, nonempty environment variable, merged config, then selected-provider default. Selecting a different provider does not reset an explicit evaluation or text model ID; override those IDs too, or omit model settings to use the selected provider's defaults. `AI_GATEWAY_URL` remains environment-only. Cloudflare credentials are never sent to the Vercel URL, and goal configuration does not affect `chat`. Each step sends bounded text from the full accessibility snapshot, a numbered element table, and recent actions to the evaluation model, which answers two typed questions in one request: the next operation (`CLICK`, `TYPE_TEXT`, `SCROLL_UP`, `SCROLL_DOWN`, `WAIT`, `DONE`, `BLOCKED`) and the element index for it. Diagnostic and paragraph text is prioritized within the bound, remaining text is sampled from both ends, and actionable labels already in the table are omitted from page text. Indices map back to `@eN` refs and run as `click`, `fill`, `scroll`, or `wait` through the normal pipeline. Cursor and editability hints preserve actionable custom controls without exposing structural wrappers. `TYPE_TEXT` asks the text model for the value, which must come from the goal; a missing value stops the run as `blocked`. A pending confirmation is not an executed step. Without `--confirm-interactive`, the run returns `confirmation_required` with the confirmation ID. With that flag, a TTY prompts; non-TTY stdin auto-denies and goal returns `denied`. Approval after the deadline triggers denial cleanup and returns `timeout` without dispatching the action. For ordinary commands approved with `--confirm-interactive`, output and exit status come from the executed inner command rather than the confirmation envelope. The last allowed action receives a final terminal assessment, but no extra action can run. Stops on `DONE`, `BLOCKED`, budgets, or three actions without DOM, URL, or measured scroll progress. JSON output includes the selected provider and models. Exit `0` only on `DONE`. Verify the result yourself.
+
+```json
+{
+  "goal": {
+    "provider": "cloudflare",
+    "evalModel": "typesafe/jev",
+    "textModel": "@cf/qwen/qwen3-30b-a3b-fp8",
+    "cloudflare": {
+      "accountId": "ACCOUNT_ID",
+      "apiToken": "API_TOKEN",
+      "gatewayId": "default"
+    },
+    "vercel": {
+      "apiKey": "VERCEL_API_KEY"
+    }
+  }
+}
+```
+
+Credential fields are plaintext. Prefer `~/.agent-browser/config.json`, run `chmod 600 ~/.agent-browser/config.json`, and never commit credentials in a project `agent-browser.json`. The command does not create or rewrite config files.
 
 ## MCP Server
 
@@ -416,6 +436,8 @@ agent-browser mcp --tools core,network,react
 ```
 
 Starts a stdio Model Context Protocol server. MCP clients should configure the server command as `agent-browser` with args `["mcp"]`. The server defaults to MCP protocol 2025-11-25 and accepts older supported client protocol versions during initialization.
+
+The `agent_browser_goal` subprocess uses normal config discovery. Set `AGENT_BROWSER_CONFIG` in the MCP server environment for every goal call, or pass `["--config", "/path/to/config.json"]` through that call's `extraArgs`. A `--config` consumed only while launching the MCP server is not automatically forwarded to later child invocations.
 
 The default tools profile is `core`, which keeps MCP context small for everyday browser automation. Use `--tools all` for the full typed CLI parity surface, or combine profiles with commas, such as `--tools core,network,react`.
 
@@ -567,12 +589,12 @@ AGENT_BROWSER_STREAM_PORT="9223"             # Override WebSocket streaming port
 AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS="https://dashboard.example.com" # Trusted HTTPS reverse-proxied dashboard origins
 AGENT_BROWSER_CONFIG="./agent-browser.json"  # Custom config file
 AGENT_BROWSER_CDP="9222"                     # Connect daemon to CDP port or WebSocket URL
-AGENT_BROWSER_GOAL_PROVIDER="vercel"         # Goal provider: vercel or cloudflare
-AGENT_BROWSER_GOAL_MODEL="typesafe-ai/jev"   # Evaluation model for goal (or --eval-model)
-AGENT_BROWSER_GOAL_TEXT_MODEL="inception/mercury-2.5" # Text model for goal TYPE_TEXT (or --text-model)
-CLOUDFLARE_ACCOUNT_ID="account_id"           # Required for cloudflare goal provider
-CLOUDFLARE_API_TOKEN="workers_ai_read_token" # Required for cloudflare goal provider
-CLOUDFLARE_AI_GATEWAY_ID="default"           # Optional Cloudflare AI Gateway ID
+AGENT_BROWSER_GOAL_PROVIDER="vercel"         # Overrides goal.provider
+AGENT_BROWSER_GOAL_MODEL="typesafe-ai/jev"   # Overrides goal.evalModel; --eval-model wins
+AGENT_BROWSER_GOAL_TEXT_MODEL="inception/mercury-2.5" # Overrides goal.textModel; --text-model wins
+CLOUDFLARE_ACCOUNT_ID="account_id"           # Overrides goal.cloudflare.accountId
+CLOUDFLARE_API_TOKEN="workers_ai_read_token" # Overrides goal.cloudflare.apiToken
+CLOUDFLARE_AI_GATEWAY_ID="default"           # Overrides goal.cloudflare.gatewayId
 AGENT_BROWSER_ALLOWED_DOMAINS="example.com"  # Restrict network domains; requires a fresh controllable browser context without profile/session startup args, restore/state replay, or direct-page provider plugins
 AGENT_BROWSER_PLUGINS='[{"name":"vault","command":"agent-browser-plugin-vault","capabilities":["credential.read"]},{"name":"stealth","command":"agent-browser-plugin-stealth","capabilities":["launch.mutate"]}]'
 ```

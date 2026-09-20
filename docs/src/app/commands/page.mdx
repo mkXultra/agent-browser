@@ -531,7 +531,7 @@ Chat-specific options:
 
 Give the open page one natural-language goal and let an evaluation model choose every action. On each step the `goal` command sends bounded text from the full accessibility snapshot plus a numbered element table to the model, which answers two typed questions in one request: the next operation and the element index it targets. Alert, status, log, and paragraph text is prioritized, remaining text is sampled from both ends, and actionable labels already present in the element table are not duplicated. Only observed elements are offered, so the model never produces a selector, a URL, or a script. When the operation is `TYPE_TEXT`, a small text model writes the field value from the goal.
 
-Vercel AI Gateway is the default goal provider. Set `AGENT_BROWSER_GOAL_PROVIDER=cloudflare` to use Cloudflare instead:
+Vercel AI Gateway is the default goal provider. Set `AGENT_BROWSER_GOAL_PROVIDER=cloudflare` to use Cloudflare instead. Environment-only configuration remains supported:
 
 ```bash
 # Vercel
@@ -546,6 +546,28 @@ export CLOUDFLARE_AI_GATEWAY_ID=default                    # optional
 ```
 
 The Cloudflare token needs Account > Workers AI > Read permission; an AI Gateway-only token is not sufficient. The CLI does not load `.env` automatically. Export variables directly, or load a trusted file into the current shell with `set -a; source .env; set +a`. Cloudflare goal credentials are never sent to the Vercel gateway, and selecting Cloudflare for `goal` does not change `chat`.
+
+Goal settings can instead use existing config discovery. Use this full credential-bearing shape only in a protected `~/.agent-browser/config.json` or explicit config; a project `./agent-browser.json` should contain only nonsecret fields:
+
+```json
+{
+  "goal": {
+    "provider": "cloudflare",
+    "evalModel": "typesafe/jev",
+    "textModel": "@cf/qwen/qwen3-30b-a3b-fp8",
+    "cloudflare": {
+      "accountId": "ACCOUNT_ID",
+      "apiToken": "API_TOKEN",
+      "gatewayId": "default"
+    },
+    "vercel": {
+      "apiKey": "VERCEL_API_KEY"
+    }
+  }
+}
+```
+
+JSON credentials are plaintext. Prefer the user config with `chmod 600 ~/.agent-browser/config.json` and never commit tokens in a project config. User and project goal settings merge field by field, including partial `cloudflare` and `vercel` objects. An explicit config replaces automatic discovery. Provider and credential environment variables override config. Model precedence is command-local option, nonempty environment variable, merged config, then selected-provider default. Selecting a different provider does not reset an explicit evaluation or text model ID; override those IDs too, or omit model settings to use the selected provider's defaults. `AI_GATEWAY_URL` remains environment-only. Goal config does not affect `chat`.
 
 ```bash
 agent-browser open https://www.google.com/travel/flights
@@ -578,16 +600,16 @@ Goal-specific options:
     </tr>
     <tr>
       <td><code>--eval-model &lt;model&gt;</code></td>
-      <td>Evaluation model, or <code>AGENT_BROWSER_GOAL_MODEL</code> (Vercel default: <code>typesafe-ai/jev</code>; Cloudflare default: <code>typesafe/jev</code>)</td>
+      <td>Evaluation model; overrides <code>AGENT_BROWSER_GOAL_MODEL</code>, then <code>goal.evalModel</code> config (Vercel default: <code>typesafe-ai/jev</code>; Cloudflare default: <code>typesafe/jev</code>)</td>
     </tr>
     <tr>
       <td><code>--text-model &lt;model&gt;</code></td>
-      <td>Text model for <code>TYPE_TEXT</code>, or <code>AGENT_BROWSER_GOAL_TEXT_MODEL</code> (Vercel default: <code>inception/mercury-2.5</code>; Cloudflare default: <code>@cf/qwen/qwen3-30b-a3b-fp8</code>)</td>
+      <td>Text model for <code>TYPE_TEXT</code>; overrides <code>AGENT_BROWSER_GOAL_TEXT_MODEL</code>, then <code>goal.textModel</code> config (Vercel default: <code>inception/mercury-2.5</code>; Cloudflare default: <code>@cf/qwen/qwen3-30b-a3b-fp8</code>)</td>
     </tr>
   </tbody>
 </table>
 
-Command-line model options override `AGENT_BROWSER_GOAL_MODEL` and `AGENT_BROWSER_GOAL_TEXT_MODEL`; those environment variables override the selected provider's defaults. `--debug` additionally writes every model request and reply to stderr, which is the quickest way to see what the model was offered on a step that went wrong. The `--json` result carries the selected `provider`, `model`, and `textModel`, plus `status` (`done`, `blocked`, `denied`, `timeout`, `confirmation_required`, or `error`), the final `url`, `elapsedMs`, pending confirmation fields when applicable, and one entry per executed step with the operation, the target ref, role and name, any typed text, the target probability, the model's confidence, the operation distribution, and per-phase timings.
+`--debug` additionally writes every model request and reply to stderr, which is the quickest way to see what the model was offered on a step that went wrong. The `--json` result carries the selected `provider`, `model`, and `textModel`, plus `status` (`done`, `blocked`, `denied`, `timeout`, `confirmation_required`, or `error`), the final `url`, `elapsedMs`, pending confirmation fields when applicable, and one entry per executed step with the operation, the target ref, role and name, any typed text, the target probability, the model's confidence, the operation distribution, and per-phase timings.
 
 ## Navigation
 

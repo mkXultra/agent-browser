@@ -1898,7 +1898,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_GOAL,
             "Goal",
-            "Drive the open page toward one natural-language goal. An evaluation model picks an operation and an observed element on every step; actions run through the normal command pipeline. Pending confirmations stop safely and are returned with their confirmation ID. Uses the goal provider selected by AGENT_BROWSER_GOAL_PROVIDER: Vercel by default, or Cloudflare. Verify the outcome afterwards; DONE is the model's opinion.",
+            "Drive the open page toward one natural-language goal. An evaluation model picks an operation and an observed element on every step; actions run through the normal command pipeline. Pending confirmations stop safely and are returned with their confirmation ID. Uses the goal provider selected by the nested goal config or AGENT_BROWSER_GOAL_PROVIDER: Vercel by default, or Cloudflare. Set AGENT_BROWSER_CONFIG on the MCP server, or pass --config through extraArgs for one call. Verify the outcome afterwards; DONE is the model's opinion.",
             json!({
                 "goal": { "type": "string", "description": "What to achieve on the open page, including when to stop." },
                 "maxSteps": { "type": "integer", "minimum": 1, "description": "Action budget (default 40)." },
@@ -4894,6 +4894,70 @@ mod tests {
                 .contains("@cf/qwen/qwen3-30b-a3b-fp8")
         );
         assert!(goal_args(&json!({})).is_err());
+    }
+
+    #[test]
+    fn goal_mcp_uses_normal_config_discovery_and_model_override_precedence() {
+        let guard = crate::test_utils::EnvGuard::new(&[
+            "AGENT_BROWSER_CONFIG",
+            "AGENT_BROWSER_GOAL_PROVIDER",
+            "AGENT_BROWSER_GOAL_MODEL",
+            "AGENT_BROWSER_GOAL_TEXT_MODEL",
+        ]);
+        for name in [
+            "AGENT_BROWSER_CONFIG",
+            "AGENT_BROWSER_GOAL_PROVIDER",
+            "AGENT_BROWSER_GOAL_MODEL",
+            "AGENT_BROWSER_GOAL_TEXT_MODEL",
+        ] {
+            guard.remove(name);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("goal-config.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+                "goal": {
+                    "provider": "cloudflare",
+                    "evalModel": "config-eval",
+                    "textModel": "config-text",
+                    "cloudflare": {
+                        "accountId": "account",
+                        "apiToken": "token"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let arguments = json!({
+            "goal": "Finish",
+            "evalModel": "mcp-eval",
+            "extraArgs": ["--config", config_path.to_string_lossy()]
+        });
+        let cli_args = cli_tool_args(&arguments, goal_args(&arguments).unwrap(), None).unwrap();
+        let flags = crate::flags::parse_flags(&cli_args);
+        let parsed =
+            crate::commands::parse_command(&crate::flags::clean_args(&cli_args), &flags).unwrap();
+        let config = crate::goal::GoalConfig::from_command(&parsed, &flags.goal).unwrap();
+        assert_eq!(config.provider, crate::goal::GoalProvider::Cloudflare);
+        assert_eq!(config.eval_model, "mcp-eval");
+        assert_eq!(config.text_model, "config-text");
+
+        guard.set(
+            "AGENT_BROWSER_CONFIG",
+            config_path.to_string_lossy().as_ref(),
+        );
+        guard.set("AGENT_BROWSER_GOAL_TEXT_MODEL", "env-text");
+        let arguments = json!({ "goal": "Finish" });
+        let cli_args = cli_tool_args(&arguments, goal_args(&arguments).unwrap(), None).unwrap();
+        let flags = crate::flags::parse_flags(&cli_args);
+        let parsed =
+            crate::commands::parse_command(&crate::flags::clean_args(&cli_args), &flags).unwrap();
+        let config = crate::goal::GoalConfig::from_command(&parsed, &flags.goal).unwrap();
+        assert_eq!(config.provider, crate::goal::GoalProvider::Cloudflare);
+        assert_eq!(config.eval_model, "config-eval");
+        assert_eq!(config.text_model, "env-text");
     }
 
     #[test]

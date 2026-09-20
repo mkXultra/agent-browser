@@ -2,6 +2,7 @@ use crate::color;
 use crate::plugins::PluginConfig;
 use serde::Deserialize;
 use std::env;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -49,6 +50,97 @@ fn parse_idle_timeout_value(value: Option<String>, source: &str) -> Option<Strin
             None
         }
     })
+}
+
+/// Goal-specific configuration. This is nested under `goal` so the goal
+/// provider and models cannot collide with browser-provider or chat settings.
+#[derive(Debug, Default, Deserialize, Clone, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct GoalSettings {
+    pub provider: Option<String>,
+    pub eval_model: Option<String>,
+    pub text_model: Option<String>,
+    pub cloudflare: Option<GoalCloudflareSettings>,
+    pub vercel: Option<GoalVercelSettings>,
+}
+
+impl GoalSettings {
+    fn merge(self, other: Self) -> Self {
+        Self {
+            provider: other.provider.or(self.provider),
+            eval_model: other.eval_model.or(self.eval_model),
+            text_model: other.text_model.or(self.text_model),
+            cloudflare: merge_optional(self.cloudflare, other.cloudflare),
+            vercel: merge_optional(self.vercel, other.vercel),
+        }
+    }
+}
+
+impl MergeSettings for GoalSettings {
+    fn merge(self, other: Self) -> Self {
+        GoalSettings::merge(self, other)
+    }
+}
+
+trait MergeSettings {
+    fn merge(self, other: Self) -> Self;
+}
+
+fn merge_optional<T: MergeSettings>(base: Option<T>, override_value: Option<T>) -> Option<T> {
+    match (base, override_value) {
+        (Some(base), Some(override_value)) => Some(base.merge(override_value)),
+        (base, override_value) => override_value.or(base),
+    }
+}
+
+#[derive(Default, Deserialize, Clone, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct GoalCloudflareSettings {
+    pub account_id: Option<String>,
+    pub api_token: Option<String>,
+    pub gateway_id: Option<String>,
+}
+
+impl MergeSettings for GoalCloudflareSettings {
+    fn merge(self, other: Self) -> Self {
+        Self {
+            account_id: other.account_id.or(self.account_id),
+            api_token: other.api_token.or(self.api_token),
+            gateway_id: other.gateway_id.or(self.gateway_id),
+        }
+    }
+}
+
+impl fmt::Debug for GoalCloudflareSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GoalCloudflareSettings")
+            .field("account_id", &self.account_id)
+            .field("api_token", &self.api_token.as_ref().map(|_| "[REDACTED]"))
+            .field("gateway_id", &self.gateway_id)
+            .finish()
+    }
+}
+
+#[derive(Default, Deserialize, Clone, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct GoalVercelSettings {
+    pub api_key: Option<String>,
+}
+
+impl MergeSettings for GoalVercelSettings {
+    fn merge(self, other: Self) -> Self {
+        Self {
+            api_key: other.api_key.or(self.api_key),
+        }
+    }
+}
+
+impl fmt::Debug for GoalVercelSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GoalVercelSettings")
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -104,6 +196,7 @@ pub struct Config {
     pub idle_timeout: Option<String>,
     pub no_auto_dialog: Option<bool>,
     pub model: Option<String>,
+    pub goal: Option<GoalSettings>,
     pub plugins: Option<Vec<PluginConfig>>,
 }
 
@@ -187,6 +280,7 @@ impl Config {
             idle_timeout: other.idle_timeout.or(self.idle_timeout),
             no_auto_dialog: other.no_auto_dialog.or(self.no_auto_dialog),
             model: other.model.or(self.model),
+            goal: merge_optional(self.goal, other.goal),
             plugins: match (self.plugins, other.plugins) {
                 (Some(mut a), Some(b)) => {
                     a.extend(b);
@@ -315,6 +409,12 @@ fn extract_config_path(args: &[String]) -> Option<Option<String>> {
         "--idle-timeout",
         "--ca-cert",
         "--model",
+        // Goal-local flags are included only for this preliminary scan so a
+        // value named "--config" is not mistaken for the global config flag.
+        "--max-steps",
+        "--timeout",
+        "--eval-model",
+        "--text-model",
     ];
     let mut i = 0;
     while i < args.len() {
@@ -329,14 +429,15 @@ fn extract_config_path(args: &[String]) -> Option<Option<String>> {
     None
 }
 
-pub fn load_config(args: &[String]) -> Result<Config, String> {
+fn load_config_from_paths(
+    args: &[String],
+    env_config: Option<String>,
+    user_path: Option<PathBuf>,
+    project_path: PathBuf,
+) -> Result<Config, String> {
     let explicit = extract_config_path(args)
         .map(|p| ("--config", p))
-        .or_else(|| {
-            env::var("AGENT_BROWSER_CONFIG")
-                .ok()
-                .map(|p| ("AGENT_BROWSER_CONFIG", Some(p)))
-        });
+        .or_else(|| env_config.map(|p| ("AGENT_BROWSER_CONFIG", Some(p))));
 
     if let Some((source, maybe_path)) = explicit {
         let path_str = maybe_path.ok_or_else(|| format!("{} requires a file path", source))?;
@@ -348,17 +449,25 @@ pub fn load_config(args: &[String]) -> Result<Config, String> {
             .ok_or_else(|| format!("failed to load config from {}", path_str));
     }
 
-    let user_config = dirs::home_dir()
-        .map(|d| d.join(CONFIG_DIR).join(CONFIG_FILENAME))
+    let user_config = user_path
         .and_then(|p| read_config_file(&p))
         .unwrap_or_default();
 
-    let project_config = read_config_file(&PathBuf::from(PROJECT_CONFIG_FILENAME));
+    let project_config = read_config_file(&project_path);
 
     Ok(match project_config {
         Some(project) => user_config.merge(project),
         None => user_config,
     })
+}
+
+pub fn load_config(args: &[String]) -> Result<Config, String> {
+    load_config_from_paths(
+        args,
+        env::var("AGENT_BROWSER_CONFIG").ok(),
+        dirs::home_dir().map(|d| d.join(CONFIG_DIR).join(CONFIG_FILENAME)),
+        PathBuf::from(PROJECT_CONFIG_FILENAME),
+    )
 }
 
 pub struct Flags {
@@ -417,6 +526,9 @@ pub struct Flags {
     pub default_timeout: Option<u64>, // AGENT_BROWSER_DEFAULT_TIMEOUT in ms
     pub no_auto_dialog: bool,
     pub model: Option<String>,
+    /// Merged goal settings from the selected config source. Environment and
+    /// command-local overrides are resolved by the goal command itself.
+    pub goal: GoalSettings,
     pub plugins: Vec<PluginConfig>,
     pub verbose: bool,
     pub quiet: bool,
@@ -657,6 +769,7 @@ pub fn parse_flags(args: &[String]) -> Flags {
         no_auto_dialog: env_var_is_truthy("AGENT_BROWSER_NO_AUTO_DIALOG")
             || config.no_auto_dialog.unwrap_or(false),
         model: env::var("AI_GATEWAY_MODEL").ok().or(config.model),
+        goal: config.goal.unwrap_or_default(),
         plugins,
         verbose: false,
         quiet: false,
@@ -1639,6 +1752,42 @@ mod tests {
     }
 
     #[test]
+    fn test_goal_config_deserializes_and_debug_redacts_credentials() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "goal": {
+                    "provider": "cloudflare",
+                    "evalModel": "typesafe/jev",
+                    "textModel": "@cf/qwen/qwen3-30b-a3b-fp8",
+                    "cloudflare": {
+                        "accountId": "account-id",
+                        "apiToken": "cf-secret-token",
+                        "gatewayId": "default"
+                    },
+                    "vercel": { "apiKey": "vercel-secret-key" }
+                }
+            }"#,
+        )
+        .unwrap();
+        let goal = config.goal.as_ref().unwrap();
+        assert_eq!(goal.provider.as_deref(), Some("cloudflare"));
+        assert_eq!(goal.eval_model.as_deref(), Some("typesafe/jev"));
+        assert_eq!(
+            goal.cloudflare.as_ref().unwrap().account_id.as_deref(),
+            Some("account-id")
+        );
+        assert_eq!(
+            goal.vercel.as_ref().unwrap().api_key.as_deref(),
+            Some("vercel-secret-key")
+        );
+
+        let debug = format!("{config:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("cf-secret-token"));
+        assert!(!debug.contains("vercel-secret-key"));
+    }
+
+    #[test]
     fn test_config_deserialize_partial() {
         let json = r#"{"headed": true, "proxy": "http://localhost:8080"}"#;
         let config: Config = serde_json::from_str(json).unwrap();
@@ -1695,6 +1844,130 @@ mod tests {
         let merged = user.merge(project);
         assert_eq!(merged.headed, Some(true));
         assert_eq!(merged.proxy.as_deref(), Some("http://proxy:8080"));
+    }
+
+    #[test]
+    fn test_goal_config_merge_is_fieldwise_at_each_nested_level() {
+        let user: Config = serde_json::from_str(
+            r#"{
+                "goal": {
+                    "provider": "cloudflare",
+                    "evalModel": "user-eval",
+                    "cloudflare": {
+                        "accountId": "user-account",
+                        "apiToken": "user-token",
+                        "gatewayId": "user-gateway"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let project: Config = serde_json::from_str(
+            r#"{
+                "goal": {
+                    "textModel": "project-text",
+                    "cloudflare": { "gatewayId": "project-gateway" }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let goal = user.merge(project).goal.unwrap();
+        assert_eq!(goal.provider.as_deref(), Some("cloudflare"));
+        assert_eq!(goal.eval_model.as_deref(), Some("user-eval"));
+        assert_eq!(goal.text_model.as_deref(), Some("project-text"));
+        let cloudflare = goal.cloudflare.unwrap();
+        assert_eq!(cloudflare.account_id.as_deref(), Some("user-account"));
+        assert_eq!(cloudflare.api_token.as_deref(), Some("user-token"));
+        assert_eq!(cloudflare.gateway_id.as_deref(), Some("project-gateway"));
+    }
+
+    #[test]
+    fn test_goal_config_discovery_paths_merge_and_explicit_replaces_discovery() {
+        let root = tempfile::tempdir().unwrap();
+        let user_path = root.path().join("home/.agent-browser/config.json");
+        let project_a = root.path().join("project-a/agent-browser.json");
+        let project_b = root.path().join("project-b/agent-browser.json");
+        let explicit = root.path().join("explicit.json");
+        fs::create_dir_all(user_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(project_a.parent().unwrap()).unwrap();
+        fs::create_dir_all(project_b.parent().unwrap()).unwrap();
+        fs::write(
+            &user_path,
+            r#"{"goal":{"provider":"cloudflare","cloudflare":{"accountId":"acct","apiToken":"token"}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            &project_a,
+            r#"{"goal":{"textModel":"project-a-text","cloudflare":{"gatewayId":"project-a"}}}"#,
+        )
+        .unwrap();
+        fs::write(&project_b, r#"{"goal":{"evalModel":"project-b-eval"}}"#).unwrap();
+        fs::write(
+            &explicit,
+            r#"{"goal":{"provider":"vercel","vercel":{"apiKey":"explicit-key"}}}"#,
+        )
+        .unwrap();
+
+        let from_a = load_config_from_paths(&[], None, Some(user_path.clone()), project_a.clone())
+            .unwrap()
+            .goal
+            .unwrap();
+        assert_eq!(from_a.provider.as_deref(), Some("cloudflare"));
+        assert_eq!(from_a.text_model.as_deref(), Some("project-a-text"));
+        assert_eq!(
+            from_a.cloudflare.as_ref().unwrap().api_token.as_deref(),
+            Some("token")
+        );
+        assert_eq!(
+            from_a.cloudflare.as_ref().unwrap().gateway_id.as_deref(),
+            Some("project-a")
+        );
+
+        let from_b = load_config_from_paths(&[], None, Some(user_path.clone()), project_b)
+            .unwrap()
+            .goal
+            .unwrap();
+        assert_eq!(from_b.eval_model.as_deref(), Some("project-b-eval"));
+        assert_eq!(from_b.text_model, None);
+        assert_eq!(
+            from_b.cloudflare.unwrap().account_id.as_deref(),
+            Some("acct")
+        );
+
+        let explicit_args = vec![
+            "--config".to_string(),
+            explicit.to_string_lossy().to_string(),
+            "goal".to_string(),
+            "finish".to_string(),
+        ];
+        let selected = load_config_from_paths(
+            &explicit_args,
+            None,
+            Some(user_path.clone()),
+            project_a.clone(),
+        )
+        .unwrap()
+        .goal
+        .unwrap();
+        assert_eq!(selected.provider.as_deref(), Some("vercel"));
+        assert!(selected.cloudflare.is_none());
+        assert_eq!(
+            selected.vercel.unwrap().api_key.as_deref(),
+            Some("explicit-key")
+        );
+
+        let selected_from_env = load_config_from_paths(
+            &[],
+            Some(explicit.to_string_lossy().to_string()),
+            Some(user_path),
+            project_a,
+        )
+        .unwrap()
+        .goal
+        .unwrap();
+        assert_eq!(selected_from_env.provider.as_deref(), Some("vercel"));
+        assert!(selected_from_env.cloudflare.is_none());
     }
 
     #[test]
@@ -1773,6 +2046,10 @@ mod tests {
     #[test]
     fn test_extract_config_path_skips_flag_values() {
         assert_eq!(extract_config_path(&args("--args --config open")), None);
+        assert_eq!(
+            extract_config_path(&args("goal --eval-model --config finish")),
+            None
+        );
     }
 
     #[test]

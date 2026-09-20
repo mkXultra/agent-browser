@@ -3741,6 +3741,7 @@ mod tests {
             default_timeout: None,
             no_auto_dialog: false,
             model: None,
+            goal: crate::flags::GoalSettings::default(),
             plugins: Vec::new(),
             verbose: false,
             quiet: false,

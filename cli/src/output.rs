@@ -3649,14 +3649,22 @@ cleanup, returns timeout, and does not dispatch the pending action.
 DONE is the model's opinion: verify the outcome with snapshot or get url.
 
 Vercel requires AI_GATEWAY_API_KEY. Cloudflare requires CLOUDFLARE_ACCOUNT_ID
-and CLOUDFLARE_API_TOKEN with Workers AI Read permission. Start from a page that
-is already open in the session; goal does not navigate on its own.
+and CLOUDFLARE_API_TOKEN with Workers AI Read permission. These settings may
+instead be placed in the nested goal.vercel or goal.cloudflare config object.
+Provider and credential environment variables override config.
+Model precedence is command-local option, nonempty environment variable, merged
+config, then selected-provider default. Selecting a different provider does not
+reset explicit model IDs; override them too, or omit model settings to use the
+selected provider's defaults. Credentials in JSON are plaintext, so prefer
+~/.agent-browser/config.json with mode 600 and never commit them in
+agent-browser.json. Config discovery does not load .env files. Start from a page
+that is already open in the session; goal does not navigate on its own.
 
 Goal Options:
   --max-steps <n>        Action budget (default: 40)
   --timeout <ms>         Time budget in milliseconds (default: 120000)
-  --eval-model <model>   Evaluation model (or AGENT_BROWSER_GOAL_MODEL; Vercel default: typesafe-ai/jev, Cloudflare: typesafe/jev)
-  --text-model <model>   TYPE_TEXT model (or AGENT_BROWSER_GOAL_TEXT_MODEL; Vercel default: inception/mercury-2.5, Cloudflare: @cf/qwen/qwen3-30b-a3b-fp8)
+  --eval-model <model>   Evaluation model (then AGENT_BROWSER_GOAL_MODEL, goal.evalModel, provider default)
+  --text-model <model>   TYPE_TEXT model (then AGENT_BROWSER_GOAL_TEXT_MODEL, goal.textModel, provider default)
   -v, --verbose          Show probability, confidence, and page-change per step
   -q, --quiet            Print only the final result
   --debug                Also write every model request and reply to stderr
@@ -3664,6 +3672,7 @@ Goal Options:
 Global Options:
   --json                 Structured output with every step, timings, and pending confirmation data
   --session <name>       Target session for commands
+  --config <path>        Use one config file instead of automatic user/project discovery
 
 Exit status is 0 only when the model reports DONE.
 
@@ -3671,6 +3680,7 @@ Examples:
   agent-browser open https://www.google.com/travel/flights
   agent-browser goal "Find one-way flights from Zurich to London on 20 September for one adult. Stop when flight options are visible."
   agent-browser goal --max-steps 10 "Open the pricing page"
+  agent-browser --config ~/.agent-browser/config.json goal "Open the pricing page"
   agent-browser --json goal "Accept the cookie banner"
 "##
         }
@@ -4166,6 +4176,9 @@ Configuration:
   Plugin example:
     {{"plugins":[{{"name":"vault","command":"agent-browser-plugin-vault","capabilities":["credential.read"]}},{{"name":"stealth","command":"agent-browser-plugin-stealth","capabilities":["launch.mutate"]}}]}}
 
+  Goal provider example (credentials are plaintext; prefer the user config with mode 600):
+    {{"goal":{{"provider":"cloudflare","evalModel":"typesafe/jev","textModel":"@cf/qwen/qwen3-30b-a3b-fp8","cloudflare":{{"accountId":"ACCOUNT_ID","apiToken":"API_TOKEN","gatewayId":"default"}},"vercel":{{"apiKey":"VERCEL_API_KEY"}}}}}}
+
 Environment:
   AGENT_BROWSER_CONFIG           Path to config file (or use --config)
   AGENT_BROWSER_SESSION          Session name (default: "default")
@@ -4230,14 +4243,14 @@ Environment:
   AGENT_BROWSER_SCREENSHOT_QUALITY JPEG quality 0-100
   AGENT_BROWSER_SCREENSHOT_FORMAT Screenshot format: png, jpeg
   AI_GATEWAY_URL                 Vercel AI Gateway base URL (default: https://ai-gateway.vercel.sh)
-  AI_GATEWAY_API_KEY             Vercel AI Gateway key (enables chat, dashboard AI chat, and Vercel goal mode)
+  AI_GATEWAY_API_KEY             Vercel AI Gateway key (chat and dashboard; overrides goal.vercel.apiKey for goal mode)
   AI_GATEWAY_MODEL               Default AI model (default: anthropic/claude-sonnet-4.6, or --model flag)
-  AGENT_BROWSER_GOAL_PROVIDER    Goal provider: vercel (default) or cloudflare
-  AGENT_BROWSER_GOAL_MODEL       Evaluation model for goal (provider default, or --eval-model)
-  AGENT_BROWSER_GOAL_TEXT_MODEL  Text model for goal TYPE_TEXT (provider default, or --text-model)
-  CLOUDFLARE_ACCOUNT_ID          Cloudflare account for cloudflare goal mode
-  CLOUDFLARE_API_TOKEN           Cloudflare token with Workers AI Read permission for goal mode
-  CLOUDFLARE_AI_GATEWAY_ID       Cloudflare AI Gateway ID for goal mode (default: default)
+  AGENT_BROWSER_GOAL_PROVIDER    Goal provider; overrides goal.provider (default: vercel)
+  AGENT_BROWSER_GOAL_MODEL       Evaluation model; overrides goal.evalModel (or --eval-model)
+  AGENT_BROWSER_GOAL_TEXT_MODEL  TYPE_TEXT model; overrides goal.textModel (or --text-model)
+  CLOUDFLARE_ACCOUNT_ID          Cloudflare account; overrides goal.cloudflare.accountId
+  CLOUDFLARE_API_TOKEN           Cloudflare token; overrides goal.cloudflare.apiToken
+  CLOUDFLARE_AI_GATEWAY_ID       Gateway ID; overrides goal.cloudflare.gatewayId (default: default)
 
 Install:
   npm install -g agent-browser           # npm

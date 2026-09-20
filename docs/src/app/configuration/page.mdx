@@ -36,9 +36,51 @@ AGENT_BROWSER_CONFIG=./ci-config.json agent-browser open example.com
   "profile": "./browser-data",
   "userAgent": "my-agent/1.0",
   "hideScrollbars": false,
-  "ignoreHttpsErrors": true
+  "ignoreHttpsErrors": true,
+  "goal": {
+    "provider": "cloudflare"
+  }
 }
 ```
+
+The nested `goal` object keeps goal provider and model settings separate from the browser `provider` and chat `model` keys. Use the full credential-bearing shape below only in a protected user or explicit config; project config should contain only nonsecret fields:
+
+```json
+{
+  "goal": {
+    "provider": "cloudflare",
+    "evalModel": "typesafe/jev",
+    "textModel": "@cf/qwen/qwen3-30b-a3b-fp8",
+    "cloudflare": {
+      "accountId": "ACCOUNT_ID",
+      "apiToken": "API_TOKEN",
+      "gatewayId": "default"
+    },
+    "vercel": {
+      "apiKey": "VERCEL_API_KEY"
+    }
+  }
+}
+```
+
+<table>
+  <thead>
+    <tr><th>Goal Config Key</th><th>Precedence (Highest to Lowest)</th><th>Default</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>goal.provider</code></td><td><code>AGENT_BROWSER_GOAL_PROVIDER</code> → <code>goal.provider</code></td><td><code>vercel</code></td></tr>
+    <tr><td><code>goal.evalModel</code></td><td><code>--eval-model</code> → <code>AGENT_BROWSER_GOAL_MODEL</code> → <code>goal.evalModel</code></td><td>Selected provider default</td></tr>
+    <tr><td><code>goal.textModel</code></td><td><code>--text-model</code> → <code>AGENT_BROWSER_GOAL_TEXT_MODEL</code> → <code>goal.textModel</code></td><td>Selected provider default</td></tr>
+    <tr><td><code>goal.cloudflare.accountId</code></td><td><code>CLOUDFLARE_ACCOUNT_ID</code> → <code>goal.cloudflare.accountId</code></td><td>(required for Cloudflare)</td></tr>
+    <tr><td><code>goal.cloudflare.apiToken</code></td><td><code>CLOUDFLARE_API_TOKEN</code> → <code>goal.cloudflare.apiToken</code></td><td>(required for Cloudflare)</td></tr>
+    <tr><td><code>goal.cloudflare.gatewayId</code></td><td><code>CLOUDFLARE_AI_GATEWAY_ID</code> → <code>goal.cloudflare.gatewayId</code></td><td><code>default</code></td></tr>
+    <tr><td><code>goal.vercel.apiKey</code></td><td><code>AI_GATEWAY_API_KEY</code> → <code>goal.vercel.apiKey</code></td><td>(required for Vercel goal mode)</td></tr>
+  </tbody>
+</table>
+
+User and project goal settings merge field by field, including partial nested provider objects. An explicit `--config` or `AGENT_BROWSER_CONFIG` file replaces automatic user and project discovery. Model precedence is command-local option, nonempty environment variable, merged config, then selected-provider default. Provider and credential environment variables override config. Selecting a different provider does not reset an explicit evaluation or text model ID; override those IDs too, or omit model settings to use the selected provider's defaults. `AI_GATEWAY_URL` remains environment-only and this goal block does not configure `chat`.
+
+Goal API keys and tokens in JSON are plaintext. Prefer `~/.agent-browser/config.json`, protect it with `chmod 600 ~/.agent-browser/config.json`, and never commit credentials in a project `agent-browser.json`. The CLI does not automatically load `.env` files and does not write goal credentials or defaults back to config.
 
 A [JSON Schema](https://agent-browser.dev/schema.json) is available for IDE autocomplete and validation. Add a `$schema` key to your config file to enable it:
 
@@ -107,6 +149,7 @@ Global launch, output, provider, and chat options can be set in the config file 
     <tr><td><code>idleTimeout</code></td><td><code>--idle-timeout</code></td><td>string (<code>10s</code>, <code>3m</code>, <code>1h</code>, or raw ms); defaults to <code>1h</code>, while <code>0</code> disables idle shutdown</td></tr>
     <tr><td><code>noAutoDialog</code></td><td><code>--no-auto-dialog</code></td><td>boolean</td></tr>
     <tr><td><code>model</code></td><td><code>--model</code></td><td>string</td></tr>
+    <tr><td><code>goal</code></td><td>Goal-specific flags and environment variables</td><td>nested provider, model, and credential object</td></tr>
     <tr><td><code>headers</code></td><td><code>--headers</code></td><td>string (JSON)</td></tr>
     <tr><td><code>plugins</code></td><td>(config only)</td><td>plugin config[]</td></tr>
   </tbody>
@@ -319,14 +362,14 @@ These environment variables configure additional daemon and runtime behavior:
     <tr><td><code>AGENT_BROWSER_COLOR</code></td><td>Enable colored CLI output when truthy.</td><td>(disabled)</td></tr>
     <tr><td><code>NO_COLOR</code></td><td>Disable colored output when present.</td><td>(not set)</td></tr>
     <tr><td><code>AI_GATEWAY_URL</code></td><td>Vercel AI Gateway base URL.</td><td><code>https://ai-gateway.vercel.sh</code></td></tr>
-    <tr><td><code>AI_GATEWAY_API_KEY</code></td><td>API key for Vercel AI Gateway. Required for AI chat and Vercel goal mode.</td><td>(none)</td></tr>
+    <tr><td><code>AI_GATEWAY_API_KEY</code></td><td>API key for Vercel AI Gateway. Required for AI chat; overrides <code>goal.vercel.apiKey</code> for Vercel goal mode.</td><td>(none)</td></tr>
     <tr><td><code>AI_GATEWAY_MODEL</code></td><td>Default AI model for dashboard chat.</td><td><code>anthropic/claude-sonnet-4.6</code></td></tr>
-    <tr><td><code>AGENT_BROWSER_GOAL_PROVIDER</code></td><td>Provider for the <code>goal</code> command: <code>vercel</code> or <code>cloudflare</code>.</td><td><code>vercel</code></td></tr>
-    <tr><td><code>AGENT_BROWSER_GOAL_MODEL</code></td><td>Evaluation model for the <code>goal</code> command.</td><td>Provider default: <code>typesafe-ai/jev</code> or <code>typesafe/jev</code></td></tr>
-    <tr><td><code>AGENT_BROWSER_GOAL_TEXT_MODEL</code></td><td>Text model that writes <code>TYPE_TEXT</code> values for the <code>goal</code> command.</td><td>Provider default: <code>inception/mercury-2.5</code> or <code>@cf/qwen/qwen3-30b-a3b-fp8</code></td></tr>
-    <tr><td><code>CLOUDFLARE_ACCOUNT_ID</code></td><td>Cloudflare account ID for Cloudflare goal mode.</td><td>(none)</td></tr>
-    <tr><td><code>CLOUDFLARE_API_TOKEN</code></td><td>Cloudflare API token with Account &gt; Workers AI &gt; Read permission for Cloudflare goal mode.</td><td>(none)</td></tr>
-    <tr><td><code>CLOUDFLARE_AI_GATEWAY_ID</code></td><td>AI Gateway ID used for Cloudflare goal requests.</td><td><code>default</code></td></tr>
+    <tr><td><code>AGENT_BROWSER_GOAL_PROVIDER</code></td><td>Provider for <code>goal</code>; overrides <code>goal.provider</code>. Values are <code>vercel</code> or <code>cloudflare</code>.</td><td><code>vercel</code></td></tr>
+    <tr><td><code>AGENT_BROWSER_GOAL_MODEL</code></td><td>Evaluation model for <code>goal</code>; overrides <code>goal.evalModel</code>.</td><td>Provider default: <code>typesafe-ai/jev</code> or <code>typesafe/jev</code></td></tr>
+    <tr><td><code>AGENT_BROWSER_GOAL_TEXT_MODEL</code></td><td>Text model for <code>TYPE_TEXT</code>; overrides <code>goal.textModel</code>.</td><td>Provider default: <code>inception/mercury-2.5</code> or <code>@cf/qwen/qwen3-30b-a3b-fp8</code></td></tr>
+    <tr><td><code>CLOUDFLARE_ACCOUNT_ID</code></td><td>Cloudflare account ID; overrides <code>goal.cloudflare.accountId</code>.</td><td>(none)</td></tr>
+    <tr><td><code>CLOUDFLARE_API_TOKEN</code></td><td>Cloudflare API token with Account &gt; Workers AI &gt; Read permission; overrides <code>goal.cloudflare.apiToken</code>.</td><td>(none)</td></tr>
+    <tr><td><code>CLOUDFLARE_AI_GATEWAY_ID</code></td><td>AI Gateway ID; overrides <code>goal.cloudflare.gatewayId</code>.</td><td><code>default</code></td></tr>
   </tbody>
 </table>
 
@@ -337,4 +380,4 @@ These environment variables configure additional daemon and runtime behavior:
 - **Malformed JSON** in auto-discovered files prints a warning to stderr and continues without that file.
 - **Unknown keys** are silently ignored for forward compatibility.
 
-> **Tip:** If your project-level `agent-browser.json` contains environment-specific values (paths, proxies), consider adding it to `.gitignore`.
+> **Tip:** If your project-level `agent-browser.json` contains environment-specific values, consider adding it to `.gitignore`. Never store API tokens there if the file may be committed.
