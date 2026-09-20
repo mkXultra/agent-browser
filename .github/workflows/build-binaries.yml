@@ -1,0 +1,205 @@
+name: Build Fork Binaries
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - fix/goal-command-reliability
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    if: github.ref == 'refs/heads/fix/goal-command-reliability'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            os: ubuntu-24.04
+            rust_target: x86_64-unknown-linux-gnu
+            build_target: x86_64-unknown-linux-gnu.2.28
+            artifact: agent-browser-linux-x64
+            archive: agent-browser-x86_64-unknown-linux-gnu.tar.gz
+            zigbuild: true
+          - name: macOS Apple Silicon
+            os: macos-15
+            rust_target: aarch64-apple-darwin
+            build_target: aarch64-apple-darwin
+            artifact: agent-browser-macos-arm64
+            archive: agent-browser-aarch64-apple-darwin.tar.gz
+            zigbuild: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Sync version
+        run: pnpm run version:sync
+
+      - name: Build dashboard
+        run: pnpm --filter dashboard build
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cli
+
+      - name: Install Linux build tools
+        if: matrix.zigbuild
+        run: |
+          set -euo pipefail
+          python3 -m pip install --user ziglang==0.16.0
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          cargo install cargo-zigbuild --version 0.23.2 --locked
+
+      - name: Build Linux binary
+        if: matrix.zigbuild
+        run: cargo zigbuild --release --locked --manifest-path cli/Cargo.toml --target ${{ matrix.build_target }}
+
+      - name: Build macOS binary
+        if: ${{ !matrix.zigbuild }}
+        run: cargo build --release --locked --manifest-path cli/Cargo.toml --target ${{ matrix.rust_target }}
+
+      - name: Verify Linux glibc floor
+        if: matrix.zigbuild
+        run: |
+          set -euo pipefail
+          binary="cli/target/${{ matrix.rust_target }}/release/agent-browser"
+          command -v objdump >/dev/null
+          glibc_versions="$(objdump -p "$binary" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -Vu || true)"
+          if [[ -z "$glibc_versions" ]]; then
+            echo "ERROR: Could not determine linked glibc requirements"
+            exit 1
+          fi
+          printf '%s\n' "$glibc_versions"
+          if awk -F '[_.]' '$2 > 2 || ($2 == 2 && $3 > 28) { found = 1 } END { exit !found }' <<< "$glibc_versions"; then
+            echo "ERROR: agent-browser requires glibc newer than 2.28"
+            exit 1
+          fi
+
+      - name: Smoke test binary
+        run: |
+          set -euo pipefail
+          binary="cli/target/${{ matrix.rust_target }}/release/agent-browser"
+          "$binary" --version
+          "$binary" --help >/dev/null
+
+      - name: Package binary
+        env:
+          ARCHIVE_NAME: ${{ matrix.archive }}
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: |
+          set -euo pipefail
+          bundle="agent-browser-${RUST_TARGET}"
+          mkdir -p "dist/$bundle/bin" artifacts
+          install -m 0755 "cli/target/${RUST_TARGET}/release/agent-browser" "dist/$bundle/bin/agent-browser"
+          install -m 0644 LICENSE "dist/$bundle/LICENSE"
+          install -m 0644 cli/src/native/a11y/LICENSE-axe-core.txt "dist/$bundle/LICENSE-axe-core.txt"
+          install -m 0644 cli/src/native/a11y/LICENSE-axe-core-THIRD-PARTY.txt "dist/$bundle/LICENSE-axe-core-THIRD-PARTY.txt"
+          cp -R skills skill-data "dist/$bundle/"
+          {
+            printf 'commit=%s\n' "$GITHUB_SHA"
+            printf 'ref=%s\n' "$GITHUB_REF"
+            printf 'target=%s\n' "$RUST_TARGET"
+          } > "dist/$bundle/BUILD-INFO.txt"
+          tar -C dist -czf "artifacts/$ARCHIVE_NAME" "$bundle"
+          if command -v sha256sum >/dev/null; then
+            (cd artifacts && sha256sum "$ARCHIVE_NAME" > SHA256SUMS)
+          else
+            (cd artifacts && shasum -a 256 "$ARCHIVE_NAME" > SHA256SUMS)
+          fi
+
+      - name: Verify isolated package and symlink install
+        env:
+          ARCHIVE_NAME: ${{ matrix.archive }}
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: |
+          set -euo pipefail
+          checkout_root="$(pwd -P)"
+          test_root="$(mktemp -d "${TMPDIR:-/tmp}/agent-browser-package.XXXXXX")"
+          test_root="$(cd "$test_root" && pwd -P)"
+          case "$test_root" in
+            "$checkout_root" | "$checkout_root"/*)
+              echo "ERROR: Package test directory is inside the checkout"
+              exit 1
+              ;;
+          esac
+          trap 'rm -rf -- "$test_root"' EXIT
+
+          bundle="agent-browser-${RUST_TARGET}"
+          tar -xzf "artifacts/$ARCHIVE_NAME" -C "$test_root"
+          package_root="$test_root/$bundle"
+          test -x "$package_root/bin/agent-browser"
+          test -f "$package_root/LICENSE"
+          test -f "$package_root/LICENSE-axe-core.txt"
+          test -f "$package_root/LICENSE-axe-core-THIRD-PARTY.txt"
+          test -d "$package_root/skills"
+          test -d "$package_root/skill-data"
+          diff -qr "$checkout_root/skills" "$package_root/skills"
+          diff -qr "$checkout_root/skill-data" "$package_root/skill-data"
+
+          unset AGENT_BROWSER_SKILLS_DIR
+          "$package_root/bin/agent-browser" --version
+          "$package_root/bin/agent-browser" skills get core --full > "$test_root/core-skill.txt"
+          grep -F -- '--- references/authentication.md ---' "$test_root/core-skill.txt" >/dev/null
+          skill_path="$("$package_root/bin/agent-browser" skills path core)"
+          expected_path="$(cd "$package_root/skill-data/core" && pwd -P)"
+          test "$skill_path" = "$expected_path"
+          case "$skill_path" in
+            "$checkout_root" | "$checkout_root"/*)
+              echo "ERROR: Packaged binary resolved skills from the checkout"
+              exit 1
+              ;;
+          esac
+
+          install_root="$test_root/home/.local/lib/agent-browser/$GITHUB_SHA"
+          mkdir -p "$(dirname "$install_root")" "$test_root/home/.local/bin"
+          mv "$package_root" "$install_root"
+          ln -s "$install_root/bin/agent-browser" "$test_root/home/.local/bin/agent-browser"
+          installed_binary="$test_root/home/.local/bin/agent-browser"
+          "$installed_binary" --version
+          installed_skill_path="$("$installed_binary" skills path core)"
+          expected_installed_path="$(cd "$install_root/skill-data/core" && pwd -P)"
+          test "$installed_skill_path" = "$expected_installed_path"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            artifacts/${{ matrix.archive }}
+            artifacts/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14

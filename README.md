@@ -60,6 +60,10 @@ pnpm link --global  # Makes agent-browser available globally
 agent-browser install
 ```
 
+### Fork Branch Binaries
+
+Build-only artifacts for macOS Apple Silicon and Linux x64, including Ubuntu x64 in WSL2, are documented in [Fork branch binaries](https://github.com/mkXultra/agent-browser/blob/fix/goal-command-reliability/.github/BUILD-BINARIES.md). These artifacts do not publish to npm or create a release.
+
 ### Linux Dependencies
 
 On Linux, install system dependencies:
