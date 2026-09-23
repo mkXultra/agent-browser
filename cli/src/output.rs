@@ -1735,6 +1735,8 @@ XPath, or an element reference from snapshot (e.g., @e1).
 
 If another element covers the click point, agent-browser reports the
 covering element instead of dispatching a click to the wrong target.
+Reference clicks account for iframe offsets and transforms, including
+cross-origin frames, while still rejecting clicks blocked by another element.
 
 Options:
   --new-tab            Open link in a new tab instead of navigating current tab.

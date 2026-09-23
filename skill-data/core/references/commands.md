@@ -80,7 +80,7 @@ agent-browser upload @e1 file.pdf # Upload files
 
 Visible-label matching treats non-breaking and ordinary spaces equivalently.
 
-Clicks fail before dispatch when another element covers the target's click point. The error names the covering element, for example `covered by <div#consent-banner>`. Dismiss or interact with that element, run a fresh snapshot, then retry the original action.
+Reference clicks account for iframe offsets and transforms, including cross-origin frames. Clicks fail before dispatch when another element covers the target's click point. The error names the covering element, for example `covered by <div#consent-banner>`. Dismiss or interact with that element, run a fresh snapshot, then retry the original action.
 
 ## Get Information
 

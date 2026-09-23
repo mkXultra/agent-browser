@@ -853,7 +853,7 @@ fn tools() -> Vec<Value> {
         tool(
             TOOL_CLICK,
             "Click element",
-            "Click an element by @ref or CSS selector.",
+            "Click an element by @ref or CSS selector. Reference clicks account for iframe offsets and transforms, including cross-origin frames, and reject clicks blocked by another element.",
             json!({
                 "selector": selector_schema(),
                 "newTab": { "type": "boolean", "default": false, "description": "Open link targets in a new tab after applying session setup." },
@@ -4712,6 +4712,23 @@ mod tests {
         .unwrap();
 
         assert_eq!(args, vec!["click", "@e1", "--new-tab"]);
+    }
+
+    #[test]
+    fn reference_click_uses_canonical_cli_parser() {
+        for human in [false, true] {
+            let arguments = json!({ "selector": "@e5", "human": human });
+            let args =
+                cli_tool_args(&arguments, click_command_args(&arguments).unwrap(), None).unwrap();
+            let flags = crate::flags::parse_flags(&args);
+            let parsed =
+                crate::commands::parse_command(&crate::flags::clean_args(&args), &flags).unwrap();
+
+            assert_eq!(parsed["action"], "click");
+            assert_eq!(parsed["selector"], "@e5");
+            assert_eq!(parsed["inputMode"].as_str(), human.then_some("human"));
+            assert!(parsed.get("newTab").is_none());
+        }
     }
 
     #[test]

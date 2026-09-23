@@ -1338,7 +1338,7 @@ agent-browser get text @e1                # Get heading text
 agent-browser hover @e4                   # Hover the link
 ```
 
-When a ref click is blocked by an overlay, the error includes the covering element, such as `covered by <div#consent-banner>`. Click the banner or dialog control first, then run `snapshot` again before reusing refs.
+Reference clicks account for iframe offsets and transforms, including cross-origin frames. When a ref click is blocked by an overlay, the error includes the covering element, such as `covered by <div#consent-banner>`. Click the banner or dialog control first, then run `snapshot` again before reusing refs.
 
 **Why use refs?**
 

@@ -302,7 +302,7 @@ pub(super) async fn frame_owner_object_id(
 /// Find a selector inside a same-process iframe and return its center in
 /// top-level viewport coordinates (input events dispatch in that space).
 /// Same-origin access to contentDocument is what makes this possible; a
-/// cross-origin frame never takes this path because it has its own session.
+/// same-session cross-origin frame cannot be resolved through contentDocument.
 async fn resolve_center_in_same_process_frame(
     client: &CdpClient,
     session_id: &str,
@@ -311,6 +311,7 @@ async fn resolve_center_in_same_process_frame(
 ) -> Result<(f64, f64), String> {
     let owner_object_id = frame_owner_object_id(client, session_id, frame_id).await?;
     let find_expr = build_find_element_js_in("doc", selector);
+    let blocker_at = blocker_at_js();
     let function = format!(
         r#"function() {{
             const doc = this.contentDocument;
@@ -329,7 +330,7 @@ async fn resolve_center_in_same_process_frame(
                 y += frameRect.y + win.frameElement.clientTop;
                 win = win.parent;
             }}
-            const blockerAt = {BLOCKER_AT_JS};
+            const blockerAt = {blocker_at};
             const topDoc = win ? win.document : doc;
             return {{ x: x, y: y, blocker: blockerAt(topDoc, el, x, y) }};
         }}"#,
@@ -426,10 +427,11 @@ pub async fn resolve_element_center(
 
             if let Ok(r) = result {
                 let (x, y) = box_model_center(&r.model);
-                check_node_interception(
+                let (x, y) = check_node_interception(
                     client,
                     effective_session_id,
                     backend_node_id,
+                    entry.frame_id.as_deref(),
                     selector_or_ref,
                     x,
                     y,
@@ -464,10 +466,11 @@ pub async fn resolve_element_center(
             )
             .await?;
         let (x, y) = box_model_center(&result.model);
-        check_node_interception(
+        let (x, y) = check_node_interception(
             client,
             effective_session_id,
             fresh_id,
+            entry.frame_id.as_deref(),
             selector_or_ref,
             x,
             y,
@@ -563,71 +566,384 @@ pub async fn session_viewport_offset(
     Err("Cyclic recording cursor frame ownership".to_string())
 }
 
-/// Hit-test a ref-resolved node at its computed click point and error if an
-/// unrelated element (overlay, banner, sticky header) would receive the input
-/// instead. Best effort: resolution failures skip the check rather than block
-/// the interaction.
+/// Hit-test in the same renderer/session as the box model and input dispatch.
+/// CDP handles cross-origin local frames and inverse embedding transforms; a
+/// JavaScript frameElement walk follows origin boundaries, not renderer roots.
+/// Return the sampled viewport point for dispatch. Resolution failures retain
+/// the original point and the existing best-effort interception behavior.
 async fn check_node_interception(
     client: &CdpClient,
     session_id: &str,
     backend_node_id: i64,
+    frame_id: Option<&str>,
     target: &str,
     x: f64,
     y: f64,
-) -> Result<(), String> {
-    let resolved: Result<DomResolveNodeResult, String> = client
+) -> Result<(f64, f64), String> {
+    match node_interception(client, session_id, backend_node_id, frame_id, x, y).await {
+        Ok((_, _, Some(blocker))) => Err(intercepted_error(target, &blocker)),
+        Ok((x, y, None)) => Ok((x, y)),
+        Err(_) => Ok((x, y)),
+    }
+}
+
+async fn node_interception(
+    client: &CdpClient,
+    session_id: &str,
+    backend_node_id: i64,
+    frame_id: Option<&str>,
+    x: f64,
+    y: f64,
+) -> Result<(f64, f64, Option<String>), String> {
+    // getBoxModel/Input use the session's viewport, while getNodeForLocation
+    // uses its root document's CSS pixels. Add only that viewport's scroll
+    // offset, including for OOPIF sessions. The hit-test API takes integers:
+    // return its sampled point in viewport coordinates so input dispatch never
+    // lands on a different side of a fractional overlay/target boundary.
+    let metrics = client
+        .send_command_no_params("Page.getLayoutMetrics", Some(session_id))
+        .await?;
+    let viewport = &metrics["cssVisualViewport"];
+    let page_x = viewport["pageX"].as_f64().ok_or("Missing viewport x")?;
+    let page_y = viewport["pageY"].as_f64().ok_or("Missing viewport y")?;
+    let document_x = (x + page_x).round() as i64;
+    let document_y = (y + page_y).round() as i64;
+    let x = document_x as f64 - page_x;
+    let y = document_y as f64 - page_y;
+    let hit = client
+        .send_command(
+            "DOM.getNodeForLocation",
+            Some(serde_json::json!({
+                "x": document_x,
+                "y": document_y,
+                "includeUserAgentShadowDOM": false,
+                "ignorePointerEventsNone": false,
+            })),
+            Some(session_id),
+        )
+        .await?;
+    let mut hit_id = hit["backendNodeId"].as_i64().ok_or("Missing hit node")?;
+    if hit_id == backend_node_id {
+        return Ok((x, y, None));
+    }
+
+    // Map a native frame hit to the hit-side owner in the lowest common
+    // document. Descendant owners can be related to the target; sibling/cousin
+    // owners are only used to describe the blocker and must remain rejected.
+    // Frame identity also covers containers and customized frame owners.
+    let mut compare_relationship = true;
+    let mut description_scope_frame = None;
+    let hit_frame = hit["frameId"].as_str().ok_or("Missing hit frame")?;
+    if frame_id != Some(hit_frame) {
+        let tree = client
+            .send_command_no_params("Page.getFrameTree", Some(session_id))
+            .await?;
+        let tree = &tree["frameTree"];
+        let target_frame = frame_id
+            .or_else(|| tree["frame"]["id"].as_str())
+            .ok_or("Missing target frame")?;
+        compare_relationship = target_frame == hit_frame;
+        if let Some((owner_frame, common_frame)) = hit_frame_owner(tree, target_frame, hit_frame) {
+            compare_relationship = common_frame == target_frame;
+            let owner = client
+                .send_command(
+                    "DOM.getFrameOwner",
+                    Some(serde_json::json!({"frameId": owner_frame})),
+                    Some(session_id),
+                )
+                .await?;
+            hit_id = owner["backendNodeId"]
+                .as_i64()
+                .ok_or("Missing frame owner")?;
+            if compare_relationship && hit_id == backend_node_id {
+                return Ok((x, y, None));
+            }
+        }
+        if !compare_relationship {
+            // Reverse the paths to find the target-side owner in the document
+            // where the blocker is described, including ancestor-frame hits.
+            description_scope_frame =
+                hit_frame_owner(tree, hit_frame, target_frame).map(|(owner, _)| owner.to_string());
+        }
+    }
+
+    let hit: DomResolveNodeResult = client
         .send_command_typed(
             "DOM.resolveNode",
             &DomResolveNodeParams {
-                backend_node_id: Some(backend_node_id),
+                backend_node_id: Some(hit_id),
                 node_id: None,
                 object_group: Some("agent-browser".to_string()),
             },
             Some(session_id),
         )
-        .await;
-    let Ok(resolved) = resolved else {
-        return Ok(());
+        .await?;
+    let hit_object = hit.object.object_id.ok_or("Missing hit object")?;
+    let target_object = if compare_relationship {
+        let target: DomResolveNodeResult = client
+            .send_command_typed(
+                "DOM.resolveNode",
+                &DomResolveNodeParams {
+                    backend_node_id: Some(backend_node_id),
+                    node_id: None,
+                    object_group: Some("agent-browser".to_string()),
+                },
+                Some(session_id),
+            )
+            .await?;
+        Some(target.object.object_id.ok_or("Missing target object")?)
+    } else {
+        None
     };
-    let Some(object_id) = resolved.object.object_id else {
-        return Ok(());
+
+    if let Some(target_object) = target_object.as_deref() {
+        let blocker_for_hit = blocker_for_hit_js();
+        let function = format!(
+            "function(hit, component) {{ return ({blocker_for_hit})(this, hit, component); }}"
+        );
+        let mut result = client
+            .send_command(
+                "Runtime.callFunctionOn",
+                Some(serde_json::json!({
+                    "objectId": target_object,
+                    "functionDeclaration": function,
+                    "arguments": [{"objectId": hit_object}, {"value": true}],
+                    "returnByValue": true,
+                })),
+                Some(session_id),
+            )
+            .await;
+        if result
+            .as_ref()
+            .ok()
+            .and_then(|v| v.pointer("/result/value"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            // Only a component-visual exemption needs this extra native walk.
+            // Neither JS node may expose the target's closed slot assignment;
+            // trusting its apparent outer root could admit an unrelated dialog.
+            let group = format!("agent-browser-hit-{}", uuid::Uuid::new_v4());
+            let component = native_shadow_root(client, session_id, target_object, &group)
+                .await
+                .ok()
+                .flatten();
+            let component_arg = match component {
+                Some(object_id) => serde_json::json!({"objectId": object_id}),
+                None => serde_json::json!({"value": null}),
+            };
+            // If native ancestry cannot be resolved, disable only this optional
+            // exemption; a known hit must not become allowed because it failed.
+            result = client
+                .send_command(
+                    "Runtime.callFunctionOn",
+                    Some(serde_json::json!({
+                        "objectId": target_object,
+                        "functionDeclaration": function,
+                        "arguments": [{"objectId": hit_object}, component_arg],
+                        "returnByValue": true,
+                    })),
+                    Some(session_id),
+                )
+                .await;
+            let _ = client
+                .send_command(
+                    "Runtime.releaseObjectGroup",
+                    Some(serde_json::json!({"objectGroup": group})),
+                    Some(session_id),
+                )
+                .await;
+        }
+        if let Ok(value) = result {
+            if let Some(blocker) = value.pointer("/result/value") {
+                if blocker.is_null() || blocker.is_string() {
+                    return Ok((x, y, blocker.as_str().map(String::from)));
+                }
+            }
+        }
+    }
+
+    // The mapped target owner supplies tree scopes only: a known cross-document
+    // blocker must never be granted a relationship/component exemption. Scope
+    // lookup is optional; failure falls back to a document-level description.
+    let description_scope = if let Some(target) = target_object {
+        Some(target)
+    } else if let Some(frame) = description_scope_frame {
+        frame_owner_object_id(client, session_id, &frame).await.ok()
+    } else {
+        None
     };
-    // Box-model coordinates are in the top-level viewport space, so the
-    // hit-test starts from the top document. For an OOPIF node the
-    // frameElement walk stops at the process boundary, where the frame's own
-    // document and session-local coordinates are already consistent.
-    let function = format!(
-        r#"function(x, y) {{
-            let topDoc = this.ownerDocument || document;
-            while (topDoc.defaultView && topDoc.defaultView.frameElement) {{
-                topDoc = topDoc.defaultView.frameElement.ownerDocument;
-            }}
-            const blockerAt = {BLOCKER_AT_JS};
-            return blockerAt(topDoc, this, x, y);
-        }}"#,
-    );
-    let result = client
+    let mut description = describe_blocking_hit(
+        client,
+        session_id,
+        &hit_object,
+        description_scope.as_deref(),
+    )
+    .await;
+    if description.is_err() && description_scope.is_some() {
+        description = describe_blocking_hit(client, session_id, &hit_object, None).await;
+    }
+    let blocker = match description {
+        Ok(blocker) => blocker,
+        // Even a failed diagnostic must not turn an established cross-document
+        // blocker into allowed input. Relationship-resolution errors elsewhere
+        // retain the existing best-effort behavior.
+        Err(_) if !compare_relationship => "another element".to_string(),
+        Err(error) => return Err(error),
+    };
+    Ok((x, y, Some(blocker)))
+}
+
+/// Describe a known blocker without running relationship or component checks.
+async fn describe_blocking_hit(
+    client: &CdpClient,
+    session_id: &str,
+    hit_object: &str,
+    scope_object: Option<&str>,
+) -> Result<String, String> {
+    let scope_arg = match scope_object {
+        Some(object_id) => serde_json::json!({"objectId": object_id}),
+        None => serde_json::json!({"value": null}),
+    };
+    let description = client
         .send_command(
             "Runtime.callFunctionOn",
             Some(serde_json::json!({
-                "objectId": object_id,
-                "functionDeclaration": function,
-                "arguments": [{ "value": x }, { "value": y }],
+                "objectId": hit_object,
+                "functionDeclaration": format!(
+                    "function(scope) {{ return ({DESCRIBE_HIT_JS})(scope, this); }}"
+                ),
+                "arguments": [scope_arg],
                 "returnByValue": true,
             })),
             Some(session_id),
         )
-        .await;
-    if let Ok(value) = result {
-        if let Some(blocker) = value
-            .get("result")
-            .and_then(|r| r.get("value"))
-            .and_then(|v| v.as_str())
+        .await?;
+    description
+        .pointer("/result/value")
+        .and_then(Value::as_str)
+        .map(String::from)
+        .ok_or_else(|| "Cannot describe blocking hit".to_string())
+}
+
+/// Follow native assigned-slot edges to the nearest author shadow root. CDP
+/// exposes closed assignments and built-in UA slots (for example in details).
+/// UA roots are implementation details: continue through their host so they
+/// neither replace the author component nor skip its overlay boundary.
+/// The caller releases `object_group` after using the returned root or on error.
+async fn native_shadow_root(
+    client: &CdpClient,
+    session_id: &str,
+    target_object: &str,
+    object_group: &str,
+) -> Result<Option<String>, String> {
+    let mut object_id = target_object.to_string();
+    let mut visited = std::collections::HashSet::new();
+    loop {
+        let description = client
+            .send_command(
+                "DOM.describeNode",
+                Some(serde_json::json!({"objectId": object_id, "depth": 0})),
+                Some(session_id),
+            )
+            .await?;
+        let node = &description["node"];
+        let backend_id = node["backendNodeId"]
+            .as_i64()
+            .ok_or("Missing composed ancestor node")?;
+        if !visited.insert(backend_id) {
+            return Err("Cyclic composed ancestry".to_string());
+        }
+        let shadow_root_type = node["shadowRootType"].as_str();
+        if node["nodeType"].as_i64() == Some(11)
+            && matches!(shadow_root_type, Some("open" | "closed"))
         {
-            return Err(intercepted_error(target, blocker));
+            return Ok(Some(object_id));
+        }
+        if let Some(slot_id) = node
+            .pointer("/assignedSlot/backendNodeId")
+            .and_then(Value::as_i64)
+        {
+            let slot: DomResolveNodeResult = client
+                .send_command_typed(
+                    "DOM.resolveNode",
+                    &DomResolveNodeParams {
+                        backend_node_id: Some(slot_id),
+                        node_id: None,
+                        object_group: Some(object_group.to_string()),
+                    },
+                    Some(session_id),
+                )
+                .await?;
+            object_id = slot
+                .object
+                .object_id
+                .ok_or("Missing assigned slot object")?;
+        } else {
+            let parent_function = if shadow_root_type == Some("user-agent") {
+                "function() { return this.host; }"
+            } else {
+                "function() { return this.parentNode; }"
+            };
+            let parent = client
+                .send_command(
+                    "Runtime.callFunctionOn",
+                    Some(serde_json::json!({
+                        "objectId": object_id,
+                        "functionDeclaration": parent_function,
+                        "objectGroup": object_group,
+                        "returnByValue": false,
+                    })),
+                    Some(session_id),
+                )
+                .await?;
+            if parent.get("exceptionDetails").is_some() {
+                return Err("Cannot resolve composed parent".to_string());
+            }
+            if parent.pointer("/result/subtype").and_then(Value::as_str) == Some("null") {
+                return Ok(None);
+            }
+            object_id = parent
+                .pointer("/result/objectId")
+                .and_then(Value::as_str)
+                .ok_or("Missing composed parent object")?
+                .to_string();
         }
     }
-    Ok(())
+}
+
+/// Return the hit-side child frame and its lowest common ancestor document.
+/// Descendant hits map to an owner in the target document; sibling/cousin hits
+/// map to an owner in the common document. Same-frame, ancestor, or missing
+/// hits have no child owner to map to.
+fn hit_frame_owner<'a>(
+    tree: &'a Value,
+    target_frame: &str,
+    hit_frame: &str,
+) -> Option<(&'a str, &'a str)> {
+    if !frame_contains_target(tree, target_frame) {
+        return None;
+    }
+    let child = tree["childFrames"]
+        .as_array()?
+        .iter()
+        .find(|child| frame_contains_target(child, hit_frame))?;
+    if frame_contains_target(child, target_frame) {
+        return hit_frame_owner(child, target_frame, hit_frame);
+    }
+    Some((
+        child["frame"]["id"].as_str()?,
+        tree["frame"]["id"].as_str()?,
+    ))
+}
+
+fn frame_contains_target(tree: &Value, target: &str) -> bool {
+    tree["frame"]["id"].as_str() == Some(target)
+        || tree["childFrames"].as_array().is_some_and(|children| {
+            children
+                .iter()
+                .any(|child| frame_contains_target(child, target))
+        })
 }
 
 /// Coordinates from DOM.getBoxModel are viewport-relative, and input events
@@ -758,8 +1074,8 @@ pub async fn resolve_element_object_id(
 }
 
 /// Determine which CDP session and parameters to use for an AX tree query.
-/// Cross-origin iframes have a dedicated session (no frameId needed);
-/// same-origin iframes use the parent session with a frameId parameter.
+/// Out-of-process iframes have a dedicated session (no frameId needed);
+/// in-process iframes, including cross-origin ones, use a frameId parameter.
 pub(super) fn resolve_ax_session<'a>(
     frame_id: Option<&str>,
     session_id: &'a str,
@@ -777,7 +1093,7 @@ pub(super) fn resolve_ax_session<'a>(
 }
 
 /// Resolve the effective CDP session for an element's frame.
-/// If the element's frame_id has a dedicated cross-origin iframe session, return it.
+/// If the element's frame_id has a dedicated out-of-process session, return it.
 /// Otherwise, return the parent session.
 fn resolve_frame_session<'a>(
     frame_id: Option<&str>,
@@ -889,33 +1205,25 @@ fn build_count_elements_js(selector: &str) -> String {
     }
 }
 
-/// JS function source for `blockerAt(doc, el, x, y)`: returns a short
-/// description of the element that would actually receive a click at (x, y)
-/// when that element is unrelated to `el`, or null when the click would land
-/// on `el` (or something that activates it). Relations that count as "lands
-/// on el": shadow-including ancestors/descendants in either direction, and
-/// label/control association (custom checkboxes hide the input under a styled
-/// sibling inside the same label).
-const BLOCKER_AT_JS: &str = r#"(doc, el, x, y) => {
-    // Descend from the given document through same-origin iframes so a point
-    // over a frame resolves to the element inside it, in that frame's space.
-    let d = doc, lx = x, ly = y;
-    let hit = d.elementFromPoint(lx, ly);
-    while (hit && (hit.tagName === 'IFRAME' || hit.tagName === 'FRAME') && hit.contentDocument && hit !== el) {
-        const r = hit.getBoundingClientRect();
-        lx -= r.x + hit.clientLeft;
-        ly -= r.y + hit.clientTop;
-        d = hit.contentDocument;
-        hit = d.elementFromPoint(lx, ly);
+/// Pure blocker description, retargeted to the caller's tree scopes. A scope
+/// element supplies visibility only and cannot make the hit related or allowed.
+const DESCRIBE_HIT_JS: &str = r#"(scope, hit) => {
+    while (hit && !hit.tagName && hit.element) hit = hit.element;
+    if (!hit) return null;
+    const scopes = new Set();
+    if (scope) {
+        for (let node = scope; node; ) {
+            const root = node.getRootNode();
+            scopes.add(root);
+            if (!root.host) break;
+            node = root.host;
+        }
     }
-    if (!hit || hit === el) return null;
-    const up = (n) => n.parentNode || n.host || (n.getRootNode && n.getRootNode().host) || null;
-    for (let n = hit; n; n = up(n)) { if (n === el) return null; }
-    for (let n = el; n; n = up(n)) { if (n === hit) return null; }
-    const hitLabel = hit.closest ? hit.closest('label') : null;
-    if (hitLabel && (hitLabel.control === el || hitLabel.contains(el))) return null;
-    const elLabel = el.closest ? el.closest('label') : null;
-    if (elLabel && elLabel.contains(hit)) return null;
+    // Name the nearest host visible from the target, not an inaccessible inner
+    // node or the shared app shell. Null-scope descriptions reach the document.
+    for (let root = hit.getRootNode(); root.host && !scopes.has(root); root = hit.getRootNode()) {
+        hit = root.host;
+    }
     let desc = hit.tagName.toLowerCase();
     if (hit.id) desc += '#' + hit.id;
     else if (typeof hit.className === 'string' && hit.className.trim())
@@ -928,7 +1236,87 @@ const BLOCKER_AT_JS: &str = r#"(doc, el, x, y) => {
     return desc;
 }"#;
 
+/// Shared relationship policy for native refs and document-local selectors.
+/// Preserve ordinary/composed ancestry and labels; allow internal visuals only
+/// within the nearest author component. A true third argument asks native
+/// callers to confirm that root, then pass it or null to disable the exemption.
+fn blocker_for_hit_js() -> String {
+    format!(
+        r#"(el, hit, nativeComponent) => {{
+    // Native hits may be pseudo-elements or deep nodes in closed shadow roots.
+    while (hit && !hit.tagName && hit.element) hit = hit.element;
+    if (!hit || hit === el) return null;
+    if (el) {{
+        // assignedSlot hides closed-root assignments. Either side may expose
+        // the assigning root (a slotted target or a slotted hit), so inspect both.
+        const slots = new Map();
+        const starts = [el, hit];
+        if (nativeComponent && nativeComponent !== true) starts.push(nativeComponent);
+        for (const start of starts) {{
+            for (let node = start; node; ) {{
+                const root = node.getRootNode();
+                if (!root.host) break;
+                for (const slot of root.querySelectorAll('slot')) {{
+                    if (slot.assignedNodes) {{
+                        for (const assigned of slot.assignedNodes()) slots.set(assigned, slot);
+                    }}
+                }}
+                node = root.host;
+            }}
+        }}
+        const parent = n => n.parentNode || n.host || (n.getRootNode && n.getRootNode().host) || null;
+        const composedParent = n => n.assignedSlot || slots.get(n) || parent(n);
+        for (const up of [parent, composedParent]) {{
+            for (let n = hit; n; n = up(n)) {{ if (n === el) return null; }}
+            for (let n = el; n; n = up(n)) {{ if (n === hit) return null; }}
+        }}
+        const hitLabel = hit.closest ? hit.closest('label') : null;
+        if (hitLabel && (hitLabel.control === el || hitLabel.contains(el))) return null;
+        const elLabel = el.closest ? el.closest('label') : null;
+        if (elLabel && elLabel.contains(hit)) return null;
+
+        // Sharing the outer app host does not make separate components related.
+        // Stop at the target's first composed shadow root, including slot edges.
+        let component = nativeComponent;
+        if (nativeComponent === undefined || nativeComponent === true) {{
+            component = null;
+            for (let n = composedParent(el); n; n = composedParent(n)) {{
+                if (n.nodeType === 11 && n.host) {{ component = n; break; }}
+            }}
+        }}
+        if (component) {{
+            for (let n = hit; n; n = composedParent(n)) {{
+                if (n === component) return nativeComponent === true ? true : null;
+            }}
+        }}
+    }}
+    return ({DESCRIBE_HIT_JS})(el, hit);
+}}"#
+    )
+}
+
+/// Document-local hit testing for the CSS selector path. Reference clicks use
+/// CDP hit testing so renderer coordinates never enter a different DOM viewport.
+fn blocker_at_js() -> String {
+    let blocker_for_hit = blocker_for_hit_js();
+    format!(
+        r#"(doc, el, x, y) => {{
+            let d = doc, lx = x, ly = y;
+            let hit = d.elementFromPoint(lx, ly);
+            while (hit && (hit.tagName === 'IFRAME' || hit.tagName === 'FRAME') && hit.contentDocument && hit !== el) {{
+                const r = hit.getBoundingClientRect();
+                lx -= r.x + hit.clientLeft;
+                ly -= r.y + hit.clientTop;
+                d = hit.contentDocument;
+                hit = d.elementFromPoint(lx, ly);
+            }}
+            return ({blocker_for_hit})(el, hit);
+        }}"#
+    )
+}
+
 fn build_selector_js(selector: &str) -> String {
+    let blocker_at = blocker_at_js();
     let find_expr = build_find_element_js(selector);
     // Input events dispatch at viewport coordinates, so an element outside the
     // viewport must be scrolled into view first or the click lands on nothing.
@@ -949,7 +1337,7 @@ fn build_selector_js(selector: &str) -> String {
             }}
             const x = rect.x + rect.width / 2;
             const y = rect.y + rect.height / 2;
-            const blockerAt = {BLOCKER_AT_JS};
+            const blockerAt = {blocker_at};
             return {{ x: x, y: y, blocker: blockerAt(document, el, x, y) }};
         }})()"#,
     )
@@ -1645,6 +2033,47 @@ mod tests {
         let (x, y) = box_model_center(&model);
         assert!((x - 60.0).abs() < 0.01);
         assert!((y - 40.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_hit_maps_to_owner_in_common_document() {
+        let tree = serde_json::json!({
+            "frame": {"id": "root"},
+            "childFrames": [
+                {"frame": {"id": "owner"}, "childFrames": [
+                    {"frame": {"id": "nested"}, "childFrames": [
+                        {"frame": {"id": "deep"}}
+                    ]},
+                    {"frame": {"id": "other"}, "childFrames": [
+                        {"frame": {"id": "cousin"}}
+                    ]}
+                ]},
+                {"frame": {"id": "sibling"}}
+            ]
+        });
+        for (target, hit, expected) in [
+            ("root", "owner", Some(("owner", "root"))),
+            ("root", "deep", Some(("owner", "root"))),
+            ("owner", "deep", Some(("nested", "owner"))),
+            ("nested", "other", Some(("other", "owner"))),
+            ("deep", "cousin", Some(("other", "owner"))),
+            ("cousin", "deep", Some(("nested", "owner"))),
+            ("nested", "sibling", Some(("sibling", "root"))),
+            // Reversed paths select the description scope on the target side.
+            ("sibling", "deep", Some(("owner", "root"))),
+            ("other", "deep", Some(("nested", "owner"))),
+            ("owner", "owner", None),
+            ("owner", "root", None),
+            ("deep", "nested", None),
+            ("missing", "nested", None),
+            ("nested", "missing", None),
+        ] {
+            assert_eq!(
+                hit_frame_owner(&tree, target, hit),
+                expected,
+                "{target} -> {hit}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

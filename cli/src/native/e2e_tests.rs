@@ -5062,6 +5062,604 @@ async fn e2e_click_reports_covering_overlay() {
     assert_success(&resp);
 }
 
+/// Serve both documents over HTTP so different localhost ports produce a
+/// cross-origin iframe that still shares the page's renderer/CDP session.
+async fn start_iframe_click_server(
+    child_url: Option<String>,
+    transform: &str,
+    overlay: &str,
+) -> (u16, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let child_url = child_url.unwrap_or_else(|| format!("http://localhost:{port}/child"));
+    let child_overlay = if overlay == "child" {
+        "<div id='child-overlay' style='position:absolute;left:20px;top:20px;width:100px;height:30px;z-index:10'></div>"
+    } else {
+        ""
+    };
+    let child = format!(
+        r#"<!doctype html><html><body style="margin:0">
+<button id="target" style="position:absolute;left:20px;top:20px;width:100px;height:30px"
+    onclick="parent.postMessage('target', '*')">Frame target</button>
+<button id="decoy" style="position:absolute;left:0;top:120px;width:390px;height:60px"
+    onclick="parent.postMessage('decoy', '*')">Lower decoy</button>
+{child_overlay}<script>parent.postMessage('ready', '*')</script></body></html>"#
+    );
+    let parent_overlay = if overlay == "parent" {
+        "<div id='parent-overlay' style='position:fixed;inset:0;z-index:10'></div>"
+    } else {
+        ""
+    };
+    let parent = format!(
+        r#"<!doctype html><html><body style="margin:0">
+<script>
+window.clicks = {{target:0, decoy:0, top:0}};
+window.childReady = false;
+addEventListener('message', event => {{
+    if (event.source !== document.getElementById('click-frame').contentWindow) return;
+    if (event.data === 'ready') window.childReady = true;
+    else if (event.data === 'target' || event.data === 'decoy') window.clicks[event.data]++;
+}});
+</script>
+<button style="position:absolute;left:10px;top:10px" onclick="window.clicks.top++">Top target</button>
+<iframe id="click-frame" name="click-frame" title="Click frame" src="{child_url}"
+    style="position:absolute;left:100px;top:120px;width:400px;height:240px;border:0;transform-origin:0 0;transform:{transform}"></iframe>
+{parent_overlay}</body></html>"#
+    );
+    let server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let parent = parent.clone();
+            let child = child.clone();
+            tokio::spawn(async move {
+                let mut buf = [0; 8192];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let body = if request.starts_with("GET /child ") {
+                    child
+                } else {
+                    parent
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nOrigin-Agent-Cluster: ?0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    (port, server)
+}
+
+async fn assert_iframe_reference_click(
+    topology: &str,
+    transform: &str,
+    select_frame: bool,
+    overlay: &str,
+    scroll_and_scale: bool,
+) {
+    let (child_port, child_server) = start_iframe_click_server(None, "none", overlay).await;
+    let child_url = match topology {
+        "same-origin" => None,
+        "same-session" => Some(format!("http://localhost:{child_port}/child")),
+        "oopif" => Some(format!("http://127.0.0.1:{child_port}/child")),
+        _ => panic!("Unknown frame topology: {topology}"),
+    };
+    let (port, parent_server) = start_iframe_click_server(child_url, transform, overlay).await;
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(&json!({"action":"launch", "headless":true}), &mut state).await,
+    );
+    if scroll_and_scale {
+        assert_success(
+            &execute_command(
+                &json!({"action":"viewport", "width":1280, "height":720, "deviceScaleFactor":2}),
+                &mut state,
+            )
+            .await,
+        );
+    }
+    assert_success(
+        &execute_command(
+            &json!({"action":"navigate", "url":format!("http://localhost:{port}/")}),
+            &mut state,
+        )
+        .await,
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let ready = execute_command(
+                &json!({"action":"evaluate", "script":"window.childReady"}),
+                &mut state,
+            )
+            .await;
+            assert_success(&ready);
+            if get_data(&ready)["result"] == true {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("iframe fixture did not load");
+    let snapshot = execute_command(&json!({"action":"snapshot"}), &mut state).await;
+    assert_success(&snapshot);
+    let top_reference = get_data(&snapshot)["refs"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(_, entry)| entry["name"] == "Top target")
+        .unwrap()
+        .0
+        .clone();
+    let top_click = execute_command(
+        &json!({"action":"click", "selector":format!("@{top_reference}")}),
+        &mut state,
+    )
+    .await;
+    if overlay == "parent" {
+        assert_eq!(top_click["success"], false);
+        assert!(top_click["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("covered by <div#parent-overlay>"));
+    } else {
+        assert_success(&top_click);
+    }
+    if scroll_and_scale {
+        assert_evaluate(&mut state, "scroll", "document.body.style.height = '2000px'; window.scrollTo(0, 60); [window.scrollY, window.devicePixelRatio]", json!([60, 2])).await;
+    }
+
+    if select_frame {
+        let frame_reference = get_data(&snapshot)["refs"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .find(|(_, entry)| entry["name"] == "Click frame")
+            .unwrap()
+            .0;
+        assert_success(
+            &execute_command(
+                &json!({"action":"frame", "selector":format!("@{frame_reference}")}),
+                &mut state,
+            )
+            .await,
+        );
+    }
+    let snapshot = execute_command(&json!({"action":"snapshot"}), &mut state).await;
+    assert_success(&snapshot);
+    let reference = get_data(&snapshot)["refs"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(_, entry)| entry["name"] == "Frame target")
+        .expect("frame target must be exposed by the Rust snapshot")
+        .0
+        .clone();
+    let entry = state.ref_map.get(&reference).unwrap();
+    let frame_id = entry
+        .frame_id
+        .as_deref()
+        .expect("target ref must belong to the iframe");
+    assert_eq!(
+        state.iframe_sessions.contains_key(frame_id),
+        topology == "oopif",
+        "fixture must exercise {topology}, sessions: {:?}",
+        state.iframe_sessions
+    );
+    if select_frame {
+        assert_eq!(state.active_frame_id.as_deref(), Some(frame_id));
+    }
+    // Assert the DOM geometry is disjoint, independently of the click result.
+    let browser = state.browser.as_ref().unwrap();
+    let session = state
+        .iframe_sessions
+        .get(frame_id)
+        .map(String::as_str)
+        .unwrap_or(browser.active_session_id().unwrap());
+    let object = browser
+        .client
+        .send_command(
+            "DOM.resolveNode",
+            Some(json!({"backendNodeId":entry.backend_node_id.unwrap()})),
+            Some(session),
+        )
+        .await
+        .unwrap();
+    if topology == "oopif" && scroll_and_scale {
+        // Keep both nodes visible while giving the OOPIF its own scroll offset.
+        // The decoy occupies the wrong document point used when that session's
+        // viewport offset is omitted, so a best-effort miss cannot hide the bug.
+        let scrolled = browser.client.send_command("Runtime.callFunctionOn", Some(json!({
+            "objectId":object["object"]["objectId"],
+            "functionDeclaration":"function() { const doc = this.ownerDocument; doc.body.style.height = '2000px'; this.style.top = '400px'; doc.getElementById('decoy').style.top = '200px'; doc.defaultView.scrollTo(0, 200); const rect = this.getBoundingClientRect(); return [doc.defaultView.scrollY, rect.top >= 0 && rect.bottom <= doc.defaultView.innerHeight]; }",
+            "returnByValue":true
+        })), Some(session)).await.unwrap();
+        assert_eq!(scrolled["result"]["value"], json!([200, true]));
+        let wrong_hit = browser
+            .client
+            .send_command(
+                "DOM.getNodeForLocation",
+                Some(json!({"x":70,"y":215})),
+                Some(session),
+            )
+            .await
+            .unwrap();
+        let wrong_node = browser
+            .client
+            .send_command(
+                "DOM.describeNode",
+                Some(json!({"backendNodeId":wrong_hit["backendNodeId"]})),
+                Some(session),
+            )
+            .await
+            .unwrap();
+        assert!(
+            wrong_node["node"]["attributes"]
+                .as_array()
+                .unwrap()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .any(|attribute| attribute[0] == "id" && attribute[1] == "decoy"),
+            "omitting the OOPIF's viewport offset must sample its unrelated decoy: {wrong_node}"
+        );
+    }
+    let geometry = browser.client.send_command("Runtime.callFunctionOn", Some(json!({
+        "objectId":object["object"]["objectId"],
+        "functionDeclaration":"function() { const target = this.getBoundingClientRect(); const decoy = this.ownerDocument.getElementById('decoy').getBoundingClientRect(); return {disjoint:target.bottom < decoy.top || decoy.bottom < target.top, parentAccessible:!!this.ownerDocument.defaultView.frameElement}; }",
+        "returnByValue":true
+    })), Some(session)).await.unwrap();
+    assert_eq!(geometry["result"]["value"]["disjoint"], true);
+    assert_eq!(
+        geometry["result"]["value"]["parentAccessible"],
+        topology == "same-origin"
+    );
+
+    let clicked = execute_command(
+        &json!({"action":"click", "selector":format!("@{reference}")}),
+        &mut state,
+    )
+    .await;
+    // Collect counters and close before asserting the expected baseline failure.
+    let counters = execute_command(&json!({"action":"evaluate", "script":"new Promise(resolve => setTimeout(() => resolve(window.clicks), 50))"}), &mut state).await;
+    assert_success(&counters);
+    assert_success(&execute_command(&json!({"action":"close"}), &mut state).await);
+    child_server.abort();
+    parent_server.abort();
+    if overlay.is_empty() {
+        assert_success(&clicked);
+        assert_eq!(
+            get_data(&counters)["result"],
+            json!({"target":1,"decoy":0,"top":1}),
+            "{topology}, transform={transform}, selected={select_frame}"
+        );
+    } else {
+        assert_eq!(
+            clicked["success"], false,
+            "a genuine {overlay} overlay must reject the click: {clicked}"
+        );
+        assert!(
+            clicked["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&format!("covered by <div#{overlay}-overlay>")),
+            "unexpected interception error: {clicked}"
+        );
+        assert_eq!(
+            get_data(&counters)["result"],
+            json!({"target":0,"decoy":0,"top":if overlay == "parent" {0} else {1}})
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_iframe_reference_click_same_session_cross_origin() {
+    assert_iframe_reference_click("same-session", "none", false, "", false).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_iframe_reference_click_selected_same_session_cross_origin() {
+    assert_iframe_reference_click("same-session", "none", true, "", false).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_iframe_reference_click_transformed_same_origin() {
+    for transform in ["none", "scale(4)"] {
+        assert_iframe_reference_click("same-origin", transform, false, "", false).await;
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_iframe_reference_click_rotated_same_origin() {
+    assert_iframe_reference_click("same-origin", "scale(3) rotate(10deg)", false, "", false).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_iframe_reference_click_oopif() {
+    for select_frame in [false, true] {
+        assert_iframe_reference_click("oopif", "none", select_frame, "", false).await;
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_iframe_reference_click_rejects_real_overlays() {
+    for topology in ["same-origin", "same-session", "oopif"] {
+        for overlay in ["child", "parent"] {
+            // Parent overlays above an OOPIF require a separate cross-session
+            // check; this test preserves interception within the input session.
+            if topology == "oopif" && overlay == "parent" {
+                continue;
+            }
+            assert_iframe_reference_click(topology, "none", false, overlay, false).await;
+        }
+    }
+    assert_iframe_reference_click("same-origin", "scale(4)", false, "child", false).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_iframe_reference_click_scrolled_device_scale() {
+    assert_iframe_reference_click("same-session", "none", false, "", true).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_iframe_reference_click_scrolled_oopif() {
+    assert_iframe_reference_click("oopif", "none", false, "", true).await;
+}
+
+/// Replacing the snapshotted node must retain interception and checked-point
+/// dispatch when role/name lookup resolves its same-session cross-origin peer.
+#[tokio::test]
+#[ignore]
+async fn e2e_iframe_reference_click_stale_node_interception() {
+    let (child_port, child_server) = start_iframe_click_server(None, "none", "").await;
+    let (port, parent_server) = start_iframe_click_server(
+        Some(format!("http://localhost:{child_port}/child")),
+        "none",
+        "",
+    )
+    .await;
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(&json!({"action":"launch", "headless":true}), &mut state).await,
+    );
+    assert_success(
+        &execute_command(
+            &json!({"action":"navigate", "url":format!("http://localhost:{port}/")}),
+            &mut state,
+        )
+        .await,
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let ready = execute_command(
+                &json!({"action":"evaluate", "script":"window.childReady"}),
+                &mut state,
+            )
+            .await;
+            assert_success(&ready);
+            if get_data(&ready)["result"] == true {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("cross-origin stale-node fixture did not load");
+    let snapshot = execute_command(&json!({"action":"snapshot"}), &mut state).await;
+    assert_success(&snapshot);
+    let reference = get_data(&snapshot)["refs"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(_, entry)| entry["name"] == "Frame target")
+        .expect("stale target must originate in the Rust snapshot")
+        .0
+        .clone();
+    let entry = state.ref_map.get(&reference).unwrap();
+    let cached_id = entry.backend_node_id.unwrap();
+    let frame_id = entry.frame_id.as_ref().unwrap();
+    assert!(
+        !state.iframe_sessions.contains_key(frame_id),
+        "fixture must use a same-session cross-origin iframe"
+    );
+    let browser = state.browser.as_ref().unwrap();
+    let session = browser.active_session_id().unwrap().to_string();
+    let old_object = browser
+        .client
+        .send_command(
+            "DOM.resolveNode",
+            Some(json!({"backendNodeId":cached_id})),
+            Some(&session),
+        )
+        .await
+        .unwrap();
+    let replacement = browser.client.send_command("Runtime.callFunctionOn", Some(json!({
+        "objectId":old_object["object"]["objectId"],
+        "functionDeclaration":"function() { const fresh = this.cloneNode(true); this.replaceWith(fresh); Object.assign(fresh.style, {left:'19.4px', padding:'0', border:'0'}); Object.assign(fresh.ownerDocument.getElementById('decoy').style, {left:'70.3px', top:'20px', width:'30px', height:'30px', padding:'0', border:'0'}); return fresh; }"
+    })), Some(&session)).await.unwrap();
+    let fresh_object = replacement["result"]["objectId"].as_str().unwrap();
+    let fresh_node = browser
+        .client
+        .send_command(
+            "DOM.describeNode",
+            Some(json!({"objectId":fresh_object})),
+            Some(&session),
+        )
+        .await
+        .unwrap();
+    assert_ne!(fresh_node["node"]["backendNodeId"], cached_id);
+    assert!(
+        browser
+            .client
+            .send_command(
+                "DOM.getBoxModel",
+                Some(json!({"backendNodeId":cached_id})),
+                Some(&session),
+            )
+            .await
+            .is_err(),
+        "detached snapshot backend must fail geometry and require the fresh-node fallback"
+    );
+    // Verify that the fractional center and integer sample lie on opposite
+    // sides of the decoy boundary, and that the frame is really cross-origin.
+    let geometry = browser.client.send_command("Runtime.callFunctionOn", Some(json!({
+        "objectId":fresh_object,
+        "functionDeclaration":"function() { const doc = this.ownerDocument; const rect = this.getBoundingClientRect(); const x = rect.x + rect.width / 2; const y = rect.y + rect.height / 2; return [doc.elementFromPoint(x, y).id, doc.elementFromPoint(Math.round(x), Math.round(y)).id, doc.defaultView.frameElement === null]; }",
+        "returnByValue":true
+    })), Some(&session)).await.unwrap();
+    assert_eq!(
+        geometry["result"]["value"],
+        json!(["decoy", "target", true])
+    );
+    let clicked = execute_command(
+        &json!({"action":"click", "selector":format!("@{reference}")}),
+        &mut state,
+    )
+    .await;
+    let first_counts = execute_command(&json!({"action":"evaluate", "script":"new Promise(resolve => setTimeout(() => resolve(window.clicks), 50))"}), &mut state).await;
+
+    assert_eq!(
+        state.ref_map.get(&reference).unwrap().backend_node_id,
+        Some(cached_id),
+        "repeat the stale reference to exercise fallback with a genuine overlay too"
+    );
+    let browser = state.browser.as_ref().unwrap();
+    let covered_geometry = browser.client.send_command("Runtime.callFunctionOn", Some(json!({
+        "objectId":fresh_object,
+        "functionDeclaration":"function() { const doc = this.ownerDocument; Object.assign(doc.getElementById('decoy').style, {left:'19px', width:'101px'}); const rect = this.getBoundingClientRect(); return doc.elementFromPoint(Math.round(rect.x + rect.width / 2), Math.round(rect.y + rect.height / 2)).id; }",
+        "returnByValue":true
+    })), Some(&session)).await.unwrap();
+    assert_eq!(covered_geometry["result"]["value"], "decoy");
+    let covered = execute_command(
+        &json!({"action":"click", "selector":format!("@{reference}")}),
+        &mut state,
+    )
+    .await;
+    let final_counts = execute_command(&json!({"action":"evaluate", "script":"new Promise(resolve => setTimeout(() => resolve(window.clicks), 50))"}), &mut state).await;
+    assert_success(&execute_command(&json!({"action":"close"}), &mut state).await);
+    child_server.abort();
+    parent_server.abort();
+
+    assert_success(&clicked);
+    assert_success(&first_counts);
+    assert_eq!(
+        get_data(&first_counts)["result"],
+        json!({"target":1,"decoy":0,"top":0}),
+        "fresh-node dispatch must use the point that passed interception"
+    );
+    assert_eq!(
+        covered["success"], false,
+        "genuine overlay must block: {covered}"
+    );
+    assert!(covered["error"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("covered by <button#decoy>"));
+    assert_success(&final_counts);
+    assert_eq!(
+        get_data(&final_counts)["result"],
+        json!({"target":1,"decoy":0,"top":0}),
+        "rejected fallback must not dispatch to target or overlay"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_reference_click_preserves_related_hit_targets() {
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(&json!({"action":"launch", "headless":true}), &mut state).await,
+    );
+    let html = r#"<!doctype html><html><body>
+<script>window.counts = {descendant:0, checkbox:0, shadow:0, frame:0, ownPseudo:0, covered:0}</script>
+<style>
+#own-pseudo::before {content:'';position:absolute;inset:0;background:rgba(0,0,0,0.1)}
+#pseudo-overlay::before {content:'';position:fixed;left:240px;top:80px;width:180px;height:40px;z-index:10;background:rgba(0,0,0,0.1)}
+</style>
+<button id="own-pseudo" style="position:absolute;left:240px;top:20px;width:180px;height:40px" onclick="counts.ownPseudo++">Own pseudo target</button>
+<button style="position:absolute;left:240px;top:80px;width:180px;height:40px" onclick="counts.covered++">Pseudo covered target</button>
+<div id="pseudo-overlay"></div>
+<button style="position:absolute;left:20px;top:20px;width:180px;height:40px" onclick="counts.descendant++"><span>Descendant target</span></button>
+<input id="checkbox" aria-label="Associated checkbox" type="checkbox" style="position:absolute;left:20px;top:80px;width:30px;height:30px;margin:0" onchange="counts.checkbox++">
+<label for="checkbox" style="position:absolute;left:20px;top:80px;width:30px;height:30px;background:white"><span>Label</span></label>
+<div id="shadow-host" style="position:absolute;left:20px;top:140px"></div>
+<script>document.getElementById('shadow-host').attachShadow({mode:'open'}).innerHTML = '<button style="width:180px;height:40px" onclick="window.counts.shadow++"><span>Shadow target</span></button>'</script>
+<iframe title="Owner frame" style="position:absolute;left:20px;top:220px;width:200px;height:100px;border:0"
+    srcdoc="<body style='margin:0'><button style='width:200px;height:100px' onclick='parent.counts.frame++'>Embedded child</button></body>"></iframe>
+</body></html>"#;
+    assert_success(&execute_command(&json!({"action":"navigate", "url":format!("data:text/html;base64,{}", STANDARD.encode(html))}), &mut state).await);
+    let snapshot = execute_command(&json!({"action":"snapshot"}), &mut state).await;
+    assert_success(&snapshot);
+    for name in [
+        "Descendant target",
+        "Associated checkbox",
+        "Shadow target",
+        "Owner frame",
+        "Own pseudo target",
+    ] {
+        let reference = get_data(&snapshot)["refs"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .find(|(_, entry)| entry["name"] == name)
+            .unwrap_or_else(|| panic!("missing reference for {name}: {snapshot}"))
+            .0;
+        assert_success(
+            &execute_command(
+                &json!({"action":"click", "selector":format!("@{reference}")}),
+                &mut state,
+            )
+            .await,
+        );
+    }
+    let covered_reference = get_data(&snapshot)["refs"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(_, entry)| entry["name"] == "Pseudo covered target")
+        .unwrap()
+        .0;
+    let covered = execute_command(
+        &json!({"action":"click", "selector":format!("@{covered_reference}")}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(
+        covered["success"], false,
+        "pseudo-element overlay must block: {covered}"
+    );
+    assert!(
+        covered["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("covered by <div#pseudo-overlay>"),
+        "unexpected pseudo-element blocker: {covered}"
+    );
+    assert_evaluate(
+        &mut state,
+        "counts",
+        "window.counts",
+        json!({"descendant":1,"checkbox":1,"shadow":1,"frame":1,"ownPseudo":1,"covered":0}),
+    )
+    .await;
+    assert_evaluate(
+        &mut state,
+        "checked",
+        "document.getElementById('checkbox').checked",
+        json!(true),
+    )
+    .await;
+    assert_success(&execute_command(&json!({"action":"close"}), &mut state).await);
+}
+
 // ---------------------------------------------------------------------------
 // Profile cookie persistence across restarts
 // ---------------------------------------------------------------------------
@@ -12491,4 +13089,1487 @@ async fn e2e_mouse_interpolation_starts_at_last_element_interaction() {
         assert!((moves[1][0].as_f64().unwrap() - (start.0 + 100.0)).abs() <= 1.0);
     }
     assert_success(&execute_command(&json!({"id": "99", "action": "close"}), &mut state).await);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_reference_click_dispatches_the_checked_fractional_point() {
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(&json!({"action":"launch", "headless":true}), &mut state).await,
+    );
+    let html = r#"<!doctype html><html><body>
+<script>window.clicks = {target:0, cover:0}</script>
+<button id="target" style="position:absolute;left:19.4px;top:20px;width:100px;height:30px;padding:0;border:0"
+    onclick="window.clicks.target++">Fractional target</button>
+<div id="cover" style="position:absolute;left:70.3px;top:20px;width:30px;height:30px"
+    onclick="window.clicks.cover++">Cover</div>
+</body></html>"#;
+    assert_success(
+        &execute_command(
+            &json!({"action":"navigate", "url":format!("data:text/html;base64,{}", STANDARD.encode(html))}),
+            &mut state,
+        )
+        .await,
+    );
+    // CDP's integer hit-test point hits the button, while the fractional box
+    // center hits the neighboring overlay. Input must use the checked point.
+    assert_evaluate(
+        &mut state,
+        "geometry",
+        "(() => { const rect = document.getElementById('target').getBoundingClientRect(); const x = rect.x + rect.width / 2; const y = rect.y + rect.height / 2; return [document.elementFromPoint(x, y).id, document.elementFromPoint(Math.round(x), Math.round(y)).id]; })()",
+        json!(["cover", "target"]),
+    )
+    .await;
+    let snapshot = execute_command(&json!({"action":"snapshot"}), &mut state).await;
+    assert_success(&snapshot);
+    let reference = get_data(&snapshot)["refs"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(_, entry)| entry["name"] == "Fractional target")
+        .expect("fractional target must be exposed by the Rust snapshot")
+        .0
+        .clone();
+    let clicked = execute_command(
+        &json!({"action":"click", "selector":format!("@{reference}")}),
+        &mut state,
+    )
+    .await;
+    let first_counters = execute_command(
+        &json!({"action":"evaluate", "script":"window.clicks"}),
+        &mut state,
+    )
+    .await;
+    // An overlay that also covers the chosen integer point must still block.
+    assert_evaluate(
+        &mut state,
+        "cover-target",
+        "Object.assign(document.getElementById('cover').style, {left:'19px', width:'101px'}); true",
+        json!(true),
+    )
+    .await;
+    let covered = execute_command(
+        &json!({"action":"click", "selector":format!("@{reference}")}),
+        &mut state,
+    )
+    .await;
+    let final_counters = execute_command(
+        &json!({"action":"evaluate", "script":"window.clicks"}),
+        &mut state,
+    )
+    .await;
+    assert_success(&execute_command(&json!({"action":"close"}), &mut state).await);
+
+    assert_success(&clicked);
+    assert_success(&first_counters);
+    assert_eq!(
+        get_data(&first_counters)["result"],
+        json!({"target":1,"cover":0}),
+        "the dispatched point must match the point accepted by interception"
+    );
+    assert_eq!(
+        covered["success"], false,
+        "covering overlay must reject: {covered}"
+    );
+    assert!(covered["error"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("covered by <div#cover>"));
+    assert_success(&final_counters);
+    assert_eq!(
+        get_data(&final_counters)["result"],
+        json!({"target":1,"cover":0})
+    );
+}
+
+fn reference_named(snapshot: &Value, name: &str) -> String {
+    get_data(snapshot)["refs"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(_, entry)| entry["name"] == name)
+        .unwrap_or_else(|| panic!("missing snapshot reference for {name}: {snapshot}"))
+        .0
+        .clone()
+}
+
+async fn reference_action(
+    state: &mut DaemonState,
+    snapshot: &Value,
+    name: &str,
+    action: &str,
+) -> Value {
+    execute_command(
+        &json!({"action":action, "selector":format!("@{}", reference_named(snapshot, name))}),
+        state,
+    )
+    .await
+}
+
+async fn reference_relationship_page(state: &mut DaemonState, html: &str) -> Value {
+    assert_success(&execute_command(&json!({"action":"launch", "headless":true}), state).await);
+    assert_success(&execute_command(&json!({"action":"navigate", "url":format!("data:text/html;base64,{}", STANDARD.encode(html))}), state).await);
+    let snapshot = execute_command(&json!({"action":"snapshot"}), state).await;
+    assert_success(&snapshot);
+    snapshot
+}
+
+fn serve_reference_relationship_pages(
+    listener: tokio::net::TcpListener,
+    parent: String,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let parent = parent.clone();
+            tokio::spawn(async move {
+                let mut buf = [0; 8192];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let child = r#"<!doctype html><body style="margin:0"><button style="position:absolute;inset:0;width:100%;height:100%" onclick="top.postMessage({kind:'click',name:window.name},'*')">Embedded button</button><script>top.postMessage({kind:'ready',name:window.name},'*')</script>"#;
+                let body = if request.starts_with("GET /child ") {
+                    child
+                } else {
+                    &parent
+                };
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nOrigin-Agent-Cluster: ?0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    })
+}
+
+async fn frame_relationship_fixture(
+    topology: &str,
+) -> (
+    DaemonState,
+    Value,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let child_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let child_port = child_listener.local_addr().unwrap().port();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let child_url = match topology {
+        "same-origin" => format!("http://localhost:{port}/child"),
+        "same-session" => format!("http://localhost:{child_port}/child"),
+        "oopif" => format!("http://127.0.0.1:{child_port}/child"),
+        _ => panic!("unknown topology {topology}"),
+    };
+    let html = format!(
+        r#"<!doctype html><body style="margin:0">
+<script>
+window.hits = {{region:0,card:0,custom:0,ad:0,covered:0,overlay:0}}; window.ready = new Set();
+addEventListener('message', e => {{
+    const frame = document.querySelector('iframe[name="' + e.data.name + '"]');
+    if (!frame || frame.contentWindow !== e.source) return;
+    if (e.data.kind === 'ready') ready.add(e.data.name);
+    if (e.data.kind === 'click') hits[e.data.name]++;
+}});
+customElements.define('fancy-frame', class FancyFrame extends HTMLIFrameElement {{}}, {{extends:'iframe'}});
+</script>
+<div role="region" aria-label="Embed region" style="position:absolute;left:20px;top:20px;width:200px;height:80px">
+<iframe name="region" title="Region frame" src="{child_url}" style="width:100%;height:100%;border:0"></iframe></div>
+<div role="button" aria-label="Frame card" tabindex="0" style="position:absolute;left:20px;top:120px;width:200px;height:80px">
+<iframe name="card" title="Card frame" src="{child_url}" style="width:100%;height:100%;border:0"></iframe></div>
+<iframe is="fancy-frame" name="custom" title="Custom frame" src="{child_url}" style="position:absolute;left:20px;top:220px;width:200px;height:80px;border:0"></iframe>
+<button aria-label="Frame covered target" onclick="hits.covered++" style="position:absolute;left:20px;top:320px;width:200px;height:80px">Covered</button>
+<iframe id="ad-frame" name="ad" title="Ad frame" src="{child_url}" style="position:absolute;left:20px;top:320px;width:200px;height:80px;border:0"></iframe>
+</body>"#
+    );
+    let child_server = serve_reference_relationship_pages(child_listener, String::new());
+    let parent_server = serve_reference_relationship_pages(listener, html);
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(&json!({"action":"launch", "headless":true}), &mut state).await,
+    );
+    assert_success(
+        &execute_command(
+            &json!({"action":"navigate", "url":format!("http://localhost:{port}/")}),
+            &mut state,
+        )
+        .await,
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let ready = execute_command(
+                &json!({"action":"evaluate", "script":"window.ready.size === 4"}),
+                &mut state,
+            )
+            .await;
+            assert_success(&ready);
+            if get_data(&ready)["result"] == true {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("frame relationship fixtures did not load");
+    let snapshot = execute_command(&json!({"action":"snapshot"}), &mut state).await;
+    assert_success(&snapshot);
+    assert_eq!(
+        state.iframe_sessions.len(),
+        if topology == "oopif" { 4 } else { 0 },
+        "unexpected fixture topology: {topology}"
+    );
+    assert_evaluate(
+        &mut state,
+        "custom-owner",
+        "document.querySelector('iframe[is]').constructor.name",
+        json!("FancyFrame"),
+    )
+    .await;
+    (state, snapshot, parent_server, child_server)
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_reference_click_frame_containers() {
+    let mut outcomes = Vec::new();
+    for topology in ["same-origin", "same-session", "oopif"] {
+        let (mut state, snapshot, parent_server, child_server) =
+            frame_relationship_fixture(topology).await;
+        for name in ["Embed region", "Frame card"] {
+            for action in ["hover", "click"] {
+                outcomes.push((
+                    format!("{topology}: {action} {name}"),
+                    reference_action(&mut state, &snapshot, name, action).await,
+                ));
+            }
+        }
+        let counts = execute_command(&json!({"action":"evaluate", "script":"new Promise(resolve => setTimeout(() => resolve(window.hits), 50))"}), &mut state).await;
+        assert_success(&execute_command(&json!({"action":"close"}), &mut state).await);
+        parent_server.abort();
+        child_server.abort();
+        outcomes.push((format!("{topology}: counters"), json!({"success": get_data(&counts)["result"] == json!({"region":1,"card":1,"custom":0,"ad":0,"covered":0,"overlay":0}), "counters":counts})));
+    }
+    for (case, outcome) in outcomes {
+        assert_eq!(outcome["success"], true, "{case}: {outcome}");
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_reference_click_custom_frame_owner() {
+    let (mut state, snapshot, parent_server, child_server) =
+        frame_relationship_fixture("same-session").await;
+    let click = reference_action(&mut state, &snapshot, "Custom frame", "click").await;
+    assert_success(&execute_command(&json!({"action":"evaluate", "script":"const overlay = document.createElement('div'); overlay.id = 'custom-overlay'; overlay.style = 'position:absolute;left:20px;top:220px;width:200px;height:80px;z-index:10'; overlay.onclick = () => hits.overlay++; document.body.append(overlay);"}), &mut state).await);
+    let covered = reference_action(&mut state, &snapshot, "Custom frame", "click").await;
+    let counts = execute_command(&json!({"action":"evaluate", "script":"new Promise(resolve => setTimeout(() => resolve(window.hits), 50))"}), &mut state).await;
+    assert_success(&execute_command(&json!({"action":"close"}), &mut state).await);
+    parent_server.abort();
+    child_server.abort();
+    assert_success(&click);
+    assert_eq!(
+        covered["success"], false,
+        "custom iframe must reject unrelated overlay: {covered}"
+    );
+    assert!(
+        covered["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("covered by <div#custom-overlay>"),
+        "{covered}"
+    );
+    assert_eq!(
+        get_data(&counts)["result"],
+        json!({"region":0,"card":0,"custom":1,"ad":0,"covered":0,"overlay":0})
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_reference_click_reports_frame_owner_blockers() {
+    let mut outcomes = Vec::new();
+    for topology in ["same-origin", "same-session", "oopif"] {
+        let (mut state, snapshot, parent_server, child_server) =
+            frame_relationship_fixture(topology).await;
+        let covered =
+            reference_action(&mut state, &snapshot, "Frame covered target", "click").await;
+        let counts = execute_command(
+            &json!({"action":"evaluate", "script":"window.hits"}),
+            &mut state,
+        )
+        .await;
+        assert_success(&execute_command(&json!({"action":"close"}), &mut state).await);
+        parent_server.abort();
+        child_server.abort();
+        outcomes.push((topology, covered, counts));
+    }
+    for (topology, covered, counts) in outcomes {
+        assert_eq!(covered["success"], false, "{topology}: {covered}");
+        assert!(
+            covered["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("covered by <iframe#ad-frame>"),
+            "{topology} must describe an addressable owner: {covered}"
+        );
+        assert_eq!(
+            get_data(&counts)["result"],
+            json!({"region":0,"card":0,"custom":0,"ad":0,"covered":0,"overlay":0})
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_reference_click_slotted_shadow_controls() {
+    let html = r#"<!doctype html><body><script>window.hits = {nestedOpen:0,nestedClosed:0,topOpen:0,topClosed:0};</script>
+<div id="outer"></div><script>
+const root = document.getElementById('outer').attachShadow({mode:'open'});
+for (const [index, [name, mode, nested]] of [['nestedOpen','open',true],['nestedClosed','closed',true],['topOpen','open',false],['topClosed','closed',false]].entries()) {
+    const inner = document.createElement('div'); inner.id = 'inner-' + name;
+    inner.style = 'position:absolute;left:20px;top:' + (20 + index * 80) + 'px;width:200px;height:50px';
+    inner.innerHTML = '<span style="display:block;width:200px;height:50px">Slotted ' + name + ' target</span>';
+    const shadow = inner.attachShadow({mode});
+    shadow.innerHTML = '<button style="padding:0;width:200px;height:50px"><slot></slot></button>';
+    shadow.querySelector('button').onclick = () => hits[name]++;
+    (nested ? root : document.body).append(inner);
+}
+</script></body>"#;
+    let mut state = DaemonState::new();
+    let snapshot = reference_relationship_page(&mut state, html).await;
+    let mut clicks = Vec::new();
+    for name in ["nestedOpen", "nestedClosed", "topOpen", "topClosed"] {
+        clicks.push(
+            reference_action(
+                &mut state,
+                &snapshot,
+                &format!("Slotted {name} target"),
+                "click",
+            )
+            .await,
+        );
+    }
+    let counts = execute_command(
+        &json!({"action":"evaluate", "script":"window.hits"}),
+        &mut state,
+    )
+    .await;
+    assert_success(&execute_command(&json!({"action":"close"}), &mut state).await);
+    for click in clicks {
+        assert_success(&click);
+    }
+    assert_eq!(
+        get_data(&counts)["result"],
+        json!({"nestedOpen":1,"nestedClosed":1,"topOpen":1,"topClosed":1})
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_reference_click_shadow_component_controls() {
+    let html = r#"<!doctype html><body><script>
+window.hits = {open:0,closed:0,ripple:0}; window.checked = {};
+for (const [index, mode] of ['open','closed'].entries()) {
+    const host = document.createElement('div');
+    host.style = 'position:absolute;left:20px;top:' + (20 + index * 80) + 'px;width:60px;height:30px';
+    const root = host.attachShadow({mode});
+    root.innerHTML = '<input type="checkbox" aria-label="' + mode + ' toggle" style="position:absolute;inset:0;margin:0;width:60px;height:30px;opacity:.01"><span class="track" style="position:absolute;inset:0;background:#ccc"></span>';
+    const input = root.querySelector('input');
+    Object.defineProperty(checked, mode, {enumerable:true,get:() => input.checked});
+    host.addEventListener('click', event => { if (event.composedPath()[0] !== input) input.checked = !input.checked; hits[mode]++; });
+    document.body.append(host);
+}
+const rippleHost = document.createElement('div');
+rippleHost.style = 'position:absolute;left:20px;top:180px;width:160px;height:40px';
+const rippleRoot = rippleHost.attachShadow({mode:'open'});
+rippleRoot.innerHTML = '<button style="width:160px;height:40px">Ripple target</button><div id="ripple" style="position:absolute;inset:0"></div>';
+rippleRoot.getElementById('ripple').attachShadow({mode:'closed'}).innerHTML = '<div class="ripple-surface" style="position:absolute;inset:0;background:#ccc"></div>';
+rippleHost.addEventListener('click', () => hits.ripple++);
+document.body.append(rippleHost);
+</script></body>"#;
+    let mut state = DaemonState::new();
+    let snapshot = reference_relationship_page(&mut state, html).await;
+    let mut outcomes = Vec::new();
+    for mode in ["open", "closed"] {
+        for (action, checked) in [("check", true), ("uncheck", false)] {
+            let result =
+                reference_action(&mut state, &snapshot, &format!("{mode} toggle"), action).await;
+            let state_result = execute_command(
+                &json!({"action":"evaluate", "script":format!("window.checked.{mode}")}),
+                &mut state,
+            )
+            .await;
+            outcomes.push((mode, action, result, state_result, checked));
+        }
+    }
+    let ripple = reference_action(&mut state, &snapshot, "Ripple target", "click").await;
+    let counts = execute_command(
+        &json!({"action":"evaluate", "script":"window.hits"}),
+        &mut state,
+    )
+    .await;
+    assert_success(&execute_command(&json!({"action":"close"}), &mut state).await);
+    for (mode, action, outcome, state_result, checked) in outcomes {
+        assert_eq!(outcome["success"], true, "{mode} {action}: {outcome}");
+        assert_eq!(
+            get_data(&state_result)["result"],
+            checked,
+            "{mode} {action} did not change the actual control"
+        );
+    }
+    assert_success(&ripple);
+    assert_eq!(
+        get_data(&counts)["result"],
+        json!({"open":2,"closed":2,"ripple":1})
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_reference_click_reports_closed_shadow_blockers() {
+    let html = r#"<!doctype html><body><script>window.hits = {target:0,shadow:0,overlay:0};</script>
+<button style="position:absolute;left:20px;top:20px;width:200px;height:50px" onclick="hits.target++">Covered light target</button>
+<div id="target-host" style="position:absolute;left:20px;top:100px;width:200px;height:50px"></div>
+<consent-banner id="consent" style="position:absolute;left:0;top:0;width:300px;height:180px;display:block;z-index:10"></consent-banner>
+<script>
+document.getElementById('target-host').attachShadow({mode:'open'}).innerHTML = '<button style="width:200px;height:50px" onclick="window.hits.shadow++">Covered shadow target</button>';
+const consent = document.getElementById('consent');
+consent.attachShadow({mode:'closed'}).innerHTML = '<div class="panel inner" style="position:absolute;inset:0;background:#ccc"></div>';
+consent.onclick = () => hits.overlay++;
+</script></body>"#;
+    let mut state = DaemonState::new();
+    let snapshot = reference_relationship_page(&mut state, html).await;
+    let light = reference_action(&mut state, &snapshot, "Covered light target", "click").await;
+    let shadow = reference_action(&mut state, &snapshot, "Covered shadow target", "click").await;
+    let counts = execute_command(
+        &json!({"action":"evaluate", "script":"window.hits"}),
+        &mut state,
+    )
+    .await;
+    assert_success(&execute_command(&json!({"action":"close"}), &mut state).await);
+    for covered in [light, shadow] {
+        assert_eq!(
+            covered["success"], false,
+            "unrelated shadow overlay must block: {covered}"
+        );
+        assert!(
+            covered["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("covered by <consent-banner#consent>"),
+            "closed-root blocker must describe the addressable host: {covered}"
+        );
+    }
+    assert_eq!(
+        get_data(&counts)["result"],
+        json!({"target":0,"shadow":0,"overlay":0})
+    );
+}
+
+/// A common outer shadow host does not make separate components related.
+#[tokio::test]
+#[ignore]
+async fn e2e_reference_click_rejects_sibling_shadow_components() {
+    let html = r#"<!doctype html><body style="margin:0"><script>
+window.hits = Array.from({length:8}, () => ({target:0,overlay:0}));
+window.overlays = [];
+let index = 0;
+for (const shellMode of ['open','closed']) {
+    for (const targetMode of ['open','closed']) {
+        for (const overlayMode of ['open','closed']) {
+            const i = index++;
+            const shell = document.createElement('app-shell');
+            shell.style = 'position:absolute;left:' + (20 + Math.floor(i / 4) * 240) + 'px;top:' + (20 + (i % 4) * 90) + 'px;width:200px;height:50px';
+            const shellRoot = shell.attachShadow({mode:shellMode});
+            const component = document.createElement('my-button');
+            component.style = 'position:absolute;inset:0';
+            const root = component.attachShadow({mode:targetMode});
+            root.innerHTML = '<button style="position:absolute;inset:0;width:200px;height:50px">Shell target ' + i + '</button><span class="internal-visual" style="position:absolute;inset:0;background:#ddd"></span>';
+            component.onclick = () => hits[i].target++;
+            const overlay = document.createElement('cookie-dialog');
+            overlay.id = 'dialog-' + i;
+            overlay.style = 'position:absolute;inset:0;z-index:10';
+            overlay.attachShadow({mode:overlayMode}).innerHTML = '<div class="panel" style="position:absolute;inset:0;background:#bbb">Consent</div>';
+            overlay.onclick = () => hits[i].overlay++;
+            overlays.push(overlay);
+            shellRoot.append(component, overlay);
+            document.body.append(shell);
+        }
+    }
+}
+</script></body>"#;
+    let mut state = DaemonState::new();
+    let snapshot = reference_relationship_page(&mut state, html).await;
+    let mut covered = Vec::new();
+    for index in 0..8 {
+        covered.push(
+            reference_action(
+                &mut state,
+                &snapshot,
+                &format!("Shell target {index}"),
+                "click",
+            )
+            .await,
+        );
+    }
+    let covered_counts = execute_command(
+        &json!({"action":"evaluate", "script":"window.hits"}),
+        &mut state,
+    )
+    .await;
+    // The same refs must still allow the target component's own visual once
+    // the separate overlay component has gone away.
+    assert_evaluate(
+        &mut state,
+        "remove-sibling-components",
+        "window.overlays.forEach(overlay => overlay.remove()); true",
+        json!(true),
+    )
+    .await;
+    let mut internal = Vec::new();
+    for index in 0..8 {
+        internal.push(
+            reference_action(
+                &mut state,
+                &snapshot,
+                &format!("Shell target {index}"),
+                "click",
+            )
+            .await,
+        );
+    }
+    let internal_counts = execute_command(
+        &json!({"action":"evaluate", "script":"window.hits"}),
+        &mut state,
+    )
+    .await;
+    assert_success(&execute_command(&json!({"action":"close"}), &mut state).await);
+    for (index, response) in covered.iter().enumerate() {
+        assert_eq!(
+            response["success"], false,
+            "separate component {index} must intercept: {response}"
+        );
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&format!("covered by <cookie-dialog#dialog-{index}>")),
+            "blocker must be visible from the target's tree scope: {response}"
+        );
+    }
+    assert_success(&covered_counts);
+    assert_eq!(
+        get_data(&covered_counts)["result"],
+        json!(vec![json!({"target":0,"overlay":0}); 8])
+    );
+    for response in internal {
+        assert_success(&response);
+    }
+    assert_success(&internal_counts);
+    assert_eq!(
+        get_data(&internal_counts)["result"],
+        json!(vec![json!({"target":1,"overlay":0}); 8])
+    );
+}
+
+/// The target can be assigned into the hit's closed root, so slot recovery
+/// must inspect the hit's roots as well as the target's roots.
+#[tokio::test]
+#[ignore]
+async fn e2e_reference_click_slotted_target_internal_visuals() {
+    let html = r#"<!doctype html><body style="margin:0"><script>
+window.hits = [0,0]; window.controls = [];
+for (const [index, mode] of ['open','closed'].entries()) {
+    const field = document.createElement('fancy-field');
+    field.style = 'position:absolute;left:20px;top:' + (20 + index * 80) + 'px;width:200px;height:40px';
+    const input = document.createElement('input');
+    input.type = 'checkbox'; input.setAttribute('aria-label', mode + ' slotted toggle');
+    input.style = 'position:absolute;inset:0;margin:0;width:200px;height:40px';
+    field.append(input);
+    const root = field.attachShadow({mode});
+    root.innerHTML = '<slot></slot><span class="decor" style="position:absolute;inset:0;background:#ccc"></span>';
+    field.onclick = event => {
+        if (event.composedPath()[0] !== input) input.checked = !input.checked;
+        hits[index]++;
+    };
+    controls.push(input);
+    document.body.append(field);
+}
+</script></body>"#;
+    let mut state = DaemonState::new();
+    let snapshot = reference_relationship_page(&mut state, html).await;
+    assert_evaluate(
+        &mut state,
+        "slot-visibility",
+        "window.controls.map(input => input.assignedSlot !== null)",
+        json!([true, false]),
+    )
+    .await;
+    let mut outcomes = Vec::new();
+    for (index, mode) in ["open", "closed"].into_iter().enumerate() {
+        for (action, checked) in [("check", true), ("uncheck", false)] {
+            let result = reference_action(
+                &mut state,
+                &snapshot,
+                &format!("{mode} slotted toggle"),
+                action,
+            )
+            .await;
+            let checked_result = execute_command(
+                &json!({"action":"evaluate", "script":format!("window.controls[{index}].checked")}),
+                &mut state,
+            )
+            .await;
+            outcomes.push((mode, action, result, checked_result, checked));
+        }
+    }
+    let counts = execute_command(
+        &json!({"action":"evaluate", "script":"window.hits"}),
+        &mut state,
+    )
+    .await;
+    assert_success(&execute_command(&json!({"action":"close"}), &mut state).await);
+    for (mode, action, response, checked_result, checked) in outcomes {
+        assert_eq!(response["success"], true, "{mode} {action}: {response}");
+        assert_success(&checked_result);
+        assert_eq!(get_data(&checked_result)["result"], checked);
+    }
+    assert_success(&counts);
+    assert_eq!(get_data(&counts)["result"], json!([2, 2]));
+}
+
+fn serve_frame_blocker_pages(
+    listener: tokio::net::TcpListener,
+    pages: Arc<std::collections::HashMap<&'static str, String>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let pages = Arc::clone(&pages);
+            tokio::spawn(async move {
+                let mut buf = [0; 8192];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let body = pages.get(path).map(String::as_str).unwrap_or("");
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nOrigin-Agent-Cluster: ?0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    })
+}
+
+fn reference_frame_path(tree: &Value, frame_id: &str) -> Option<Vec<String>> {
+    let id = tree["frame"]["id"].as_str()?;
+    if id == frame_id {
+        return Some(vec![id.to_string()]);
+    }
+    tree["childFrames"].as_array()?.iter().find_map(|child| {
+        let mut path = reference_frame_path(child, frame_id)?;
+        path.insert(0, id.to_string());
+        Some(path)
+    })
+}
+
+/// The hit belongs to a different branch under an embedded common document.
+/// The blocker must name that branch's owner, including when the hit is nested
+/// another level deeper, while leaving both click counters unchanged.
+async fn assert_reference_click_cross_branch_blocker(topology: &str, cousins: bool) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let other_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let other_port = other_listener.local_addr().unwrap().port();
+    let origin = format!("http://localhost:{port}");
+    let other_origin = if topology == "same-origin" {
+        origin.clone()
+    } else {
+        format!("http://localhost:{other_port}")
+    };
+    let root = r#"<!doctype html><body style="margin:0"><script>
+window.hits = {target:0,overlay:0}; window.ready = {};
+addEventListener('message', e => {
+    if (!['target','overlay'].includes(e.data.name)) return;
+    const common = document.getElementById('common-wrapper').contentWindow;
+    const branch = common.frames[e.data.name === 'target' ? 0 : 1];
+    const expected = __COUSINS__ ? branch.frames[0] : branch;
+    if (e.source !== expected) return;
+    if (e.data.kind === 'ready') ready[e.data.name] = e.data;
+    if (e.data.kind === 'click') hits[e.data.name]++;
+});
+</script><iframe id="common-wrapper" title="Common wrapper" src="/common" style="position:absolute;left:40px;top:40px;width:600px;height:240px;border:0"></iframe>"#.replace("__COUSINS__", if cousins { "true" } else { "false" });
+    let target_url = format!(
+        "{origin}/{}",
+        if cousins {
+            "target-branch"
+        } else {
+            "target-leaf"
+        }
+    );
+    let overlay_url = format!(
+        "{other_origin}/{}",
+        if cousins {
+            "overlay-branch"
+        } else {
+            "overlay-leaf"
+        }
+    );
+    let common = format!(
+        r#"<!doctype html><body style="margin:0">
+<iframe id="target-branch" title="Target branch" src="{target_url}" style="position:absolute;left:20px;top:20px;width:240px;height:120px;border:0"></iframe>
+<iframe id="covering-branch" title="Covering branch" src="{overlay_url}" style="position:absolute;left:320px;top:20px;width:240px;height:120px;border:0;z-index:10"></iframe>"#
+    );
+    let mut pages = std::collections::HashMap::from([("/", root), ("/common", common)]);
+    for name in ["target", "overlay"] {
+        let label = if name == "target" {
+            "Cross branch target"
+        } else {
+            "Cross branch overlay"
+        };
+        let leaf = format!(
+            r#"<!doctype html><body style="margin:0"><button id="{name}-internal" style="position:absolute;inset:0;width:100%;height:100%" onclick="top.postMessage({{kind:'click',name:'{name}'}},'*')">{label}</button><script>top.postMessage({{kind:'ready',name:'{name}',origin:location.origin,parentAccessible:!!frameElement}},'*')</script>"#
+        );
+        // Cross-origin cousins reverse the origins again at the leaf, proving
+        // the diagnostic chooses the common document's owner, not this owner.
+        let leaf_origin = if name == "target" {
+            &other_origin
+        } else {
+            &origin
+        };
+        let branch = format!(
+            r#"<!doctype html><body style="margin:0"><iframe id="{name}-leaf" title="Nested {name}" src="{leaf_origin}/{name}-leaf" style="position:absolute;inset:0;width:100%;height:100%;border:0"></iframe>"#
+        );
+        if name == "target" {
+            pages.insert("/target-leaf", leaf);
+            pages.insert("/target-branch", branch);
+        } else {
+            pages.insert("/overlay-leaf", leaf);
+            pages.insert("/overlay-branch", branch);
+        }
+    }
+    let pages = Arc::new(pages);
+    let server = serve_frame_blocker_pages(listener, Arc::clone(&pages));
+    let other_server = serve_frame_blocker_pages(other_listener, pages);
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(&json!({"action":"launch", "headless":true}), &mut state).await,
+    );
+    assert_success(
+        &execute_command(
+            &json!({"action":"navigate", "url":format!("{origin}/")}),
+            &mut state,
+        )
+        .await,
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let ready = execute_command(
+                &json!({"action":"evaluate", "script":"!!(ready.target && ready.overlay)"}),
+                &mut state,
+            )
+            .await;
+            assert_success(&ready);
+            if get_data(&ready)["result"] == true {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("cross-branch frame fixtures did not load");
+    assert_evaluate(&mut state, "verify-origins", "[ready.target.origin === ready.overlay.origin, ready.target.parentAccessible, ready.overlay.parentAccessible]", json!([topology == "same-origin", topology == "same-origin" || !cousins, topology == "same-origin"])).await;
+    // The default snapshot expands only one iframe level. Select each leaf
+    // through the real frame command to obtain its own Rust snapshot refs.
+    assert_success(
+        &execute_command(
+            &json!({"action":"frame", "url":"/overlay-leaf"}),
+            &mut state,
+        )
+        .await,
+    );
+    let overlay_snapshot = execute_command(&json!({"action":"snapshot"}), &mut state).await;
+    assert_success(&overlay_snapshot);
+    let overlay = state
+        .ref_map
+        .get(&reference_named(&overlay_snapshot, "Cross branch overlay"))
+        .unwrap()
+        .clone();
+    assert_success(
+        &execute_command(&json!({"action":"frame", "url":"/target-leaf"}), &mut state).await,
+    );
+    let snapshot = execute_command(&json!({"action":"snapshot"}), &mut state).await;
+    assert_success(&snapshot);
+    assert!(
+        state.iframe_sessions.is_empty(),
+        "{topology} must use one CDP session"
+    );
+    let target = state
+        .ref_map
+        .get(&reference_named(&snapshot, "Cross branch target"))
+        .unwrap()
+        .clone();
+    assert_eq!(state.active_frame_id, target.frame_id);
+    assert_success(&execute_command(&json!({"action":"mainframe"}), &mut state).await);
+    {
+        let browser = state.browser.as_ref().unwrap();
+        let session = browser.active_session_id().unwrap();
+        let tree = browser
+            .client
+            .send_command("Page.getFrameTree", None, Some(session))
+            .await
+            .unwrap();
+        let target_path =
+            reference_frame_path(&tree["frameTree"], target.frame_id.as_deref().unwrap()).unwrap();
+        let overlay_path =
+            reference_frame_path(&tree["frameTree"], overlay.frame_id.as_deref().unwrap()).unwrap();
+        assert_eq!(target_path.len(), if cousins { 4 } else { 3 });
+        assert_eq!(overlay_path.len(), target_path.len());
+        assert_eq!(
+            target_path[..2],
+            overlay_path[..2],
+            "common ancestor must be an embedded frame"
+        );
+        assert_ne!(
+            target_path[2], overlay_path[2],
+            "target and overlay must occupy separate branches"
+        );
+    }
+    assert_evaluate(
+        &mut state,
+        "uncovered-geometry",
+        "document.getElementById('common-wrapper').contentDocument.elementFromPoint(140,80).id",
+        json!("target-branch"),
+    )
+    .await;
+    let uncovered = reference_action(&mut state, &snapshot, "Cross branch target", "click").await;
+    let before = execute_command(&json!({"action":"evaluate", "script":"new Promise(resolve => setTimeout(() => resolve({...hits}), 50))"}), &mut state).await;
+    assert_evaluate(&mut state, "cover-target", "const common = document.getElementById('common-wrapper').contentDocument; common.getElementById('covering-branch').style.left = '20px'; common.elementFromPoint(140,80).id", json!("covering-branch")).await;
+    {
+        let browser = state.browser.as_ref().unwrap();
+        let session = browser.active_session_id().unwrap();
+        let model = browser
+            .client
+            .send_command(
+                "DOM.getBoxModel",
+                Some(json!({"backendNodeId":target.backend_node_id.unwrap()})),
+                Some(session),
+            )
+            .await
+            .unwrap();
+        let quad = model["model"]["border"].as_array().unwrap();
+        let x = (quad[0].as_f64().unwrap() + quad[4].as_f64().unwrap()) / 2.0;
+        let y = (quad[1].as_f64().unwrap() + quad[5].as_f64().unwrap()) / 2.0;
+        let hit = browser
+            .client
+            .send_command(
+                "DOM.getNodeForLocation",
+                Some(json!({"x":x.round() as i64, "y":y.round() as i64})),
+                Some(session),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            hit["frameId"],
+            overlay.frame_id.as_deref().unwrap(),
+            "native hit must enter the covering branch"
+        );
+        assert_eq!(
+            hit["backendNodeId"],
+            overlay.backend_node_id.unwrap(),
+            "fixture must hit the internal overlay button, not a frame border"
+        );
+    }
+    let covered = reference_action(&mut state, &snapshot, "Cross branch target", "click").await;
+    let after = execute_command(&json!({"action":"evaluate", "script":"new Promise(resolve => setTimeout(() => resolve({...hits}), 50))"}), &mut state).await;
+    assert_success(&execute_command(&json!({"action":"close"}), &mut state).await);
+    server.abort();
+    other_server.abort();
+    assert_success(&uncovered);
+    assert_success(&before);
+    assert_success(&after);
+    assert_eq!(get_data(&before)["result"], json!({"target":1,"overlay":0}));
+    assert_eq!(
+        covered["success"], false,
+        "{topology}, cousins={cousins}: {covered}"
+    );
+    assert!(covered["error"].as_str().unwrap_or_default().contains("covered by <iframe#covering-branch>"), "{topology}, cousins={cousins}: must name the hit-side owner in the lowest common ancestor, got {covered}");
+    assert_eq!(
+        get_data(&after)["result"],
+        get_data(&before)["result"],
+        "a rejected click must reach neither handler"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_reference_click_reports_sibling_frame_blockers() {
+    for topology in ["same-origin", "same-session"] {
+        assert_reference_click_cross_branch_blocker(topology, false).await;
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_reference_click_reports_cousin_frame_blockers() {
+    for topology in ["same-origin", "same-session"] {
+        assert_reference_click_cross_branch_blocker(topology, true).await;
+    }
+}
+
+/// A target assigned to a closed component still belongs to that component,
+/// even when only a sibling overlay's deep node is available to JavaScript.
+#[tokio::test]
+#[ignore]
+async fn e2e_reference_click_rejects_overlays_above_slotted_components() {
+    let html = r#"<!doctype html><body style="margin:0"><script>
+window.hits = Array.from({length:4}, () => ({target:0,overlay:0}));
+window.controls = []; window.slottables = []; window.overlays = [];
+let index = 0;
+for (const mode of ['open','closed']) {
+    for (const wrapped of [false,true]) {
+        const i = index++;
+        const shell = document.createElement('app-shell');
+        shell.style = 'position:absolute;left:20px;top:' + (20 + i * 80) + 'px;width:200px;height:40px';
+        const shellRoot = shell.attachShadow({mode:'open'});
+        const field = document.createElement('fancy-field');
+        field.style = 'position:absolute;inset:0';
+        const input = document.createElement('input');
+        input.type = 'checkbox';
+        input.setAttribute('aria-label', 'Protected slotted toggle ' + i);
+        input.style = 'position:absolute;inset:0;margin:0;width:200px;height:40px';
+        if (wrapped) {
+            const wrapper = document.createElement('div');
+            wrapper.style = 'position:absolute;inset:0';
+            wrapper.append(input);
+            field.append(wrapper);
+            slottables.push(wrapper);
+        } else {
+            field.append(input);
+            slottables.push(input);
+        }
+        const root = field.attachShadow({mode});
+        root.innerHTML = '<slot></slot><span class="decor" style="position:absolute;inset:0;background:#ddd"></span>';
+        field.onclick = event => {
+            if (event.composedPath()[0] !== input) input.checked = !input.checked;
+            hits[i].target++;
+        };
+        const overlay = document.createElement('cookie-dialog');
+        overlay.id = 'slotted-dialog-' + i;
+        overlay.style = 'position:absolute;inset:0;z-index:10';
+        overlay.attachShadow({mode:'closed'}).innerHTML = '<div class="panel" style="position:absolute;inset:0;background:#bbb">Consent</div>';
+        overlay.onclick = () => hits[i].overlay++;
+        controls.push(input); overlays.push(overlay);
+        shellRoot.append(field, overlay);
+        document.body.append(shell);
+    }
+}
+</script></body>"#;
+    let mut state = DaemonState::new();
+    let snapshot = reference_relationship_page(&mut state, html).await;
+    assert_evaluate(
+        &mut state,
+        "hidden-component-slots",
+        "window.slottables.map(node => node.assignedSlot !== null)",
+        json!([true, true, false, false]),
+    )
+    .await;
+    let mut covered = Vec::new();
+    for index in 0..4 {
+        covered.push(
+            reference_action(
+                &mut state,
+                &snapshot,
+                &format!("Protected slotted toggle {index}"),
+                "click",
+            )
+            .await,
+        );
+    }
+    let covered_counts = execute_command(
+        &json!({"action":"evaluate", "script":"window.hits"}),
+        &mut state,
+    )
+    .await;
+    assert_evaluate(
+        &mut state,
+        "remove-slotted-component-overlays",
+        "window.overlays.forEach(overlay => overlay.remove()); true",
+        json!(true),
+    )
+    .await;
+    let mut outcomes = Vec::new();
+    for index in 0..4 {
+        for (action, checked) in [("check", true), ("uncheck", false)] {
+            let response = reference_action(
+                &mut state,
+                &snapshot,
+                &format!("Protected slotted toggle {index}"),
+                action,
+            )
+            .await;
+            let checked_result = execute_command(
+                &json!({"action":"evaluate", "script":format!("window.controls[{index}].checked")}),
+                &mut state,
+            )
+            .await;
+            outcomes.push((index, action, response, checked_result, checked));
+        }
+    }
+    let final_counts = execute_command(
+        &json!({"action":"evaluate", "script":"window.hits"}),
+        &mut state,
+    )
+    .await;
+    assert_success(&execute_command(&json!({"action":"close"}), &mut state).await);
+    for (index, response) in covered.iter().enumerate() {
+        assert_eq!(
+            response["success"], false,
+            "overlay above slotted component {index} must intercept: {response}"
+        );
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&format!(
+                    "covered by <cookie-dialog#slotted-dialog-{index}>"
+                )),
+            "blocker must name the separate component: {response}"
+        );
+    }
+    assert_success(&covered_counts);
+    assert_eq!(
+        get_data(&covered_counts)["result"],
+        json!(vec![json!({"target":0,"overlay":0}); 4])
+    );
+    for (index, action, response, checked_result, checked) in outcomes {
+        assert_eq!(
+            response["success"], true,
+            "component {index} {action}: {response}"
+        );
+        assert_success(&checked_result);
+        assert_eq!(get_data(&checked_result)["result"], checked);
+    }
+    assert_success(&final_counts);
+    assert_eq!(
+        get_data(&final_counts)["result"],
+        json!(vec![json!({"target":2,"overlay":0}); 4])
+    );
+}
+
+/// Built-in UA slots must not replace the nearest author component, and
+/// walking through them must not make a sibling overlay component related.
+async fn assert_reference_click_builtin_component_visuals(kind: &str) {
+    let html = r#"<!doctype html><body style="margin:0"><script>
+window.hits = [{target:0,overlay:0},{target:0,overlay:0}];
+window.controls = []; window.overlays = [];
+const kind = 'BUILTIN_KIND';
+for (const [i, mode] of ['open','closed'].entries()) {
+    const shell = document.createElement('app-shell');
+    shell.style = 'display:block;position:absolute;left:20px;top:' + (20 + i * 120) + 'px;width:240px;height:80px';
+    const shellRoot = shell.attachShadow({mode});
+    const component = document.createElement('fancy-field');
+    component.style = 'display:block;position:absolute;inset:0';
+    const root = component.attachShadow({mode});
+    const inputHtml = '<input type="checkbox" aria-label="' + mode + ' ' + kind + ' toggle" style="width:40px;height:40px;margin:0">';
+    root.innerHTML = (kind === 'details'
+        ? '<details open><summary>Question</summary>' + inputHtml + '</details>'
+        : '<details><summary>' + inputHtml + '</summary>Body</details>')
+        + '<span class="visual" style="position:absolute;inset:0;background:#ddd"></span>';
+    const input = root.querySelector('input');
+    component.onclick = event => {
+        if (event.composedPath()[0] !== input) input.checked = !input.checked;
+        hits[i].target++;
+    };
+    const overlay = document.createElement('cookie-dialog');
+    overlay.id = 'builtin-dialog-' + i;
+    overlay.style = 'display:block;position:absolute;inset:0;z-index:10';
+    overlay.attachShadow({mode:'closed'}).innerHTML = '<div class="panel" style="position:absolute;inset:0;background:#bbb">Consent</div>';
+    overlay.onclick = () => hits[i].overlay++;
+    controls.push(input); overlays.push(overlay);
+    shellRoot.append(component, overlay);
+    document.body.append(shell);
+}
+</script></body>"#.replace("BUILTIN_KIND", kind);
+    let mut state = DaemonState::new();
+    let snapshot = reference_relationship_page(&mut state, &html).await;
+    assert_evaluate(
+        &mut state,
+        "builtin-component-geometry",
+        "window.controls.every(input => { const r = input.getBoundingClientRect(); const v = input.getRootNode().querySelector('.visual').getBoundingClientRect(); return r.width === 40 && r.height === 40 && r.left >= v.left && r.right <= v.right && r.top >= v.top && r.bottom <= v.bottom && r.top >= 0 && r.bottom < innerHeight; })",
+        json!(true),
+    )
+    .await;
+    let mut covered = Vec::new();
+    for mode in ["open", "closed"] {
+        covered.push(
+            reference_action(
+                &mut state,
+                &snapshot,
+                &format!("{mode} {kind} toggle"),
+                "check",
+            )
+            .await,
+        );
+    }
+    let covered_state = execute_command(
+        &json!({"action":"evaluate", "script":"({hits, checked:controls.map(input => input.checked)})"}),
+        &mut state,
+    )
+    .await;
+    assert_evaluate(
+        &mut state,
+        "remove-builtin-component-overlays",
+        "window.overlays.forEach(overlay => overlay.remove()); true",
+        json!(true),
+    )
+    .await;
+    let mut outcomes = Vec::new();
+    for (index, mode) in ["open", "closed"].iter().enumerate() {
+        for (action, checked) in [("check", true), ("uncheck", false)] {
+            let response = reference_action(
+                &mut state,
+                &snapshot,
+                &format!("{mode} {kind} toggle"),
+                action,
+            )
+            .await;
+            let checked_result = execute_command(
+                &json!({"action":"evaluate", "script":format!("window.controls[{index}].checked")}),
+                &mut state,
+            )
+            .await;
+            outcomes.push((mode, action, response, checked_result, checked));
+        }
+    }
+    let final_state = execute_command(
+        &json!({"action":"evaluate", "script":"({hits, checked:controls.map(input => input.checked)})"}),
+        &mut state,
+    )
+    .await;
+    assert_success(&execute_command(&json!({"action":"close"}), &mut state).await);
+    for (index, response) in covered.iter().enumerate() {
+        assert_eq!(
+            response["success"], false,
+            "separate overlay above {kind} component {index} must intercept: {response}"
+        );
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&format!(
+                    "covered by <cookie-dialog#builtin-dialog-{index}>"
+                )),
+            "blocker must name the separate component: {response}"
+        );
+    }
+    assert_success(&covered_state);
+    assert_eq!(
+        get_data(&covered_state)["result"],
+        json!({"hits":[{"target":0,"overlay":0},{"target":0,"overlay":0}],"checked":[false,false]})
+    );
+    for (mode, action, response, checked_result, checked) in outcomes {
+        assert_eq!(
+            response["success"], true,
+            "{mode} {kind} component {action}: {response}"
+        );
+        assert_success(&checked_result);
+        assert_eq!(get_data(&checked_result)["result"], checked);
+    }
+    assert_success(&final_state);
+    assert_eq!(
+        get_data(&final_state)["result"],
+        json!({"hits":[{"target":2,"overlay":0},{"target":2,"overlay":0}],"checked":[false,false]})
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_reference_click_details_component_visuals() {
+    assert_reference_click_builtin_component_visuals("details").await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_reference_click_summary_component_visuals() {
+    assert_reference_click_builtin_component_visuals("summary").await;
+}
+
+/// A cross-document hit must be described in the scopes of the target-side
+/// frame owner, even when both branches share a closed shell below the top frame.
+async fn assert_reference_click_shadow_frame_blocker(
+    topology: &str,
+    mode: &str,
+    frame_overlay: bool,
+    cousins: bool,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let other_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let other_port = other_listener.local_addr().unwrap().port();
+    let origin = format!("http://localhost:{port}");
+    let leaf_origin = if topology == "same-origin" {
+        origin.clone()
+    } else {
+        format!("http://localhost:{other_port}")
+    };
+    let root = r#"<!doctype html><body style="margin:0"><script>
+window.hits = {target:0,overlay:0}; window.ready = {};
+addEventListener('message', e => {
+    if (!e.data || !['target','overlay'].includes(e.data.name)) return;
+    const common = document.getElementById('common-wrapper').contentWindow;
+    const branch = common.fixtureFrames[e.data.name];
+    const expected = common.cousins ? branch.contentWindow.frames[0] : branch.contentWindow;
+    if (e.source !== expected) return;
+    if (e.data.kind === 'ready') ready[e.data.name] = e.data;
+    if (e.data.kind === 'click') hits[e.data.name]++;
+});
+</script><iframe id="common-wrapper" title="Shared shell document" src="/common" style="position:absolute;left:40px;top:40px;width:560px;height:200px;border:0"></iframe>"#.to_string();
+    let target_url = if cousins {
+        format!("{origin}/target-branch")
+    } else {
+        format!("{leaf_origin}/target-leaf")
+    };
+    let overlay_url = if cousins {
+        format!("{origin}/overlay-branch")
+    } else {
+        format!("{leaf_origin}/overlay-leaf")
+    };
+    let overlay = if frame_overlay {
+        format!(
+            r#"<iframe id="chat-frame" title="Chat frame" src="{overlay_url}" style="position:absolute;left:300px;top:20px;width:200px;height:100px;border:0;z-index:10"></iframe>"#
+        )
+    } else {
+        r#"<cookie-dialog id="consent" style="display:block;position:absolute;left:300px;top:20px;width:200px;height:100px;z-index:10"></cookie-dialog>"#.to_string()
+    };
+    let common = format!(
+        r#"<!doctype html><body style="margin:0"><app-shell id="shell" style="display:block;position:absolute;inset:0"></app-shell><script>
+window.cousins = {cousins};
+window.fixtureRoot = document.getElementById('shell').attachShadow({{mode:'{mode}'}});
+fixtureRoot.innerHTML = '<iframe id="target-frame" title="Target frame" src="{target_url}" style="position:absolute;left:20px;top:20px;width:200px;height:100px;border:0"></iframe>{overlay}';
+window.fixtureFrames = {{target:fixtureRoot.getElementById('target-frame'),overlay:fixtureRoot.getElementById('chat-frame')}};
+window.covering = fixtureRoot.getElementById('{overlay_id}');
+if (!{frame_overlay}) {{
+    covering.attachShadow({{mode:'closed'}}).innerHTML = '<div id="consent-panel" style="position:absolute;inset:0;background:#ddd"></div>';
+    covering.onclick = () => top.hits.overlay++;
+}}
+</script>"#,
+        overlay_id = if frame_overlay {
+            "chat-frame"
+        } else {
+            "consent"
+        },
+    );
+    let mut pages = std::collections::HashMap::from([("/", root), ("/common", common)]);
+    for name in ["target", "overlay"] {
+        let label = if name == "target" {
+            "Shared shell target"
+        } else {
+            "Shared shell chat"
+        };
+        let leaf = format!(
+            r#"<!doctype html><body style="margin:0"><button id="{name}-internal" style="position:absolute;inset:0;width:100%;height:100%;margin:0;padding:0;border:0" onclick="top.postMessage({{kind:'click',name:'{name}'}},'*')">{label}</button><script>top.postMessage({{kind:'ready',name:'{name}',origin:location.origin,parentAccessible:!!frameElement}},'*')</script>"#
+        );
+        let branch = format!(
+            r#"<!doctype html><body style="margin:0"><iframe id="{name}-leaf" title="Nested {name}" src="{leaf_origin}/{name}-leaf" style="position:absolute;inset:0;width:100%;height:100%;border:0"></iframe>"#
+        );
+        if name == "target" {
+            pages.insert("/target-leaf", leaf);
+            pages.insert("/target-branch", branch);
+        } else {
+            pages.insert("/overlay-leaf", leaf);
+            pages.insert("/overlay-branch", branch);
+        }
+    }
+    let pages = Arc::new(pages);
+    let server = serve_frame_blocker_pages(listener, Arc::clone(&pages));
+    let other_server = serve_frame_blocker_pages(other_listener, pages);
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(&json!({"action":"launch", "headless":true}), &mut state).await,
+    );
+    assert_success(
+        &execute_command(
+            &json!({"action":"navigate", "url":format!("{origin}/")}),
+            &mut state,
+        )
+        .await,
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let ready = execute_command(&json!({"action":"evaluate", "script":format!("!!(ready.target && ({} || ready.overlay))", !frame_overlay)}), &mut state).await;
+            assert_success(&ready);
+            if get_data(&ready)["result"] == true { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }).await.expect("shared shadow shell frames did not load");
+    assert_evaluate(&mut state, "verify-shared-shell-topology", "[ready.target.origin === location.origin, ready.target.parentAccessible, document.getElementById('common-wrapper').contentDocument.getElementById('shell').shadowRoot !== null]", json!([topology == "same-origin", topology == "same-origin", mode == "open"])).await;
+    let overlay_entry = if frame_overlay {
+        assert_success(
+            &execute_command(
+                &json!({"action":"frame", "url":"/overlay-leaf"}),
+                &mut state,
+            )
+            .await,
+        );
+        let snapshot = execute_command(&json!({"action":"snapshot"}), &mut state).await;
+        assert_success(&snapshot);
+        Some(
+            state
+                .ref_map
+                .get(&reference_named(&snapshot, "Shared shell chat"))
+                .unwrap()
+                .clone(),
+        )
+    } else {
+        None
+    };
+    // Selecting the leaf uses the real frame command and snapshot ref path;
+    // default snapshots do not expand every nested iframe automatically.
+    assert_success(
+        &execute_command(&json!({"action":"frame", "url":"/target-leaf"}), &mut state).await,
+    );
+    let snapshot = execute_command(&json!({"action":"snapshot"}), &mut state).await;
+    assert_success(&snapshot);
+    let target = state
+        .ref_map
+        .get(&reference_named(&snapshot, "Shared shell target"))
+        .unwrap()
+        .clone();
+    assert_eq!(state.active_frame_id, target.frame_id);
+    assert!(
+        state.iframe_sessions.is_empty(),
+        "{topology} must share a CDP session"
+    );
+    assert_success(&execute_command(&json!({"action":"mainframe"}), &mut state).await);
+    let common_frame = {
+        let browser = state.browser.as_ref().unwrap();
+        let session = browser.active_session_id().unwrap();
+        let tree = browser
+            .client
+            .send_command("Page.getFrameTree", None, Some(session))
+            .await
+            .unwrap();
+        let target_path =
+            reference_frame_path(&tree["frameTree"], target.frame_id.as_deref().unwrap()).unwrap();
+        assert_eq!(target_path.len(), if cousins { 4 } else { 3 });
+        if let Some(overlay) = &overlay_entry {
+            let overlay_path =
+                reference_frame_path(&tree["frameTree"], overlay.frame_id.as_deref().unwrap())
+                    .unwrap();
+            assert_eq!(target_path.len(), overlay_path.len());
+            assert_eq!(target_path[..2], overlay_path[..2]);
+            assert_ne!(
+                target_path[2], overlay_path[2],
+                "the hit must occupy a separate frame branch"
+            );
+        }
+        target_path[1].clone()
+    };
+    assert_evaluate(&mut state, "uncovered-shared-shell", "document.getElementById('common-wrapper').contentWindow.fixtureRoot.elementFromPoint(120,70).id", json!("target-frame")).await;
+    let uncovered = reference_action(&mut state, &snapshot, "Shared shell target", "click").await;
+    let before = execute_command(&json!({"action":"evaluate", "script":"new Promise(resolve => setTimeout(() => resolve({...hits}), 50))"}), &mut state).await;
+    assert_evaluate(&mut state, "cover-shared-shell-target", "const common = document.getElementById('common-wrapper').contentWindow; common.covering.style.left = '20px'; common.fixtureRoot.elementFromPoint(120,70).id", json!(if frame_overlay { "chat-frame" } else { "consent" })).await;
+    {
+        let browser = state.browser.as_ref().unwrap();
+        let session = browser.active_session_id().unwrap();
+        let model = browser
+            .client
+            .send_command(
+                "DOM.getBoxModel",
+                Some(json!({"backendNodeId":target.backend_node_id.unwrap()})),
+                Some(session),
+            )
+            .await
+            .unwrap();
+        let quad = model["model"]["border"].as_array().unwrap();
+        let x = (quad[0].as_f64().unwrap() + quad[4].as_f64().unwrap()) / 2.0;
+        let y = (quad[1].as_f64().unwrap() + quad[5].as_f64().unwrap()) / 2.0;
+        let hit = browser
+            .client
+            .send_command(
+                "DOM.getNodeForLocation",
+                Some(json!({"x":x.round() as i64,"y":y.round() as i64})),
+                Some(session),
+            )
+            .await
+            .unwrap();
+        if let Some(overlay) = &overlay_entry {
+            assert_eq!(
+                hit["frameId"],
+                overlay.frame_id.as_deref().unwrap(),
+                "native hit must enter the separate covering branch"
+            );
+            assert_eq!(
+                hit["backendNodeId"],
+                overlay.backend_node_id.unwrap(),
+                "native hit must reach the internal chat button"
+            );
+        } else {
+            assert_eq!(
+                hit["frameId"], common_frame,
+                "component hit must belong to the embedded ancestor document"
+            );
+            let node = browser
+                .client
+                .send_command(
+                    "DOM.describeNode",
+                    Some(json!({"backendNodeId":hit["backendNodeId"],"depth":0})),
+                    Some(session),
+                )
+                .await
+                .unwrap();
+            assert!(
+                node["node"]["attributes"]
+                    .as_array()
+                    .unwrap()
+                    .chunks(2)
+                    .any(|pair| pair == [json!("id"), json!("consent-panel")]),
+                "native hit must enter the dialog's closed root: {node}"
+            );
+        }
+    }
+    let covered = reference_action(&mut state, &snapshot, "Shared shell target", "click").await;
+    let after = execute_command(&json!({"action":"evaluate", "script":"new Promise(resolve => setTimeout(() => resolve({...hits}), 50))"}), &mut state).await;
+    assert_success(&execute_command(&json!({"action":"close"}), &mut state).await);
+    server.abort();
+    other_server.abort();
+    assert_success(&uncovered);
+    assert_success(&before);
+    assert_success(&after);
+    assert_eq!(get_data(&before)["result"], json!({"target":1,"overlay":0}));
+    assert_eq!(
+        covered["success"], false,
+        "{topology} {mode}, frame_overlay={frame_overlay}, cousins={cousins}: {covered}"
+    );
+    let blocker = if frame_overlay {
+        "iframe#chat-frame"
+    } else {
+        "cookie-dialog#consent"
+    };
+    assert!(covered["error"].as_str().unwrap_or_default().contains(&format!("covered by <{blocker}>")), "{topology} {mode}, cousins={cousins}: must name the addressable covering element, got {covered}");
+    assert_eq!(
+        get_data(&after)["result"],
+        get_data(&before)["result"],
+        "rejection must dispatch to neither target nor blocker"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_reference_click_reports_frame_blockers_in_shared_shadow_shells() {
+    for topology in ["same-origin", "same-session"] {
+        for mode in ["open", "closed"] {
+            for cousins in [false, true] {
+                assert_reference_click_shadow_frame_blocker(topology, mode, true, cousins).await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_reference_click_reports_ancestor_blockers_in_shared_shadow_shells() {
+    for topology in ["same-origin", "same-session"] {
+        for mode in ["open", "closed"] {
+            assert_reference_click_shadow_frame_blocker(topology, mode, false, false).await;
+        }
+    }
 }
