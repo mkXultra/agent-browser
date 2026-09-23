@@ -3648,6 +3648,18 @@ confirmation is never counted as an executed step. Without
 a TTY uses the normal prompt; non-TTY stdin keeps the CLI's auto-denial behavior
 and goal returns denied. Approval after the goal deadline triggers safe denial
 cleanup, returns timeout, and does not dispatch the pending action.
+On DONE, the final URL is refreshed once with get url, allowing at most 1000 ms
+within the remaining goal time budget. Failed, timed-out, oversized, or unusable
+reads keep DONE and the last observed URL, including a missing live browser/page
+or launch/relaunch lifecycle response. This read never launches or replaces a
+browser, creates a tab, retries, respawns the daemon, or prompts. The daemon reply
+is capped at 64 KiB. With WebDriver, the backend URL read also has a 1000 ms
+deadline and a 64 KiB cap including HTTP headers and chunk framing. Both paths
+require at least 10 ms remaining before JSON parsing and check the deadline
+while parsing. Oversized or late backend responses close the connection and
+release the daemon for subsequent commands. Standalone get url is unchanged.
+Step URLs remain their recorded observations.
+This read does not wait for navigation to finish.
 DONE is the model's opinion: verify the outcome with snapshot or get url.
 
 Vercel requires AI_GATEWAY_API_KEY. Cloudflare requires CLOUDFLARE_ACCOUNT_ID
@@ -3672,7 +3684,7 @@ Goal Options:
   --debug                Also write every model request and reply to stderr
 
 Global Options:
-  --json                 Structured output with every step, timings, and pending confirmation data
+  --json                 Structured output with final URL, every step, timings, and pending confirmation data
   --session <name>       Target session for commands
   --config <path>        Use one config file instead of automatic user/project discovery
 

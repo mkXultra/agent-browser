@@ -12350,6 +12350,98 @@ async fn e2e_pushstate_changes_url() {
     let _ = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
 }
 
+/// Completion URL reads observe the existing Chrome and never create a target
+/// or replace a browser that disappears while the model decides to finish.
+#[tokio::test]
+#[ignore]
+async fn e2e_completion_url_never_launches_or_recovers_browser() {
+    let (guard, _dir) = binding_test_env();
+    let (mut state, ws_url) = launch_binding_host(&guard).await;
+    let url = "data:text/html,completion-url";
+    let resp = execute_command(
+        &json!({ "id": "completion-navigate", "action": "navigate", "url": url }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let cmd = json!({ "id": "completion-read", "action": "url", "existingBrowserOnly": true });
+    let resp = execute_command(&cmd, &mut state).await;
+    assert_success(&resp);
+    assert_eq!(resp["data"]["url"], url);
+    assert_eq!(resp["data"]["lifecycle"]["launched"], false);
+    assert_eq!(resp["data"]["lifecycle"]["relaunchedBrowser"], false);
+
+    let page = state.browser.as_ref().unwrap().pages_list()[0].clone();
+    let client = state.browser.as_ref().unwrap().client.clone();
+    let targets_before = client
+        .send_command_no_params("Target.getTargets", None)
+        .await
+        .unwrap();
+    state
+        .browser
+        .as_mut()
+        .unwrap()
+        .remove_page_by_target_id(&page.target_id);
+    let resp = execute_command(&cmd, &mut state).await;
+    assert_eq!(resp["success"], false);
+    assert_eq!(state.browser.as_ref().unwrap().page_count(), 0);
+    let targets_after = client
+        .send_command_no_params("Target.getTargets", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        targets_before, targets_after,
+        "completion must not create or activate a replacement target"
+    );
+
+    state.browser.as_mut().unwrap().add_page(page.clone());
+    state.browser.as_mut().unwrap().set_pin_tab(true);
+    state.pin_tab = true;
+    state
+        .browser
+        .as_mut()
+        .unwrap()
+        .remove_page_by_target_id(&page.target_id);
+    let resp = execute_command(&cmd, &mut state).await;
+    assert_error_code(&resp, "tab_gone");
+    assert!(state.browser.as_ref().unwrap().bound_target_is_gone());
+    state.browser.as_mut().unwrap().add_page(page);
+
+    let _ = client.send_command_no_params("Browser.close", None).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !state.browser.as_mut().unwrap().has_process_exited() {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("Chrome must exit before the final read");
+    let resp = execute_command(&cmd, &mut state).await;
+    assert_eq!(resp["success"], false);
+    assert!(state.browser.as_mut().unwrap().has_process_exited());
+    assert_eq!(state.browser.as_ref().unwrap().get_cdp_url(), ws_url);
+    assert!(Arc::ptr_eq(
+        &client,
+        &state.browser.as_ref().unwrap().client
+    ));
+
+    close_current_browser(&mut state).await.unwrap();
+    let resp = execute_command(&cmd, &mut state).await;
+    assert_eq!(resp["success"], false);
+    assert_eq!(resp["error"], "Browser not launched");
+    assert!(state.browser.is_none());
+
+    // Ordinary get url retains its established implicit launch behavior.
+    let resp = execute_command(
+        &json!({ "id": "ordinary-url", "action": "url" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(resp["data"]["url"], "about:blank");
+    assert_eq!(resp["data"]["lifecycle"]["launched"], true);
+    close_current_browser(&mut state).await.unwrap();
+}
+
 #[tokio::test]
 #[ignore]
 async fn e2e_removeinitscript_roundtrip() {

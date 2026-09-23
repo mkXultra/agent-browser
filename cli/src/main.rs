@@ -2158,24 +2158,9 @@ fn main() {
     // Handle goal command: the loop runs here in the CLI and drives the
     // daemon through the same parse/attach/send path as every other command.
     if cmd.get("action").and_then(|v| v.as_str()) == Some("goal") {
-        let runner = |words: &[String], deadline: Instant| {
-            let resp =
-                run_words(words, &flags, &daemon_opts).map_err(goal::CommandRunError::Failed)?;
-            if flags.confirm_interactive && confirmation_prompt_from_response(&resp).is_some() {
-                resolve_interactive_confirmations_before(resp, &flags, Some(deadline)).map_err(
-                    |error| match error {
-                        ConfirmationResolutionError::Denied => goal::CommandRunError::Denied,
-                        ConfirmationResolutionError::DeadlineExpired => {
-                            goal::CommandRunError::Timeout
-                        }
-                        ConfirmationResolutionError::Command(message) => {
-                            goal::CommandRunError::Failed(message)
-                        }
-                    },
-                )
-            } else {
-                Ok(resp)
-            }
+        let runner = GoalCommandRunner {
+            flags: &flags,
+            daemon_opts: &daemon_opts,
         };
         goal::run_goal(&flags, &daemon_opts, &cmd, &runner);
         return;
@@ -2226,12 +2211,58 @@ fn run_words(
     flags: &Flags,
     daemon_opts: &DaemonOptions,
 ) -> Result<connection::Response, String> {
+    let parsed = parse_session_command(words, flags)?;
+    send_command_with_respawn(parsed, &flags.session, daemon_opts)
+}
+
+/// Share CLI parsing and session context between ordinary goal commands and
+/// the bounded final URL read, including pinned-tab and restore settings.
+fn parse_session_command(words: &[String], flags: &Flags) -> Result<serde_json::Value, String> {
     let mut parsed = parse_command(words, flags).map_err(|e| e.format())?;
     attach_input_mode(&mut parsed, flags);
     attach_plugins_to_command(&mut parsed, &flags.plugins);
     attach_restore_config_to_command(&mut parsed, flags);
     attach_pin_tab_to_command(&mut parsed, flags);
-    send_command_with_respawn(parsed, &flags.session, daemon_opts)
+    Ok(parsed)
+}
+
+struct GoalCommandRunner<'a> {
+    flags: &'a Flags,
+    daemon_opts: &'a DaemonOptions<'a>,
+}
+
+impl goal::CommandRunner for GoalCommandRunner<'_> {
+    fn run(&self, words: &[String], deadline: Instant) -> Result<Response, goal::CommandRunError> {
+        let resp = run_words(words, self.flags, self.daemon_opts)
+            .map_err(goal::CommandRunError::Failed)?;
+        if self.flags.confirm_interactive && confirmation_prompt_from_response(&resp).is_some() {
+            resolve_interactive_confirmations_before(resp, self.flags, Some(deadline)).map_err(
+                |error| match error {
+                    ConfirmationResolutionError::Denied => goal::CommandRunError::Denied,
+                    ConfirmationResolutionError::DeadlineExpired => goal::CommandRunError::Timeout,
+                    ConfirmationResolutionError::Command(message) => {
+                        goal::CommandRunError::Failed(message)
+                    }
+                },
+            )
+        } else {
+            Ok(resp)
+        }
+    }
+
+    /// Completion metadata uses the same CLI parser and daemon policy checks,
+    /// but cannot launch a browser, respawn the daemon, retry, or prompt.
+    /// A pending confirmation is returned to goal's best-effort fallback.
+    fn final_url(&self, deadline: Instant) -> Result<Response, goal::CommandRunError> {
+        let words = ["get".to_string(), "url".to_string()];
+        let mut parsed =
+            parse_session_command(&words, self.flags).map_err(goal::CommandRunError::Failed)?;
+        // Internal daemon guard: a completion read must use the existing page,
+        // even if its browser died after the model's last observation.
+        parsed["existingBrowserOnly"] = json!(true);
+        connection::send_command_before(parsed, &self.flags.session, deadline)
+            .map_err(goal::CommandRunError::Failed)
+    }
 }
 
 /// send_command plus the daemon-shutdown-race recovery: ensure_daemon no
@@ -2437,6 +2468,395 @@ mod tests {
     }
 
     use super::*;
+
+    #[cfg(unix)]
+    mod goal_final_url {
+        use super::*;
+        use crate::goal::CommandRunner;
+        use crate::test_utils::EnvGuard;
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::os::unix::net::{UnixListener, UnixStream};
+        use std::path::Path;
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        fn daemon_options<'a>(flags: &'a Flags, plugins: &'a str) -> DaemonOptions<'a> {
+            DaemonOptions {
+                headed: flags.headed,
+                debug: flags.debug,
+                executable_path: flags.executable_path.as_deref(),
+                extensions: &flags.extensions,
+                init_scripts: &flags.init_scripts,
+                enable: &flags.enable,
+                args: flags.args.as_deref(),
+                user_agent: flags.user_agent.as_deref(),
+                proxy: None,
+                proxy_bypass: None,
+                proxy_username: None,
+                proxy_password: None,
+                ignore_https_errors: flags.ignore_https_errors,
+                allow_file_access: flags.allow_file_access,
+                hide_scrollbars: flags.hide_scrollbars,
+                webgpu: flags.webgpu,
+                profile: flags.profile.as_deref(),
+                state: flags.state.as_deref(),
+                provider: flags.provider.as_deref(),
+                device: flags.device.as_deref(),
+                session_name: restore_key_from_flags(flags),
+                restore_save: flags.restore_save.as_deref(),
+                restore_check_url: flags.restore_check_url.as_deref(),
+                restore_check_text: flags.restore_check_text.as_deref(),
+                restore_check_fn: flags.restore_check_fn.as_deref(),
+                download_path: flags.download_path.as_deref(),
+                allowed_domains: flags.allowed_domains.as_deref(),
+                action_policy: flags.action_policy.as_deref(),
+                confirm_actions: flags.confirm_actions.as_deref(),
+                engine: flags.engine.as_deref(),
+                auto_connect: flags.auto_connect,
+                pin_tab: flags.pin_tab,
+                idle_timeout: flags.idle_timeout.as_deref(),
+                default_timeout: flags.default_timeout,
+                cdp: flags.cdp.as_deref(),
+                no_auto_dialog: flags.no_auto_dialog,
+                plugins: Some(plugins),
+            }
+        }
+
+        fn with_runner(session: &str, test: impl FnOnce(&GoalCommandRunner<'_>, &Path)) {
+            let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_NAMESPACE"]);
+            // Short paths also exercise namespace/session routing on macOS.
+            let dir = tempfile::tempdir_in("/tmp").unwrap();
+            guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
+            guard.set("AGENT_BROWSER_NAMESPACE", "final");
+            let args: Vec<String> = [
+                "--session",
+                session,
+                "--restore",
+                "saved-context",
+                "--restore-save",
+                "always",
+                "--restore-check-url",
+                "**/dashboard",
+                "--restore-check-text",
+                "Dashboard",
+                "--restore-check-fn",
+                "!!localStorage.getItem('session')",
+                "--input-mode",
+                "smooth",
+                "--no-pin-tab",
+                "--confirm-interactive",
+                "get",
+                "url",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+            let mut flags = parse_flags(&args);
+            flags.plugins = vec![plugins::PluginConfig {
+                name: "fixture".to_string(),
+                command: "unused-plugin-executable".to_string(),
+                args: vec!["--fixture".to_string()],
+                capabilities: vec!["command.run".to_string()],
+                source: Some("fixture.json".to_string()),
+            }];
+            assert!(flags.confirm_interactive);
+            let plugins = serde_json::to_string(&flags.plugins).unwrap();
+            let opts = daemon_options(&flags, &plugins);
+            let runner = GoalCommandRunner {
+                flags: &flags,
+                daemon_opts: &opts,
+            };
+            let socket_dir = get_socket_dir();
+            fs::create_dir_all(&socket_dir).unwrap();
+            // Refuse spawn preflight even if a regression takes the recovery
+            // path, which would otherwise recursively launch the test binary.
+            fs::create_dir(socket_dir.join(".write_test")).unwrap();
+            // These files make attempted daemon recovery observable, without
+            // putting a real process PID at risk during a failing regression.
+            for extension in ["pid", "version", "config"] {
+                fs::write(
+                    socket_dir.join(format!("{session}.{extension}")),
+                    "sentinel",
+                )
+                .unwrap();
+            }
+            test(&runner, &socket_dir);
+            for extension in ["pid", "version", "config"] {
+                assert_eq!(
+                    fs::read_to_string(socket_dir.join(format!("{session}.{extension}"))).unwrap(),
+                    "sentinel",
+                    "completion must not respawn or rewrite daemon state"
+                );
+            }
+        }
+
+        fn listener(runner: &GoalCommandRunner<'_>) -> UnixListener {
+            let listener =
+                UnixListener::bind(get_socket_dir().join(format!("{}.sock", runner.flags.session)))
+                    .unwrap();
+            listener.set_nonblocking(true).unwrap();
+            listener
+        }
+
+        fn accept_request(listener: &UnixListener) -> (UnixStream, serde_json::Value) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("fake daemon did not receive final URL request: {error}"),
+                }
+            };
+            // BSD/macOS may inherit O_NONBLOCK from the listening socket.
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut request = String::new();
+            BufReader::new((&mut stream).take(16 * 1024))
+                .read_line(&mut request)
+                .unwrap();
+            assert!(
+                request.ends_with('\n'),
+                "request must fit the test's bounded buffer"
+            );
+            (stream, serde_json::from_str(&request).unwrap())
+        }
+
+        fn assert_request(mut request: serde_json::Value) {
+            assert!(request["id"].as_str().is_some_and(|id| !id.is_empty()));
+            request.as_object_mut().unwrap().remove("id");
+            assert_eq!(
+                request,
+                json!({
+                    "action": "url",
+                    "existingBrowserOnly": true,
+                    "defaultInputMode": "smooth",
+                    "pinTab": false,
+                    "restoreKey": "saved-context",
+                    "restoreSave": "always",
+                    "restoreCheckUrl": "**/dashboard",
+                    "restoreCheckText": "Dashboard",
+                    "restoreCheckFn": "!!localStorage.getItem('session')",
+                    "plugins": [{
+                        "name": "fixture",
+                        "command": "unused-plugin-executable",
+                        "args": ["--fixture"],
+                        "capabilities": ["command.run"],
+                        "source": "fixture.json"
+                    }]
+                })
+            );
+        }
+
+        fn assert_no_more_connections(listener: &UnixListener) {
+            match listener.accept() {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                _ => panic!(
+                    "completion must send exactly one request, without retries or confirmations"
+                ),
+            }
+        }
+
+        enum Reply {
+            Json(serde_json::Value),
+            Eof,
+            WaitForDeadline,
+        }
+
+        fn assert_completion_socket_closed(stream: &mut UnixStream) {
+            let closed = stream.read(&mut [0]);
+            // Closing with unread data may be reported as an abort/reset
+            // instead of EOF, depending on the platform.
+            assert!(
+                matches!(closed, Ok(0))
+                    || matches!(closed, Err(ref error) if matches!(error.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::BrokenPipe)),
+                "completion must close its socket: {closed:?}"
+            );
+        }
+
+        fn serve_once(
+            listener: &UnixListener,
+            reply: Reply,
+        ) -> (
+            mpsc::Sender<()>,
+            thread::JoinHandle<(usize, serde_json::Value)>,
+        ) {
+            let listener = listener.try_clone().unwrap();
+            let (stop, stopped) = mpsc::channel();
+            let server = thread::spawn(move || {
+                let (mut stream, request) = accept_request(&listener);
+                match reply {
+                    Reply::Json(value) => {
+                        writeln!(stream, "{value}").unwrap();
+                        assert_completion_socket_closed(&mut stream);
+                    }
+                    Reply::WaitForDeadline => {
+                        assert_completion_socket_closed(&mut stream);
+                    }
+                    Reply::Eof => {}
+                }
+                drop(stream);
+
+                // Answer unexpected retries/confirmations immediately so a
+                // failing test reports the extra connection instead of hanging.
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let mut connections = 1;
+                while Instant::now() < deadline {
+                    if !matches!(stopped.try_recv(), Err(mpsc::TryRecvError::Empty)) {
+                        break;
+                    }
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            connections += 1;
+                            stream.set_nonblocking(false).unwrap();
+                            stream
+                                .set_read_timeout(Some(Duration::from_millis(100)))
+                                .unwrap();
+                            stream
+                                .set_write_timeout(Some(Duration::from_millis(100)))
+                                .unwrap();
+                            let mut request = String::new();
+                            let _ = BufReader::new((&mut stream).take(16 * 1024))
+                                .read_line(&mut request);
+                            let _ = stream.write_all(
+                                b"{\"success\":false,\"error\":\"unexpected extra command\"}\n",
+                            );
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => panic!("failed to check extra final URL request: {error}"),
+                    }
+                }
+                (connections, request)
+            });
+            (stop, server)
+        }
+
+        fn finish_server(
+            stop: mpsc::Sender<()>,
+            server: thread::JoinHandle<(usize, serde_json::Value)>,
+            listener: &UnixListener,
+        ) {
+            let _ = stop.send(());
+            let (connections, request) = server.join().unwrap();
+            assert_eq!(
+                connections, 1,
+                "completion must make exactly one connection"
+            );
+            assert_request(request);
+            assert_no_more_connections(listener);
+        }
+
+        #[test]
+        fn uses_full_canonical_context_once() {
+            with_runner("context", |runner, _| {
+                let listener = listener(runner);
+                let (stop, server) = serve_once(
+                    &listener,
+                    Reply::Json(json!({
+                        "success": true, "data": { "url": "https://example.com/new" }
+                    })),
+                );
+                let response = runner.final_url(Instant::now() + Duration::from_secs(1));
+                finish_server(stop, server, &listener);
+                let response = response
+                    .unwrap_or_else(|_| panic!("final URL should return the fake daemon response"));
+                assert!(response.success);
+                assert_eq!(response.data.unwrap()["url"], "https://example.com/new");
+            });
+        }
+
+        #[test]
+        fn pending_confirmation_is_returned_without_prompt_or_followup() {
+            with_runner("confirm", |runner, _| {
+                let listener = listener(runner);
+                let expected = json!({
+                    "success": true,
+                    "data": {
+                        "confirmation_required": true,
+                        "confirmation_id": "pending-final-url",
+                        "action": "url",
+                        "category": "read",
+                        "description": "Read page URL"
+                    },
+                    "error": null,
+                    "warning": "pending confirmation must be left alone"
+                });
+                let (stop, server) = serve_once(&listener, Reply::Json(expected.clone()));
+                let response = runner.final_url(Instant::now() + Duration::from_secs(1));
+                finish_server(stop, server, &listener);
+                let response = response.unwrap_or_else(|_| {
+                    panic!("pending confirmation should be returned untouched")
+                });
+                assert!(confirmation_prompt_from_response(&response).is_some());
+                assert_eq!(serde_json::to_value(response).unwrap(), expected);
+            });
+        }
+
+        #[test]
+        fn eof_does_not_retry_or_respawn() {
+            with_runner("eof", |runner, _| {
+                let listener = listener(runner);
+                let (stop, server) = serve_once(&listener, Reply::Eof);
+                let started = Instant::now();
+                let response = runner.final_url(started + Duration::from_secs(1));
+                finish_server(stop, server, &listener);
+                assert!(response.is_err());
+                assert!(started.elapsed() < Duration::from_secs(1));
+            });
+        }
+
+        #[test]
+        fn deadline_closes_request_without_retry_or_respawn() {
+            with_runner("deadline", |runner, _| {
+                let listener = listener(runner);
+                let (stop, server) = serve_once(&listener, Reply::WaitForDeadline);
+                let started = Instant::now();
+                let response = runner.final_url(started + Duration::from_millis(80));
+                finish_server(stop, server, &listener);
+                assert!(response.is_err());
+                assert!(started.elapsed() < Duration::from_millis(600));
+            });
+        }
+
+        #[test]
+        fn expired_deadline_never_connects() {
+            with_runner("expired", |runner, _| {
+                let listener = listener(runner);
+                assert!(runner
+                    .final_url(Instant::now() - Duration::from_millis(1))
+                    .is_err());
+                assert_no_more_connections(&listener);
+            });
+        }
+
+        #[test]
+        fn missing_socket_preserves_daemon_state_without_spawning() {
+            with_runner("missing", |runner, socket_dir| {
+                let started = Instant::now();
+                assert!(runner.final_url(started + Duration::from_secs(1)).is_err());
+                assert!(started.elapsed() < Duration::from_millis(600));
+                assert_eq!(fs::read_dir(socket_dir).unwrap().count(), 4);
+                assert!(!socket_dir
+                    .join(format!("{}.sock", runner.flags.session))
+                    .exists());
+            });
+        }
+    }
 
     #[test]
     fn dashboard_config_comparison_rejects_unknown_or_changed_settings() {
@@ -2661,6 +3081,31 @@ mod tests {
         let mut disabled_cmd = json!({ "action": "launch" });
         attach_pin_tab_to_command(&mut disabled_cmd, &flags);
         assert_eq!(disabled_cmd["pinTab"], false);
+    }
+
+    #[test]
+    fn test_goal_url_command_preserves_cli_session_context() {
+        let mut flags = neutral_launch_config_flags();
+        flags.pin_tab = true;
+        flags.cli_input_mode = true;
+        flags.input_mode = "human".into();
+        flags.restore = Some("goal-session".into());
+        flags.restore_save = Some("never".into());
+        flags.plugins = vec![plugins::PluginConfig {
+            name: "test-plugin".into(),
+            command: "test-plugin-command".into(),
+            ..Default::default()
+        }];
+
+        // Both normal observations and the bounded completion read prepare
+        // their daemon request here using the canonical `get url` parser.
+        let command = parse_session_command(&["get".into(), "url".into()], &flags).unwrap();
+        assert_eq!(command["action"], "url");
+        assert_eq!(command["pinTab"], true);
+        assert_eq!(command["defaultInputMode"], "human");
+        assert_eq!(command["restoreKey"], "goal-session");
+        assert_eq!(command["restoreSave"], "never");
+        assert_eq!(command["plugins"], json!(flags.plugins));
     }
 
     #[test]

@@ -16,6 +16,11 @@
 //! allowlists, and session isolation apply exactly as they do for a human
 //! typed command. The loop stops on `DONE`, `BLOCKED`, the step budget, the
 //! time budget, or three consecutive actions that did not change the page.
+//! Accepted `DONE` refreshes only the final URL with one best-effort live read,
+//! capped at one second and the remaining goal budget. Step URLs stay as
+//! observed; a failed refresh preserves success and the last observed URL.
+//! This read never launches or replaces a browser; lifecycle responses that
+//! report a launch are unusable completion metadata.
 //!
 //! `AGENT_BROWSER_GOAL_PROVIDER` selects `vercel` (the default) or
 //! `cloudflare`. Vercel reads `AI_GATEWAY_API_KEY`; Cloudflare reads
@@ -49,6 +54,9 @@ const DEFAULT_CLOUDFLARE_GATEWAY_ID: &str = "default";
 pub const DEFAULT_MAX_STEPS: u64 = 40;
 /// Default time budget for one goal, in milliseconds.
 pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
+/// Maximum time spent refreshing the URL after an accepted DONE decision.
+/// This is a single read, not a wait for navigation to finish.
+pub(crate) const FINAL_URL_TIMEOUT_MS: u64 = 1000;
 
 const PAGE_TEXT_LIMIT: usize = 6000;
 const DIAGNOSTIC_TEXT_LIMIT: usize = 3000;
@@ -742,9 +750,29 @@ pub(crate) enum CommandRunError {
 
 /// Sends parsed CLI words through the normal command pipeline. The loop's
 /// monotonic deadline is supplied so confirmation handling can reject an
-/// approval received after the goal budget expired.
-pub(crate) type CommandRunner<'a> =
-    dyn Fn(&[String], Instant) -> Result<Response, CommandRunError> + 'a;
+/// approval received after the goal budget expired. Completion reads have a
+/// separate bounded path so retries or interactive prompts cannot delay DONE.
+pub(crate) trait CommandRunner {
+    fn run(&self, words: &[String], deadline: Instant) -> Result<Response, CommandRunError>;
+
+    /// Read the live URL once by `deadline`, without retrying or prompting.
+    fn final_url(&self, deadline: Instant) -> Result<Response, CommandRunError>;
+}
+
+/// Test doubles can model both paths with the same command script.
+#[cfg(test)]
+impl<F> CommandRunner for F
+where
+    F: Fn(&[String], Instant) -> Result<Response, CommandRunError>,
+{
+    fn run(&self, words: &[String], deadline: Instant) -> Result<Response, CommandRunError> {
+        self(words, deadline)
+    }
+
+    fn final_url(&self, deadline: Instant) -> Result<Response, CommandRunError> {
+        self(&words(&["get", "url"]), deadline)
+    }
+}
 
 /// The two model calls the loop makes. Implemented by the gateway client and
 /// by test doubles.
@@ -1310,16 +1338,18 @@ enum GoalLoopError {
 }
 
 fn run_or_error(
-    run: &CommandRunner,
+    run: &dyn CommandRunner,
     parts: &[&str],
     deadline: Instant,
 ) -> Result<Response, GoalLoopError> {
     remaining(deadline).map_err(GoalLoopError::Message)?;
-    let resp = run(&words(parts), deadline).map_err(|error| match error {
-        CommandRunError::Failed(message) => GoalLoopError::Message(message),
-        CommandRunError::Denied => GoalLoopError::Denied,
-        CommandRunError::Timeout => GoalLoopError::Timeout,
-    })?;
+    let resp = run
+        .run(&words(parts), deadline)
+        .map_err(|error| match error {
+            CommandRunError::Failed(message) => GoalLoopError::Message(message),
+            CommandRunError::Denied => GoalLoopError::Denied,
+            CommandRunError::Timeout => GoalLoopError::Timeout,
+        })?;
     remaining(deadline).map_err(GoalLoopError::Message)?;
     if let Some(pending) = pending_confirmation(&resp) {
         return Err(GoalLoopError::Confirmation(pending));
@@ -1334,7 +1364,7 @@ fn run_or_error(
     Ok(resp)
 }
 
-fn observe(run: &CommandRunner, deadline: Instant) -> Result<Page, GoalLoopError> {
+fn observe(run: &dyn CommandRunner, deadline: Instant) -> Result<Page, GoalLoopError> {
     // Use the full accessibility snapshot so ordinary StaticText, including
     // validation and success messages, is eligible for the bounded,
     // prioritized text selection. All actionable refs are retained.
@@ -1352,6 +1382,39 @@ fn observe(run: &CommandRunner, deadline: Instant) -> Result<Page, GoalLoopError
     })
 }
 
+/// Refresh terminal metadata without changing the accepted DONE decision or
+/// historical observations. No usable response within the remaining budget
+/// means the caller keeps the last observed URL, including on confirmation.
+fn final_url(run: &dyn CommandRunner, deadline: Instant) -> Option<String> {
+    let deadline = deadline.min(Instant::now() + Duration::from_millis(FINAL_URL_TIMEOUT_MS));
+    remaining(deadline).ok()?;
+    let response = run.final_url(deadline).ok()?;
+    remaining(deadline).ok()?;
+    if !response.success || pending_confirmation(&response).is_some() {
+        return None;
+    }
+    let data = response.data.as_ref()?;
+    let lifecycle = data.get("lifecycle");
+    if lifecycle.is_some_and(|value| !value.is_object()) {
+        return None;
+    }
+    // Also reject lifecycle markers from a daemon that does not understand
+    // the no-launch request guard. A replacement's about:blank is not the
+    // original goal page. Absent markers remain compatible with plain replies.
+    for metadata in [Some(data), lifecycle].into_iter().flatten() {
+        for key in ["launched", "relaunchedBrowser", "restartedBackground"] {
+            if metadata
+                .get(key)
+                .is_some_and(|value| value.as_bool() != Some(false))
+            {
+                return None;
+            }
+        }
+    }
+    let url = data_str(&response, "url");
+    (!url.trim().is_empty()).then_some(url)
+}
+
 /// Wait for the page to catch up with the last action, then observe it.
 ///
 /// Every action gets a short settle pause. Typing additionally waits, in
@@ -1359,7 +1422,7 @@ fn observe(run: &CommandRunner, deadline: Instant) -> Result<Page, GoalLoopError
 /// because a typed query usually needs its suggestion selected next and an
 /// observation taken before the list opens would hide that choice.
 fn settle_and_observe(
-    run: &CommandRunner,
+    run: &dyn CommandRunner,
     operation: &str,
     deadline: Instant,
 ) -> Result<Page, GoalLoopError> {
@@ -1649,6 +1712,8 @@ fn answer_confidence(
 /// Outcome of one goal run.
 pub(crate) struct GoalOutcome {
     pub status: String,
+    /// On DONE, one fresh live read when available; otherwise the last observation.
+    /// Historical step URLs always retain their original observations.
     pub url: String,
     pub steps: Vec<Value>,
     pub stale_decisions: usize,
@@ -1662,7 +1727,7 @@ pub(crate) struct GoalOutcome {
 pub(crate) fn run_goal_loop(
     config: &GoalConfig,
     gateway: &dyn Oracle,
-    run: &CommandRunner,
+    run: &dyn CommandRunner,
     mut on_step: impl FnMut(&Step),
 ) -> GoalOutcome {
     let started = Instant::now();
@@ -1804,7 +1869,14 @@ pub(crate) fn run_goal_loop(
         }
 
         match decision.operation.as_str() {
-            "DONE" => return finish("done", &page, &history, stale_total, None),
+            "DONE" => {
+                let url = final_url(run, deadline);
+                let mut outcome = finish("done", &page, &history, stale_total, None);
+                if let Some(url) = url {
+                    outcome.url = url;
+                }
+                return outcome;
+            }
             "BLOCKED" => {
                 return finish(
                     "blocked",
@@ -1937,7 +2009,7 @@ pub(crate) fn run_goal_loop(
             );
         }
         let started_execute = Instant::now();
-        let executed = run(&command, deadline);
+        let executed = run.run(&command, deadline);
         let execute_ms = started_execute.elapsed().as_millis();
         let mut step = Step {
             step: history.len() + 1,
@@ -2123,7 +2195,7 @@ pub(crate) fn run_goal_loop(
 }
 
 /// Entry point from `main`: runs the goal and prints the result.
-pub fn run_goal(flags: &Flags, _daemon_opts: &DaemonOptions, cmd: &Value, run: &CommandRunner) {
+pub fn run_goal(flags: &Flags, _daemon_opts: &DaemonOptions, cmd: &Value, run: &dyn CommandRunner) {
     let mut config = match GoalConfig::from_command(cmd, &flags.goal) {
         Ok(config) => config,
         Err(error) => fail(flags.json, &error),
@@ -3470,6 +3542,8 @@ mod tests {
         }
     }
 
+    type EvaluationHook = Box<dyn Fn(&Value)>;
+
     /// A model double that replays a script of (operation, target) answers.
     struct FakeOracle {
         answers:
@@ -3478,6 +3552,7 @@ mod tests {
         seen: std::cell::RefCell<Vec<Value>>,
         evaluate_delay: Duration,
         text_delay: Duration,
+        on_evaluate: Option<EvaluationHook>,
     }
 
     impl FakeOracle {
@@ -3488,6 +3563,7 @@ mod tests {
                 seen: std::cell::RefCell::new(Vec::new()),
                 evaluate_delay: Duration::ZERO,
                 text_delay: Duration::ZERO,
+                on_evaluate: None,
             }
         }
     }
@@ -3502,6 +3578,9 @@ mod tests {
         ) -> Result<Value, String> {
             std::thread::sleep(self.evaluate_delay);
             self.seen.borrow_mut().push(state.clone());
+            if let Some(on_evaluate) = &self.on_evaluate {
+                on_evaluate(state);
+            }
             let (operation, target) = self
                 .answers
                 .borrow_mut()
@@ -3665,6 +3744,367 @@ mod tests {
     }
 
     #[test]
+    fn done_refreshes_url_after_navigation_during_final_decision_without_rewriting_steps() {
+        const OLD_URL: &str = "https://example.com/home";
+        const NEW_URL: &str = "https://example.com/results";
+        let daemon = FakeDaemon::new(vec![FORM, RESULTS]);
+        let live_url = std::rc::Rc::new(std::cell::Cell::new(OLD_URL));
+        let mut oracle = FakeOracle::new(vec![("CLICK", Some("2")), ("DONE", None)]);
+        let decision_url = live_url.clone();
+        oracle.on_evaluate = Some(Box::new(move |state| {
+            if !state["recent_actions"].as_array().unwrap().is_empty() {
+                // The post-click snapshot has changed, but its observed URL
+                // still predates the navigation that completes during DONE.
+                assert_eq!(state["page"]["url"], OLD_URL);
+                assert!(state["page"]["text"].as_str().unwrap().contains("Results"));
+                decision_url.set(NEW_URL);
+            }
+        }));
+        let calls = std::cell::RefCell::new(Vec::new());
+        let runner = |words: &[String], deadline: Instant| {
+            calls.borrow_mut().push((Instant::now(), deadline));
+            let mut response = daemon.runner()(words, deadline)?;
+            if words == ["get", "url"] {
+                response.data = Some(json!({ "url": live_url.get() }));
+            }
+            Ok(response)
+        };
+        let mut emitted = Vec::new();
+
+        let outcome = run_goal_loop(&config("fly"), &oracle, &runner, |step| {
+            emitted.push(step.to_json());
+        });
+
+        assert_eq!(outcome.status, "done");
+        assert_eq!(outcome.url, NEW_URL);
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.confirmation, None);
+        assert_eq!(outcome.stale_decisions, 0);
+        assert_eq!(outcome.steps.len(), 1);
+        assert_eq!(outcome.steps[0]["url"], OLD_URL);
+        assert_eq!(outcome.steps[0]["pageChanged"], true);
+        assert_eq!(outcome.steps, emitted, "emitted history stays unchanged");
+        assert_eq!(oracle.seen.borrow().len(), 2);
+        assert_eq!(*daemon.commands.borrow(), vec!["click @e4"]);
+        assert_eq!(
+            *daemon.requests.borrow(),
+            vec![
+                "snapshot",
+                "get url",
+                "get title",
+                "click @e4",
+                "snapshot",
+                "get url",
+                "get title",
+                "get url",
+            ],
+            "DONE performs exactly one URL read and no other observation or action"
+        );
+        let calls = calls.borrow();
+        let (read_started, read_deadline) = calls.last().unwrap();
+        assert!(
+            *read_deadline <= calls[0].1,
+            "the goal deadline is preserved"
+        );
+        assert!(
+            read_deadline.saturating_duration_since(*read_started) <= Duration::from_secs(1),
+            "the final read has a one-second cap"
+        );
+    }
+
+    #[test]
+    fn done_uses_the_dedicated_final_url_runner_method() {
+        struct CompletionRunner {
+            daemon: FakeDaemon,
+            final_reads: std::cell::Cell<usize>,
+        }
+
+        impl CommandRunner for CompletionRunner {
+            fn run(
+                &self,
+                words: &[String],
+                deadline: Instant,
+            ) -> Result<Response, CommandRunError> {
+                assert!(
+                    self.daemon.requests.borrow().len() < 3,
+                    "completion must use the bounded final_url method"
+                );
+                self.daemon.runner()(words, deadline)
+            }
+
+            fn final_url(&self, deadline: Instant) -> Result<Response, CommandRunError> {
+                assert!(deadline > Instant::now());
+                self.final_reads.set(self.final_reads.get() + 1);
+                Ok(Response {
+                    success: true,
+                    data: Some(json!({ "url": "https://example.com/complete" })),
+                    error: None,
+                    code: None,
+                    warning: None,
+                })
+            }
+        }
+
+        let runner = CompletionRunner {
+            daemon: FakeDaemon::new(vec![FORM]),
+            final_reads: std::cell::Cell::new(0),
+        };
+        let oracle = FakeOracle::new(vec![("DONE", None)]);
+
+        let outcome = run_goal_loop(&config("fly"), &oracle, &runner, |_| {
+            panic!("the final URL read must not emit a step")
+        });
+
+        assert_eq!(outcome.status, "done");
+        assert_eq!(outcome.url, "https://example.com/complete");
+        assert_eq!(runner.final_reads.get(), 1);
+        assert!(outcome.steps.is_empty());
+        assert_eq!(
+            *runner.daemon.requests.borrow(),
+            vec!["snapshot", "get url", "get title"]
+        );
+    }
+
+    #[test]
+    fn done_without_actions_refreshes_url_within_remaining_goal_budget() {
+        let daemon = FakeDaemon::new(vec![FORM]);
+        let oracle = FakeOracle::new(vec![("DONE", None)]);
+        let url_reads = std::cell::Cell::new(0);
+        let deadlines = std::cell::RefCell::new(Vec::new());
+        let runner = |words: &[String], deadline: Instant| {
+            deadlines.borrow_mut().push(deadline);
+            let mut response = daemon.runner()(words, deadline)?;
+            if words == ["get", "url"] {
+                url_reads.set(url_reads.get() + 1);
+                if url_reads.get() == 2 {
+                    response.data = Some(json!({ "url": "https://example.com/complete" }));
+                }
+            }
+            Ok(response)
+        };
+        let mut cfg = config("fly");
+        cfg.timeout_ms = 500;
+
+        let outcome = run_goal_loop(&cfg, &oracle, &runner, |_| {
+            panic!("DONE without actions must not emit a step")
+        });
+
+        assert_eq!(outcome.status, "done");
+        assert_eq!(outcome.url, "https://example.com/complete");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.confirmation, None);
+        assert!(outcome.steps.is_empty());
+        assert!(daemon.commands.borrow().is_empty());
+        assert_eq!(oracle.seen.borrow().len(), 1);
+        assert_eq!(
+            oracle.seen.borrow()[0]["page"]["url"],
+            "https://example.com/0"
+        );
+        assert_eq!(
+            *daemon.requests.borrow(),
+            vec!["snapshot", "get url", "get title", "get url"]
+        );
+        let deadlines = deadlines.borrow();
+        assert_eq!(
+            deadlines.last().unwrap(),
+            &deadlines[0],
+            "the original goal deadline clips the one-second final-read cap"
+        );
+    }
+
+    #[test]
+    fn done_stays_successful_when_goal_deadline_expires_during_final_url_read() {
+        let daemon = FakeDaemon::new(vec![FORM]);
+        let oracle = FakeOracle::new(vec![("DONE", None)]);
+        let url_reads = std::cell::Cell::new(0);
+        let runner = |words: &[String], deadline: Instant| {
+            let mut response = daemon.runner()(words, deadline)?;
+            if words == ["get", "url"] {
+                url_reads.set(url_reads.get() + 1);
+                if url_reads.get() == 2 {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(
+                        deadline.saturating_duration_since(Instant::now())
+                            + Duration::from_millis(1),
+                    );
+                    response.data = Some(json!({ "url": "https://example.com/too-late" }));
+                }
+            }
+            Ok(response)
+        };
+        let mut cfg = config("fly");
+        cfg.timeout_ms = 100;
+
+        let outcome = run_goal_loop(&cfg, &oracle, &runner, |_| {
+            panic!("the final URL read must not emit a step")
+        });
+
+        assert_eq!(outcome.status, "done");
+        assert_eq!(outcome.url, "https://example.com/0");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.confirmation, None);
+        assert!(outcome.steps.is_empty());
+        assert!(outcome.elapsed_ms >= u128::from(cfg.timeout_ms));
+        assert_eq!(oracle.seen.borrow().len(), 1);
+        assert_eq!(
+            *daemon.requests.borrow(),
+            vec!["snapshot", "get url", "get title", "get url"]
+        );
+    }
+
+    #[test]
+    fn final_url_skips_dispatch_after_deadline_expiry() {
+        let runner = |_words: &[String], _deadline: Instant| -> Result<Response, CommandRunError> {
+            panic!("an expired final-read deadline must prevent dispatch")
+        };
+
+        assert_eq!(
+            final_url(&runner, Instant::now() - Duration::from_millis(1)),
+            None
+        );
+    }
+
+    #[test]
+    fn done_preserves_success_and_observed_url_when_final_url_read_fails() {
+        for failure in [
+            "transport",
+            "daemon",
+            "denied",
+            "timeout",
+            "empty URL",
+            "whitespace URL",
+            "non-string URL",
+            "missing URL",
+            "missing data",
+            "confirmation",
+            "nested confirmation",
+            "launched browser",
+            "relaunched browser",
+            "restarted daemon",
+            "top-level launch",
+            "malformed lifecycle",
+            "malformed launch marker",
+        ] {
+            let daemon = FakeDaemon::new(vec![FORM, RESULTS]);
+            let oracle = FakeOracle::new(vec![("CLICK", Some("2")), ("DONE", None)]);
+            let url_reads = std::cell::Cell::new(0);
+            let runner = |words: &[String], deadline: Instant| {
+                let mut response = daemon.runner()(words, deadline)?;
+                if words != ["get", "url"] {
+                    return Ok(response);
+                }
+                url_reads.set(url_reads.get() + 1);
+                if url_reads.get() != 3 {
+                    return Ok(response);
+                }
+                response.data = match failure {
+                    "transport" => return Err(CommandRunError::Failed("connection closed".into())),
+                    "denied" => return Err(CommandRunError::Denied),
+                    "timeout" => return Err(CommandRunError::Timeout),
+                    "daemon" => {
+                        response.success = false;
+                        response.error = Some("tab closed".into());
+                        Some(json!({ "url": "https://example.com/unusable" }))
+                    }
+                    "empty URL" => Some(json!({ "url": "" })),
+                    "whitespace URL" => Some(json!({ "url": " \t\n" })),
+                    "non-string URL" => Some(json!({ "url": 123 })),
+                    "missing URL" => Some(json!({})),
+                    "missing data" => None,
+                    "confirmation" => Some(json!({
+                        "confirmation_required": true,
+                        "confirmation_id": "final-url-1",
+                        "url": "https://example.com/unusable"
+                    })),
+                    "nested confirmation" => Some(json!({
+                        "url": "https://example.com/unusable",
+                        "result": { "data": {
+                            "confirmation_required": true,
+                            "confirmation_id": "final-url-2"
+                        }}
+                    })),
+                    "launched browser" => Some(json!({
+                        "url": "about:blank", "lifecycle": { "launched": true }
+                    })),
+                    "relaunched browser" => Some(json!({
+                        "url": "about:blank", "lifecycle": { "relaunchedBrowser": true }
+                    })),
+                    "restarted daemon" => Some(json!({
+                        "url": "about:blank", "lifecycle": { "restartedBackground": true }
+                    })),
+                    "top-level launch" => Some(json!({
+                        "url": "about:blank", "launched": true
+                    })),
+                    "malformed lifecycle" => Some(json!({
+                        "url": "about:blank", "lifecycle": null
+                    })),
+                    "malformed launch marker" => Some(json!({
+                        "url": "about:blank", "lifecycle": { "launched": "true" }
+                    })),
+                    _ => unreachable!(),
+                };
+                Ok(response)
+            };
+            let mut emitted = Vec::new();
+
+            let outcome = run_goal_loop(&config("fly"), &oracle, &runner, |step| {
+                emitted.push(step.to_json());
+            });
+
+            assert_eq!(outcome.status, "done", "{failure}");
+            assert_eq!(outcome.url, "https://example.com/1", "{failure}");
+            assert_eq!(outcome.error, None, "{failure}");
+            assert_eq!(outcome.confirmation, None, "{failure}");
+            assert_eq!(outcome.stale_decisions, 0, "{failure}");
+            assert_eq!(outcome.steps.len(), 1, "{failure}");
+            assert_eq!(
+                outcome.steps[0]["url"], "https://example.com/1",
+                "{failure}"
+            );
+            assert_eq!(outcome.steps, emitted, "{failure}");
+            assert_eq!(oracle.seen.borrow().len(), 2, "{failure}");
+            assert_eq!(*daemon.commands.borrow(), vec!["click @e4"], "{failure}");
+            assert_eq!(
+                *daemon.requests.borrow(),
+                vec![
+                    "snapshot",
+                    "get url",
+                    "get title",
+                    "click @e4",
+                    "snapshot",
+                    "get url",
+                    "get title",
+                    "get url",
+                ],
+                "{failure}: no retry or extra observation"
+            );
+        }
+    }
+
+    #[test]
+    fn final_url_accepts_an_existing_blank_page_without_launching() {
+        let runner = |_words: &[String], _deadline: Instant| {
+            Ok(Response {
+                success: true,
+                data: Some(json!({
+                    "url": "about:blank",
+                    "lifecycle": {
+                        "reused": true,
+                        "launched": false,
+                        "relaunchedBrowser": false,
+                        "restartedBackground": false
+                    }
+                })),
+                ..Response::default()
+            })
+        };
+        assert_eq!(
+            final_url(&runner, Instant::now() + Duration::from_secs(1)),
+            Some("about:blank".into())
+        );
+    }
+
+    #[test]
     fn loop_requests_each_selected_field_context_and_fills_its_distinct_value() {
         const EMPTY_FORM: &str = "- heading \"日本語検索フォーム\"\n- textbox \"氏名\" [ref=e1]\n- textbox \"検索語\" [ref=e2]\n- button \"検索\" [ref=e3]\n- StaticText \"まだ検索していません\"\n";
         const NAME_FILLED: &str = "- heading \"日本語検索フォーム\"\n- textbox \"氏名\" [ref=e1]: 山田太郎\n- textbox \"検索語\" [ref=e2]\n- button \"検索\" [ref=e3]\n- option \"氏名を入力済み\" [ref=e4]\n";
@@ -3723,6 +4163,10 @@ mod tests {
         let outcome = run_goal_loop(&config("fly"), &oracle, &daemon.runner(), |_| {});
         assert_eq!(outcome.status, "blocked");
         assert!(daemon.commands.borrow().is_empty());
+        assert_eq!(
+            *daemon.requests.borrow(),
+            vec!["snapshot", "get url", "get title"]
+        );
     }
 
     #[test]
@@ -3754,6 +4198,10 @@ mod tests {
             "confirm-1"
         );
         assert_eq!(daemon.served.get(), 0, "pending action was not executed");
+        assert_eq!(
+            *daemon.requests.borrow(),
+            vec!["snapshot", "get url", "get title"]
+        );
     }
 
     #[test]
@@ -3775,6 +4223,10 @@ mod tests {
         assert_eq!(emitted_steps, 0);
         assert!(outcome.error.unwrap().contains("not executed"));
         assert_eq!(daemon.served.get(), 0);
+        assert_eq!(
+            *daemon.requests.borrow(),
+            vec!["snapshot", "get url", "get title"]
+        );
     }
 
     #[test]
@@ -3794,6 +4246,10 @@ mod tests {
         assert_eq!(outcome.status, "timeout");
         assert!(outcome.steps.is_empty());
         assert_eq!(daemon.served.get(), 0);
+        assert_eq!(
+            *daemon.requests.borrow(),
+            vec!["snapshot", "get url", "get title"]
+        );
     }
 
     #[test]
@@ -3920,6 +4376,8 @@ mod tests {
         let outcome = run_goal_loop(&cfg, &oracle, &daemon.runner(), |_| {});
         assert_eq!(outcome.status, "done");
         assert_eq!(*daemon.commands.borrow(), vec!["click @e4"]);
+        assert_eq!(daemon.requests.borrow().last().unwrap(), "get url");
+        assert_eq!(oracle.seen.borrow().len(), 2);
     }
 
     #[test]
@@ -3933,6 +4391,18 @@ mod tests {
         assert_eq!(outcome.status, "blocked");
         assert_eq!(*daemon.commands.borrow(), vec!["click @e4"]);
         assert!(outcome.error.unwrap().contains("1-step budget"));
+        assert_eq!(
+            *daemon.requests.borrow(),
+            vec![
+                "snapshot",
+                "get url",
+                "get title",
+                "click @e4",
+                "snapshot",
+                "get url",
+                "get title",
+            ]
+        );
     }
 
     #[test]
@@ -3964,6 +4434,10 @@ mod tests {
         );
         assert!(daemon.commands.borrow().is_empty());
         assert!(outcome.steps.is_empty());
+        assert_eq!(
+            *daemon.requests.borrow(),
+            vec!["snapshot", "get url", "get title"]
+        );
     }
 
     #[test]
@@ -3977,6 +4451,11 @@ mod tests {
         let outcome = run_goal_loop(&cfg, &oracle, &daemon.runner(), |_| {});
         assert_eq!(outcome.status, "timeout");
         assert!(daemon.commands.borrow().is_empty());
+        assert_eq!(
+            *daemon.requests.borrow(),
+            vec!["snapshot", "get url", "get title"],
+            "a late DONE is still rejected before the final URL read"
+        );
     }
 
     #[test]

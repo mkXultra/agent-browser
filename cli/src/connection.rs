@@ -1041,6 +1041,117 @@ pub fn send_command(cmd: Value, session: &str) -> Result<Response, String> {
     ))
 }
 
+/// Send one best-effort command from the synchronous CLI, without retrying.
+///
+/// Goal finalization uses this for its final URL read. One absolute deadline
+/// covers connecting, writing, reading, and parsing the response. Responses are
+/// limited to 64 KiB on the wire, including their newline. Parsing requires at
+/// least 10 ms left and checks the deadline while consuming bytes. Dropping the
+/// timed-out future closes its client socket; no worker or runtime is retained.
+pub fn send_command_before(
+    cmd: Value,
+    session: &str,
+    deadline: Instant,
+) -> Result<Response, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    if Instant::now() >= deadline {
+        return Err("Command deadline expired".to_string());
+    }
+    let mut request = serde_json::to_string(&cmd).map_err(|e| e.to_string())?;
+    request.push('\n');
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("Failed to create command runtime: {}", e))?;
+
+    let response_bytes = runtime.block_on(async {
+        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+            // Do not dispatch if preparing the request exhausted the budget.
+            if Instant::now() >= deadline {
+                return Err("Command deadline expired".to_string());
+            }
+            #[cfg(unix)]
+            let mut stream = tokio::net::UnixStream::connect(get_socket_path(session))
+                .await
+                .map_err(|e| format!("Failed to connect: {}", e))?;
+            #[cfg(windows)]
+            let mut stream = tokio::net::TcpStream::connect((
+                std::net::Ipv4Addr::LOCALHOST,
+                resolve_port(session),
+            ))
+            .await
+            .map_err(|e| format!("Failed to connect: {}", e))?;
+
+            stream
+                .write_all(request.as_bytes())
+                .await
+                .map_err(|e| format!("Failed to send: {}", e))?;
+            // One extra byte distinguishes an oversized response from a valid
+            // response exactly at the limit. No read or allocation can grow
+            // beyond this fixed buffer, even if the daemon never sends a newline.
+            let mut response = vec![0; MAX_DEADLINE_RESPONSE_BYTES + 1];
+            let mut used = 0;
+            loop {
+                let count = stream
+                    .read(&mut response[used..])
+                    .await
+                    .map_err(|e| format!("Failed to read: {}", e))?;
+                let newline = response[used..used + count]
+                    .iter()
+                    .position(|byte| *byte == b'\n');
+                used += newline.map_or(count, |offset| offset + 1);
+                if used > MAX_DEADLINE_RESPONSE_BYTES {
+                    return Err("Command response exceeds 64 KiB limit".to_string());
+                }
+                if newline.is_some() || count == 0 {
+                    response.truncate(used);
+                    return Ok(response);
+                }
+            }
+        })
+        .await
+        .map_err(|_| "Command deadline expired".to_string())?
+    })?;
+    // Parsing is synchronous and cannot be cancelled by Tokio's timeout. Keep
+    // it outside that future and bound both its input and its remaining budget.
+    parse_response_before(&response_bytes, deadline)
+}
+
+const MAX_DEADLINE_RESPONSE_BYTES: usize = 64 * 1024;
+const DEADLINE_RESPONSE_PARSE_RESERVE: Duration = Duration::from_millis(10);
+
+struct DeadlineResponseReader<'a> {
+    bytes: &'a [u8],
+    deadline: Instant,
+}
+
+impl Read for DeadlineResponseReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if Instant::now() >= self.deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Command deadline expired",
+            ));
+        }
+        self.bytes.read(buffer)
+    }
+}
+
+fn parse_response_before(bytes: &[u8], deadline: Instant) -> Result<Response, String> {
+    if deadline.saturating_duration_since(Instant::now()) < DEADLINE_RESPONSE_PARSE_RESERVE {
+        return Err("Command deadline expired".to_string());
+    }
+    // serde_json's reader consumes bytes through Read, allowing deadline checks
+    // during parsing instead of only before and after an uninterruptible parse.
+    // The wire limit also bounds Value allocations and cleanup on any error.
+    let response = serde_json::from_reader(DeadlineResponseReader { bytes, deadline });
+    if Instant::now() >= deadline {
+        return Err("Command deadline expired".to_string());
+    }
+    response.map_err(|e| format!("Invalid response: {}", e))
+}
+
 /// Check if an error is transient and worth retrying against the SAME daemon.
 /// Transient errors include:
 /// - EAGAIN/EWOULDBLOCK (os error 35 on macOS, 11 on Linux)
@@ -1129,6 +1240,317 @@ fn send_command_once(cmd: &Value, session: &str) -> Result<Response, String> {
 mod tests {
     use super::*;
     use crate::test_utils::EnvGuard;
+
+    #[cfg(unix)]
+    fn with_deadline_socket(test: impl FnOnce(std::os::unix::net::UnixListener)) {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_NAMESPACE"]);
+        // Keep the Unix socket path below macOS's length limit.
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
+        guard.remove("AGENT_BROWSER_NAMESPACE");
+        let listener =
+            std::os::unix::net::UnixListener::bind(get_socket_path("bounded-url")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        test(listener);
+    }
+
+    #[cfg(unix)]
+    fn accept_deadline_request(listener: &std::os::unix::net::UnixListener) -> (UnixStream, Value) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("Failed to accept test request: {}", error),
+            }
+        };
+        // BSD/macOS may inherit O_NONBLOCK from the listening socket. This
+        // helper deliberately uses a blocking request read with a timeout.
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut request = String::new();
+        BufReader::new(&mut stream).read_line(&mut request).unwrap();
+        (stream, serde_json::from_str(&request).unwrap())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_url_read_returns_daemon_response() {
+        with_deadline_socket(|listener| {
+            let server = thread::spawn(move || {
+                let (mut stream, request) = accept_deadline_request(&listener);
+                assert_eq!(request, json!({ "action": "url" }));
+                stream
+                    .write_all(
+                        b"{\"success\":true,\"data\":{\"url\":\"https://example.com/new\"}}\n",
+                    )
+                    .unwrap();
+            });
+            let response = send_command_before(
+                json!({ "action": "url" }),
+                "bounded-url",
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap();
+            server.join().unwrap();
+            assert!(response.success);
+            assert_eq!(response.data.unwrap()["url"], "https://example.com/new");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_url_read_rejects_expired_deadline_without_connecting() {
+        with_deadline_socket(|listener| {
+            let error = send_command_before(
+                json!({ "action": "url" }),
+                "bounded-url",
+                Instant::now() - Duration::from_millis(1),
+            )
+            .err()
+            .unwrap();
+            assert_eq!(error, "Command deadline expired");
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_url_read_propagates_connect_error() {
+        with_deadline_socket(|listener| {
+            drop(listener);
+            let error = send_command_before(
+                json!({ "action": "url" }),
+                "bounded-url",
+                Instant::now() + Duration::from_secs(1),
+            )
+            .err()
+            .unwrap();
+            assert!(error.starts_with("Failed to connect:"), "{}", error);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_url_read_does_not_retry_eof_or_invalid_response() {
+        for reply in ["", "not-json\n"] {
+            with_deadline_socket(|listener| {
+                let server = thread::spawn(move || {
+                    let (mut stream, _) = accept_deadline_request(&listener);
+                    stream.write_all(reply.as_bytes()).unwrap();
+                    drop(stream);
+                    listener
+                });
+                let error = send_command_before(
+                    json!({ "action": "url" }),
+                    "bounded-url",
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .err()
+                .unwrap();
+                let listener = server.join().unwrap();
+                assert!(error.starts_with("Invalid response:"), "{}", error);
+                assert_eq!(
+                    listener.accept().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock,
+                    "the failed URL read must not be sent again"
+                );
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_url_read_deadline_covers_hung_and_trickled_responses() {
+        for trickle in [false, true] {
+            with_deadline_socket(|listener| {
+                let (stop, stopped) = std::sync::mpsc::channel();
+                let server = thread::spawn(move || {
+                    let (mut stream, _) = accept_deadline_request(&listener);
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while Instant::now() < deadline && stopped.try_recv().is_err() {
+                        if trickle && stream.write_all(b" ").is_err() {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    listener
+                });
+                let started = Instant::now();
+                let error = send_command_before(
+                    json!({ "action": "url" }),
+                    "bounded-url",
+                    started + Duration::from_millis(100),
+                )
+                .err()
+                .unwrap();
+                let elapsed = started.elapsed();
+                let _ = stop.send(());
+                let listener = server.join().unwrap();
+                assert_eq!(error, "Command deadline expired");
+                assert!(elapsed < Duration::from_secs(1), "elapsed: {:?}", elapsed);
+                assert_eq!(
+                    listener.accept().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock,
+                    "deadline expiry must not retry the URL read"
+                );
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_deadline_socket_closed(stream: &mut UnixStream) {
+        let mut byte = [0];
+        match stream.read(&mut byte) {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                ) => {}
+            result => panic!("final URL client socket must be closed: {:?}", result),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_url_read_accepts_response_at_wire_limit() {
+        with_deadline_socket(|listener| {
+            let envelope = "{\"success\":true,\"data\":{\"url\":\"\"}}\n";
+            let url = "x".repeat(MAX_DEADLINE_RESPONSE_BYTES - envelope.len());
+            let reply = format!("{{\"success\":true,\"data\":{{\"url\":\"{}\"}}}}\n", url);
+            assert_eq!(reply.len(), MAX_DEADLINE_RESPONSE_BYTES);
+            let server = thread::spawn(move || {
+                let (mut stream, _) = accept_deadline_request(&listener);
+                stream.write_all(reply.as_bytes()).unwrap();
+                assert_deadline_socket_closed(&mut stream);
+            });
+            let response = send_command_before(
+                json!({ "action": "url" }),
+                "bounded-url",
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap();
+            server.join().unwrap();
+            assert!(response.success);
+            assert_eq!(response.data.unwrap()["url"], url);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_url_read_rejects_complete_and_unterminated_oversized_responses() {
+        for complete in [true, false] {
+            with_deadline_socket(|listener| {
+                let server = thread::spawn(move || {
+                    let (mut stream, _) = accept_deadline_request(&listener);
+                    let mut reply = format!(
+                        "{{\"success\":true,\"data\":{{\"url\":\"{}",
+                        "x".repeat(MAX_DEADLINE_RESPONSE_BYTES * 4)
+                    );
+                    if complete {
+                        reply.push_str("\"}}\n");
+                    }
+                    // The bounded client may close while the oversized reply
+                    // is still being written. Both write outcomes are valid.
+                    let _ = stream.write_all(reply.as_bytes());
+                    assert_deadline_socket_closed(&mut stream);
+                    listener
+                });
+                let started = Instant::now();
+                let error = send_command_before(
+                    json!({ "action": "url" }),
+                    "bounded-url",
+                    started + Duration::from_secs(1),
+                )
+                .err()
+                .unwrap();
+                let elapsed = started.elapsed();
+                let listener = server.join().unwrap();
+                assert_eq!(error, "Command response exceeds 64 KiB limit");
+                assert!(elapsed < Duration::from_secs(1), "elapsed: {:?}", elapsed);
+                assert_eq!(
+                    listener.accept().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock,
+                    "oversized responses must not retry the URL read"
+                );
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_url_read_rejects_response_arriving_without_parse_budget() {
+        with_deadline_socket(|listener| {
+            let started = Instant::now();
+            let deadline = started + Duration::from_millis(150);
+            let server = thread::spawn(move || {
+                let (mut stream, _) = accept_deadline_request(&listener);
+                let release = deadline - DEADLINE_RESPONSE_PARSE_RESERVE / 2;
+                thread::sleep(release.saturating_duration_since(Instant::now()));
+                let _ = stream.write_all(
+                    b"{\"success\":true,\"data\":{\"url\":\"https://example.com/new\"}}\n",
+                );
+                assert_deadline_socket_closed(&mut stream);
+                listener
+            });
+            let error = send_command_before(json!({ "action": "url" }), "bounded-url", deadline)
+                .err()
+                .unwrap();
+            let elapsed = started.elapsed();
+            let listener = server.join().unwrap();
+            assert_eq!(error, "Command deadline expired");
+            assert!(elapsed < Duration::from_secs(1), "elapsed: {:?}", elapsed);
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "a near-deadline response must not retry the URL read"
+            );
+        });
+    }
+
+    #[test]
+    fn bounded_url_read_checks_parse_reserve_before_consuming_json() {
+        let error = parse_response_before(
+            b"deliberately invalid JSON",
+            Instant::now() + DEADLINE_RESPONSE_PARSE_RESERVE / 2,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error, "Command deadline expired");
+    }
+
+    #[test]
+    fn bounded_url_read_parser_checks_deadline_while_consuming_bytes() {
+        let mut reader = DeadlineResponseReader {
+            bytes: b"{}",
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        let mut byte = [0];
+        assert_eq!(reader.read(&mut byte).unwrap(), 1);
+        assert_eq!(byte, [b'{']);
+        reader.deadline = Instant::now() - Duration::from_millis(1);
+        assert_eq!(
+            reader.read(&mut byte).unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        assert_eq!(reader.bytes, b"}");
+    }
 
     #[test]
     fn long_mouse_movement_gets_its_requested_time_budget() {

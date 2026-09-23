@@ -47,6 +47,12 @@ impl WebDriverBackend {
     pub fn new(client: super::client::WebDriverClient) -> Self {
         Self { client }
     }
+
+    /// Read the existing session's URL for goal completion without recovery.
+    /// The absolute deadline and response cap cover transport and decoding.
+    pub async fn get_url_before(&self, deadline: std::time::Instant) -> Result<String, String> {
+        self.client.get_url_before(deadline).await
+    }
 }
 
 #[async_trait]

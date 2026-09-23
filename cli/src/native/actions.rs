@@ -2577,6 +2577,11 @@ fn policy_actions_for_command(
 
 pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     let action = cmd.get("action").and_then(|v| v.as_str()).unwrap_or("");
+    // A goal's completion read must only observe the browser already in this
+    // session. In particular, skip recovery, target discovery and session
+    // changes that could replace the final page with a newly opened blank tab.
+    let existing_browser_only =
+        action == "url" && cmd.get("existingBrowserOnly").and_then(Value::as_bool) == Some(true);
     // Unlike normal auth login, no-navigation mode must never launch a
     // browser or manufacture an about:blank page to satisfy the command.
     let auth_login_no_navigate = action == "auth_login"
@@ -2584,8 +2589,10 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
             .get("noNavigate")
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
-    if let Some(mode @ ("instant" | "smooth" | "human")) =
-        cmd.get("defaultInputMode").and_then(Value::as_str)
+    if let Some(mode @ ("instant" | "smooth" | "human")) = cmd
+        .get("defaultInputMode")
+        .filter(|_| !existing_browser_only)
+        .and_then(Value::as_str)
     {
         // Only an explicit session setting persists. inputMode is an override
         // for this command, including --human and MCP's human argument.
@@ -2622,6 +2629,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     if let Some(ref server) = state.stream_server {
         let mut broadcast_cmd;
         let has_internal_fields = cmd.get("plugins").is_some()
+            || cmd.get("existingBrowserOnly").is_some()
             || cmd.get("pinTab").is_some()
             || cmd.get("restoreKey").is_some()
             || cmd.get("restoreSave").is_some()
@@ -2632,6 +2640,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
             broadcast_cmd = cmd.clone();
             if let Some(obj) = broadcast_cmd.as_object_mut() {
                 obj.remove("plugins");
+                obj.remove("existingBrowserOnly");
                 obj.remove("pinTab");
                 obj.remove("restoreKey");
                 obj.remove("restoreSave");
@@ -2647,8 +2656,10 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     }
 
     // Drain and apply pending CDP events (console, errors, screencast frames, target lifecycle)
-    if let Err(e) = state.drain_cdp_events_background().await {
-        return error_response(&id, &super::browser::to_ai_friendly_error(&e));
+    if !existing_browser_only {
+        if let Err(e) = state.drain_cdp_events_background().await {
+            return error_response(&id, &super::browser::to_ai_friendly_error(&e));
+        }
     }
 
     // Keep element resolution in sync with the `frame` selection (see
@@ -2660,7 +2671,11 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     // disables a sticky pin restored from disk or enabled earlier. Both are
     // persisted with the binding so the setting survives daemon restarts;
     // absence of the field leaves the current state untouched.
-    match cmd.get("pinTab").and_then(|v| v.as_bool()) {
+    match cmd
+        .get("pinTab")
+        .filter(|_| !existing_browser_only)
+        .and_then(Value::as_bool)
+    {
         Some(pin) if pin != state.pin_tab => {
             // Persist the pinned state before committing it to live state, so a
             // load/save failure leaves the daemon exactly as it was instead of
@@ -2708,7 +2723,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     let restore_key_change_needs_launch = !skip_launch
         && command_changes_restore_key(cmd, state)
         && has_active_browser_session(state);
-    let needs_launch = if !skip_launch && !auth_login_no_navigate {
+    let needs_launch = if !skip_launch && !auth_login_no_navigate && !existing_browser_only {
         // Check if existing connection is stale and needs re-launch.
         // This must happen before policy evaluation so plugin capability
         // actions are gated when recovery relaunches would invoke plugins.
@@ -2792,6 +2807,49 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
                 }
             }
         }
+    }
+
+    if existing_browser_only {
+        // Retain the ordinary URL policy checks above, but leave before any
+        // restore switch, launch, ensure_page, post-action drain or discovery.
+        // The live read itself fails if its browser, target or connection has
+        // disappeared; it must never recover by opening a replacement.
+        let result = if command_changes_restore_key(cmd, state) {
+            Err("Completion URL read cannot switch restore sessions".to_string())
+        } else if cmd
+            .get("pinTab")
+            .and_then(Value::as_bool)
+            .is_some_and(|pin| pin != state.pin_tab)
+        {
+            Err("Completion URL read cannot change the pinned tab setting".to_string())
+        } else if state
+            .browser
+            .as_mut()
+            .is_some_and(BrowserManager::has_process_exited)
+        {
+            Err("Browser has exited".to_string())
+        } else {
+            // Share one deadline with the completion-specific WebDriver
+            // transport and parser. An outer async timeout alone cannot bound
+            // a complete response's synchronous JSON work while holding state.
+            // The client independently clips its cap to the remaining goal
+            // budget, which may be shorter than this daemon-side ceiling.
+            let deadline =
+                cmd_start + std::time::Duration::from_millis(crate::goal::FINAL_URL_TIMEOUT_MS);
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                handle_completion_url(state, deadline),
+            )
+            .await
+            .unwrap_or_else(|_| Err("Completion URL read timed out".to_string()))
+        };
+        let mut resp = match result {
+            Ok(data) => success_response(&id, data),
+            Err(error) => error_response(&id, &super::browser::to_ai_friendly_error(&error)),
+        };
+        attach_tab_gone_data(&mut resp, state);
+        inject_lifecycle(&mut resp, state, true, false, false);
+        return resp;
     }
 
     let restore_transition_closed_browser = match async {
@@ -5361,6 +5419,23 @@ async fn handle_url(state: &DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let url = mgr.get_url().await?;
     Ok(json!({ "url": url }))
+}
+
+/// Read completion metadata from the existing backend without changing the
+/// ordinary URL command. WebDriver must bound its own response and synchronous
+/// parsing as well as network waits, so a late reply releases shared daemon
+/// state promptly. CDP retains the existing live URL read and outer deadline.
+async fn handle_completion_url(
+    state: &DaemonState,
+    deadline: std::time::Instant,
+) -> Result<Value, String> {
+    if state.browser.is_none() {
+        if let Some(ref wb) = state.webdriver_backend {
+            let url = wb.get_url_before(deadline).await?;
+            return Ok(json!({ "url": url }));
+        }
+    }
+    handle_url(state).await
 }
 
 async fn handle_read(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
@@ -14633,6 +14708,300 @@ mod tests {
             .unwrap()
             .contains("Browser not launched"));
         assert!(state.browser.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_completion_url_without_browser_does_not_launch_or_connect() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_CDP", "AGENT_BROWSER_AUTO_CONNECT"]);
+        guard.set("AGENT_BROWSER_CDP", "invalid-cdp-target");
+        guard.set("AGENT_BROWSER_AUTO_CONNECT", "1");
+        let mut state = DaemonState::new();
+        state.session_name = Some("existing-restore".to_string());
+        state.restore_status = "loaded".to_string();
+        state.restore_validation_pending = true;
+        let cmd = json!({
+            "action": "url", "id": "completion-no-browser", "existingBrowserOnly": true,
+            "restoreKey": "existing-restore",
+            "plugins": [{"name": "must-not-run", "command": "missing-completion-plugin", "capabilities": ["launch.mutate"]}]
+        });
+
+        let resp = execute_command(&cmd, &mut state).await;
+
+        assert_eq!(resp["success"], false);
+        assert_eq!(resp["error"], "Browser not launched");
+        assert!(state.browser.is_none());
+        assert!(state.webdriver_backend.is_none());
+        assert!(state.active_provider_session.is_none());
+        assert!(state.pending_confirmation.is_none());
+        assert!(state.restore_validation_pending);
+        assert_eq!(state.restore_status, "loaded");
+        assert!(state.last_command_finished.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_completion_url_rejects_session_changes_without_applying_them() {
+        let mut state = DaemonState::new();
+        state.session_name = Some("existing-restore".to_string());
+        state.restore_status = "loaded".to_string();
+        state.pin_tab = true;
+        for (extra, expected) in [
+            (
+                json!({ "restoreKey": "other-restore" }),
+                "Completion URL read cannot switch restore sessions",
+            ),
+            (
+                json!({ "pinTab": false }),
+                "Completion URL read cannot change the pinned tab setting",
+            ),
+        ] {
+            let mut cmd = json!({
+                "action": "url", "id": "completion-session-change", "existingBrowserOnly": true
+            });
+            cmd.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let resp = execute_command(&cmd, &mut state).await;
+            assert_eq!(resp["success"], false);
+            assert_eq!(resp["error"], expected);
+            assert!(state.browser.is_none());
+            assert_eq!(state.session_name.as_deref(), Some("existing-restore"));
+            assert_eq!(state.restore_status, "loaded");
+            assert!(state.pin_tab);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_completion_url_preserves_policy_confirmation_without_launching() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy_path = dir.path().join("policy.json");
+        fs::write(&policy_path, r#"{"confirm":["url"]}"#).unwrap();
+        let mut state = DaemonState::new();
+        state.policy = Some(ActionPolicy::load(policy_path.to_str().unwrap()).unwrap());
+        let cmd = json!({
+            "action": "url", "id": "completion-confirm", "existingBrowserOnly": true
+        });
+
+        let resp = execute_command(&cmd, &mut state).await;
+
+        assert_eq!(resp["success"], true);
+        assert_eq!(resp["data"]["confirmation_required"], true);
+        assert_eq!(state.pending_confirmation.as_ref().unwrap().cmd, cmd);
+        assert!(state.browser.is_none());
+        assert!(state.webdriver_backend.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_completion_url_reads_existing_webdriver_once_without_browser_launch() {
+        let (port, server) = start_webdriver_response_server(vec![(
+            "/session/test-session/url",
+            json!({ "value": "https://example.com/final" }),
+        )])
+        .await;
+        let mut state = DaemonState::new();
+        state.backend_type = BackendType::WebDriver;
+        state.webdriver_backend = Some(WebDriverBackend::new(
+            crate::native::webdriver::client::WebDriverClient::new_with_session(
+                port,
+                "test-session".to_string(),
+            ),
+        ));
+        let resp = execute_command(
+            &json!({ "action": "url", "id": "completion-webdriver", "existingBrowserOnly": true }),
+            &mut state,
+        )
+        .await;
+
+        assert_eq!(resp["success"], true);
+        assert_eq!(resp["data"]["url"], "https://example.com/final");
+        assert_eq!(resp["data"]["lifecycle"]["reused"], true);
+        assert_eq!(resp["data"]["lifecycle"]["launched"], false);
+        assert_eq!(resp["data"]["lifecycle"]["relaunchedBrowser"], false);
+        assert!(state.browser.is_none());
+        assert_eq!(server.await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_completion_url_dead_webdriver_does_not_replace_session() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut state = DaemonState::new();
+        state.backend_type = BackendType::WebDriver;
+        state.webdriver_backend = Some(WebDriverBackend::new(
+            crate::native::webdriver::client::WebDriverClient::new_with_session(
+                port,
+                "dead-session".to_string(),
+            ),
+        ));
+        let resp = execute_command(
+            &json!({ "action": "url", "id": "completion-dead-webdriver", "existingBrowserOnly": true }),
+            &mut state,
+        )
+        .await;
+
+        assert_eq!(resp["success"], false);
+        assert!(state.browser.is_none());
+        assert!(state.webdriver_backend.is_some());
+        assert!(state.active_provider_session.is_none());
+        assert!(state.last_command_finished.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_completion_url_stalled_webdriver_times_out_and_closes_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 1024];
+            while !request.ends_with(b"\r\n\r\n") {
+                let n = stream.read(&mut buf).await.unwrap();
+                assert!(n > 0, "URL request must arrive before disconnect");
+                request.extend_from_slice(&buf[..n]);
+                assert!(request.len() <= 4096, "only one URL request is expected");
+            }
+            assert!(String::from_utf8(request)
+                .unwrap()
+                .starts_with("GET /session/stalled-session/url HTTP/1.1\r\n"));
+            // Keep the response open indefinitely. Cancellation must drop the
+            // client's HTTP stream instead of leaving an orphaned read task.
+            let closed =
+                tokio::time::timeout(std::time::Duration::from_secs(3), stream.read(&mut buf))
+                    .await
+                    .expect("completion timeout must close the WebDriver connection");
+            assert!(
+                matches!(closed, Ok(0))
+                    || matches!(closed, Err(ref error) if matches!(error.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::BrokenPipe)),
+                "completion must close the backend socket without another request: {closed:?}"
+            );
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept(),)
+                    .await
+                    .is_err(),
+                "completion must not open a replacement connection"
+            );
+        });
+        let mut state = DaemonState::new();
+        state.backend_type = BackendType::WebDriver;
+        state.webdriver_backend = Some(WebDriverBackend::new(
+            crate::native::webdriver::client::WebDriverClient::new_with_session(
+                port,
+                "stalled-session".to_string(),
+            ),
+        ));
+        let started = std::time::Instant::now();
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            execute_command(
+                &json!({ "action": "url", "id": "completion-stalled-webdriver", "existingBrowserOnly": true }),
+                &mut state,
+            ),
+        )
+        .await
+        .expect("completion lookup must have a daemon-side deadline");
+
+        assert_eq!(resp["success"], false);
+        assert!(resp["error"]
+            .as_str()
+            .unwrap()
+            .contains("Completion URL read timed out"));
+        assert!(
+            started.elapsed()
+                >= std::time::Duration::from_millis(crate::goal::FINAL_URL_TIMEOUT_MS)
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(state.browser.is_none());
+        assert!(state.webdriver_backend.is_some());
+        assert!(state.active_provider_session.is_none());
+        assert!(state.last_command_finished.is_none());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_completion_url_cdp_reads_once_and_never_recovers_missing_targets() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let methods = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server_methods = methods.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let cmd: Value = serde_json::from_str(&text).unwrap();
+                let method = cmd["method"].as_str().unwrap();
+                server_methods.lock().unwrap().push(method.to_string());
+                let result = if method == "Runtime.evaluate" {
+                    assert_eq!(cmd["params"]["expression"], "location.href");
+                    json!({ "result": { "type": "string", "value": "https://example.com/final" } })
+                } else {
+                    json!({})
+                };
+                ws.send(Message::Text(
+                    json!({ "id": cmd["id"], "result": result }).to_string(),
+                ))
+                .await
+                .unwrap();
+            }
+        });
+        let mut state = DaemonState::new();
+        state.browser = Some(
+            BrowserManager::connect_cdp_direct(&format!("ws://{addr}"))
+                .await
+                .unwrap(),
+        );
+        methods.lock().unwrap().clear();
+        let cmd = json!({ "action": "url", "id": "completion-cdp", "existingBrowserOnly": true });
+
+        let resp = execute_command(&cmd, &mut state).await;
+        assert_eq!(resp["success"], true);
+        assert_eq!(resp["data"]["url"], "https://example.com/final");
+        assert_eq!(resp["data"]["lifecycle"]["launched"], false);
+        assert_eq!(resp["data"]["lifecycle"]["relaunchedBrowser"], false);
+        assert_eq!(*methods.lock().unwrap(), vec!["Runtime.evaluate"]);
+
+        // A disconnected manager must remain the same manager, without even a
+        // liveness probe that could trigger the ordinary recovery path.
+        let client = state.browser.as_ref().unwrap().client.clone();
+        client.close().await;
+        let resp = execute_command(&cmd, &mut state).await;
+        assert_eq!(resp["success"], false);
+        assert!(resp["error"].as_str().unwrap().contains("closed"));
+        assert!(Arc::ptr_eq(
+            &client,
+            &state.browser.as_ref().unwrap().client
+        ));
+        assert_eq!(*methods.lock().unwrap(), vec!["Runtime.evaluate"]);
+
+        // A browser with no selected page must not create a target. A pinned
+        // missing target must likewise stay missing until explicit recovery.
+        let page = state.browser.as_ref().unwrap().pages_list()[0].clone();
+        state
+            .browser
+            .as_mut()
+            .unwrap()
+            .remove_page_by_target_id("provider-page");
+        let resp = execute_command(&cmd, &mut state).await;
+        assert_eq!(resp["success"], false);
+        assert_eq!(state.browser.as_ref().unwrap().page_count(), 0);
+        state.browser.as_mut().unwrap().add_page(page);
+        state.browser.as_mut().unwrap().set_pin_tab(true);
+        state.pin_tab = true;
+        state
+            .browser
+            .as_mut()
+            .unwrap()
+            .remove_page_by_target_id("provider-page");
+        let resp = execute_command(&cmd, &mut state).await;
+        assert_eq!(resp["code"], "tab_gone");
+        assert!(state.browser.as_ref().unwrap().bound_target_is_gone());
+        assert_eq!(*methods.lock().unwrap(), vec!["Runtime.evaluate"]);
+        server.abort();
     }
 
     #[tokio::test]

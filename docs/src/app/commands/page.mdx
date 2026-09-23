@@ -596,7 +596,7 @@ Goal-specific options:
     </tr>
     <tr>
       <td><code>--timeout &lt;ms&gt;</code></td>
-      <td>Time budget in milliseconds (default: 120000)</td>
+      <td>Time budget in milliseconds (default: 120000), including the final URL read of up to 1000 ms within the remaining budget</td>
     </tr>
     <tr>
       <td><code>--eval-model &lt;model&gt;</code></td>
@@ -610,6 +610,10 @@ Goal-specific options:
 </table>
 
 `--debug` additionally writes every model request and reply to stderr, which is the quickest way to see what the model was offered on a step that went wrong. The `--json` result carries the selected `provider`, `model`, and `textModel`, plus `status` (`done`, `blocked`, `denied`, `timeout`, `confirmation_required`, or `error`), the final `url`, `elapsedMs`, pending confirmation fields when applicable, and one entry per executed step with the operation, the target ref, role and name, any typed text, the target probability, the model's confidence, the operation distribution, and per-phase timings.
+
+On `DONE`, the final `url` is refreshed through one `get url` read, bounded to 1000 ms or the remaining goal time budget, whichever is smaller. If the read fails, times out, or returns no usable URL, the result keeps `status: "done"` and the last observed URL. A missing live browser/page, an oversized response, or a launch/relaunch lifecycle result also falls back. The read never launches or replaces a browser, creates a tab, retries, respawns the daemon, or prompts. Step URLs remain the observations recorded at those steps. This read does not wait for navigation to finish; a route change can still occur afterward. The MCP `agent_browser_goal` tool returns the same result.
+
+The completion read caps the daemon reply at 64 KiB. With WebDriver, its backend URL read also has a 1000 ms deadline and a 64 KiB cap on the entire HTTP response, including headers and chunk framing. Both paths require at least 10 ms remaining before JSON parsing and check the deadline while parsing. Oversized or late backend responses close the connection and release the daemon for subsequent commands. These completion limits do not change standalone `get url` behavior.
 
 ## Navigation
 

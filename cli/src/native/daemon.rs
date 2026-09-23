@@ -677,6 +677,257 @@ mod tests {
     #[allow(unused_imports)]
     use super::*;
 
+    /// Exercise the actual per-connection executor and its shared state lock.
+    /// Keeping the first executor as a pinned future lets the fixture make a
+    /// complete response readable before resuming it, including after its
+    /// deadline. A timeout around an otherwise unbounded read can still poll
+    /// that ready inner future to completion before checking its timer.
+    async fn completion_webdriver_failure_releases_daemon(near_deadline: bool) {
+        use crate::native::actions::BackendType;
+        use crate::native::webdriver::{backend::WebDriverBackend, client::WebDriverClient};
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (request_seen_tx, request_seen_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (response_written_tx, response_written_rx) = tokio::sync::oneshot::channel();
+        let (no_retry_tx, no_retry_rx) = tokio::sync::oneshot::channel();
+        let backend_server = tokio::spawn(async move {
+            async fn read_request(stream: &mut tokio::net::TcpStream) {
+                let mut request = Vec::new();
+                let mut bytes = [0; 1024];
+                while !request.ends_with(b"\r\n\r\n") {
+                    let count = stream.read(&mut bytes).await.unwrap();
+                    assert!(count > 0, "expected a complete WebDriver request");
+                    request.extend_from_slice(&bytes[..count]);
+                    assert!(request.len() < 4096, "unexpected extra WebDriver request");
+                }
+                assert!(String::from_utf8(request)
+                    .unwrap()
+                    .starts_with("GET /session/completion-daemon/url HTTP/1.1\r\n"));
+            }
+
+            async fn write_response(stream: &mut tokio::net::TcpStream, body: &str) {
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    stream.write_all(response.as_bytes()),
+                )
+                .await
+                .expect("the complete fixture response must fit in the socket")
+                .unwrap();
+                // The complete response must be written, but its reader may
+                // already have closed before our local write-half shutdown.
+                let _ = stream.shutdown().await;
+            }
+
+            async fn assert_backend_closed(stream: &mut tokio::net::TcpStream) {
+                let closed = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut [0]))
+                    .await
+                    .expect("completion must promptly release its backend socket");
+                assert!(
+                    matches!(closed, Ok(0))
+                        || matches!(closed, Err(ref error) if matches!(error.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::BrokenPipe)),
+                    "completion must close the socket without another request: {closed:?}"
+                );
+            }
+
+            let (mut first, _) = listener.accept().await.unwrap();
+            read_request(&mut first).await;
+            request_seen_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            let body = if near_deadline {
+                serde_json::json!({ "value": "https://example.com/too-late" }).to_string()
+            } else {
+                // This valid, complete JSON exceeds the wire cap without
+                // relying on an endless stream or on a malformed body. Keep
+                // it just over the cap to fit portable TCP fixture buffers.
+                serde_json::json!({ "value": "https://example.com/".to_string() + &"x".repeat(64 * 1024) }).to_string()
+            };
+            write_response(&mut first, &body).await;
+            response_written_tx.send(()).unwrap();
+            assert_backend_closed(&mut first).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                    .await
+                    .is_err(),
+                "failed completion must not retry or create another backend session"
+            );
+            no_retry_tx.send(()).unwrap();
+
+            let (mut next, _) = listener.accept().await.unwrap();
+            read_request(&mut next).await;
+            write_response(&mut next, r#"{"value":"https://example.com/next"}"#).await;
+            assert_backend_closed(&mut next).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                    .await
+                    .is_err(),
+                "only the two explicitly requested URL reads are allowed"
+            );
+        });
+
+        let mut initial = DaemonState::new();
+        initial.backend_type = BackendType::WebDriver;
+        initial.webdriver_backend = Some(WebDriverBackend::new(WebDriverClient::new_with_session(
+            port,
+            "completion-daemon".to_string(),
+        )));
+        initial.session_id = "completion-daemon".to_string();
+        initial.session_name = None;
+        initial.policy = None;
+        initial.confirm_actions = None;
+        let state = Arc::new(tokio::sync::Mutex::new(initial));
+        let activity = Arc::new(IdleActivity::new());
+        let close_notify = Arc::new(Notify::new());
+        let (mut first_client, first_daemon) = tokio::io::duplex(8192);
+        first_client
+            .write_all(b"{\"action\":\"url\",\"id\":\"completion\",\"existingBrowserOnly\":true}\n")
+            .await
+            .unwrap();
+        let completion = handle_connection(
+            first_daemon,
+            state.clone(),
+            activity.clone(),
+            None,
+            close_notify.clone(),
+        );
+        tokio::pin!(completion);
+        let start = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                _ = &mut completion => panic!("completion connection exited before the backend request"),
+                seen = request_seen_rx => seen.unwrap(),
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            state.try_lock().is_err(),
+            "completion must hold daemon state during the read"
+        );
+
+        let (mut queued_client, queued_daemon) = tokio::io::duplex(8192);
+        let queued = tokio::spawn(handle_connection(
+            queued_daemon,
+            state.clone(),
+            activity,
+            None,
+            close_notify,
+        ));
+        queued_client
+            .write_all(b"{\"action\":\"session_info\",\"id\":\"queued\"}\n")
+            .await
+            .unwrap();
+        let mut queued_client = BufReader::new(queued_client);
+        let mut queued_response = String::new();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                queued_client.read_line(&mut queued_response),
+            )
+            .await
+            .is_err(),
+            "the second connection must queue behind the first command's state lock"
+        );
+
+        if near_deadline {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(
+                start + Duration::from_millis(crate::goal::FINAL_URL_TIMEOUT_MS - 5),
+            ))
+            .await;
+        }
+        release_tx.send(()).unwrap();
+        response_written_rx.await.unwrap();
+        // Give the reactor a turn while the completion future remains
+        // unpolled. In the deadline case this deliberately resumes after the
+        // budget with a complete response already ready to read and parse.
+        tokio::time::sleep(Duration::from_millis(if near_deadline { 20 } else { 1 })).await;
+        let resumed = std::time::Instant::now();
+        let mut first_client = BufReader::new(first_client);
+        let mut response = String::new();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                _ = &mut completion => panic!("completion connection exited before sending its response"),
+                result = first_client.read_line(&mut response) => { result.unwrap(); },
+            }
+            queued_client.read_line(&mut queued_response).await.unwrap();
+        })
+        .await
+        .expect("fallback must release daemon state for the queued command");
+        assert!(resumed.elapsed() < Duration::from_millis(500));
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["success"], false, "{response}");
+        let error = response["error"].as_str().unwrap();
+        if near_deadline {
+            assert!(error.contains("Completion URL read timed out"), "{error}");
+        } else {
+            assert!(error.contains("64 KiB"), "{error}");
+            assert!(start.elapsed() < Duration::from_millis(500));
+        }
+        let queued_response: Value = serde_json::from_str(&queued_response).unwrap();
+        assert_eq!(queued_response["success"], true);
+        assert_eq!(queued_response["data"]["session"], "completion-daemon");
+        assert_eq!(queued_response["data"]["browserLaunched"], false);
+        no_retry_rx.await.unwrap();
+
+        // An explicit later URL command must still reach the original
+        // WebDriver session, proving both lock and backend remain usable.
+        queued_client
+            .get_mut()
+            .write_all(b"{\"action\":\"url\",\"id\":\"next\",\"existingBrowserOnly\":true}\n")
+            .await
+            .unwrap();
+        let mut next_response = String::new();
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            queued_client.read_line(&mut next_response),
+        )
+        .await
+        .expect("subsequent URL commands must remain available")
+        .unwrap();
+        let next_response: Value = serde_json::from_str(&next_response).unwrap();
+        assert_eq!(next_response["success"], true);
+        assert_eq!(next_response["data"]["url"], "https://example.com/next");
+        assert_eq!(next_response["data"]["lifecycle"]["launched"], false);
+        assert_eq!(
+            next_response["data"]["lifecycle"]["relaunchedBrowser"],
+            false
+        );
+        {
+            let state = state.lock().await;
+            assert!(state.browser.is_none());
+            assert!(state.webdriver_backend.is_some());
+            assert!(matches!(state.backend_type, BackendType::WebDriver));
+            assert!(state.pending_confirmation.is_none());
+            assert!(state.last_command_finished.is_none());
+        }
+        drop(first_client);
+        tokio::time::timeout(Duration::from_secs(1), &mut completion)
+            .await
+            .unwrap();
+        drop(queued_client);
+        queued.await.unwrap();
+        backend_server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_completion_webdriver_oversized_response_releases_daemon() {
+        completion_webdriver_failure_releases_daemon(false).await;
+    }
+
+    #[tokio::test]
+    async fn test_completion_webdriver_ready_response_after_deadline_releases_daemon() {
+        completion_webdriver_failure_releases_daemon(true).await;
+    }
+
     #[test]
     fn test_resolve_idle_timeout_unset_applies_default() {
         let t = resolve_idle_timeout(None).expect("default should apply when unset");

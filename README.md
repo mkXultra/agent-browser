@@ -1093,6 +1093,7 @@ This is useful for multimodal AI models that can reason about visual layout, unl
 | `--no-auto-dialog` | Disable automatic dismissal of `alert`/`beforeunload` dialogs (or `AGENT_BROWSER_NO_AUTO_DIALOG` env) |
 | `--model <name>` | AI model for chat command (or `AI_GATEWAY_MODEL` env) |
 | `--max-steps <n>` | Action budget for the goal command (default: 40) |
+| `--timeout <ms>` | Goal time budget (default: 120000 ms), including the final URL read of up to 1000 ms within the remaining budget |
 | `--eval-model <model>` | Evaluation model for goal; overrides `AGENT_BROWSER_GOAL_MODEL`, then `goal.evalModel` config |
 | `--text-model <model>` | Text model for goal `TYPE_TEXT`; overrides `AGENT_BROWSER_GOAL_TEXT_MODEL`, then `goal.textModel` config |
 | `-v`, `--verbose` | Show tool commands and their raw output (chat) |
@@ -1214,6 +1215,10 @@ agent-browser --json goal "Accept the cookie banner"         # Every step with t
 ```
 
 Every action runs through the normal command pipeline (`click @eN`, `fill @eN`, `scroll`, `wait`), so action policies, `--confirm-actions`, `--allowed-domains`, and session isolation apply unchanged. Without `--confirm-interactive`, a pending action stops the run with `status: "confirmation_required"` and actionable confirmation data. With that flag, a TTY uses the normal prompt; non-TTY stdin retains the CLI's documented auto-denial and goal returns `status: "denied"`. A denial or an approval received after the goal deadline never dispatches or records the pending action. The run stops on `DONE`, `BLOCKED`, the step budget, the time budget, or three consecutive actions without DOM, URL, or measured scroll progress, and exits `0` only on `DONE`. The model gets one terminal assessment after the last allowed action but cannot execute another action. The time budget covers model requests, settling, observations, and action dispatch as far as each underlying operation permits. `DONE` is the model's opinion, not proof: verify the outcome with `snapshot`, `get url`, or a screenshot. Start from a page that is already open; `goal` does not navigate on its own, and it does not see inside iframes, shadow roots, or canvas.
+
+On `DONE`, the final `url` comes from one fresh `get url` read, bounded to 1000 ms or the remaining goal time budget, whichever is smaller. A failed, timed-out, oversized, or unusable read keeps `status: "done"` and the last observed URL. The read only uses the existing browser and page; it never launches or replaces a browser, creates a tab, retries, respawns the daemon, or prompts. Missing live pages and launch/relaunch lifecycle responses also fall back. Step URLs keep their original observations. This read does not wait for navigation to finish; a later route change can still occur.
+
+The completion read caps the daemon reply at 64 KiB. With WebDriver, its backend URL read also has a 1000 ms deadline and a 64 KiB cap on the entire HTTP response, including headers and chunk framing. Both paths require at least 10 ms remaining before JSON parsing and check the deadline while parsing. Oversized or late backend responses close the connection and release the daemon for subsequent commands. These completion limits do not change standalone `get url` behavior.
 
 Goal options and environment variables:
 

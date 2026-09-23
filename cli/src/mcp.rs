@@ -1898,11 +1898,11 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_GOAL,
             "Goal",
-            "Drive the open page toward one natural-language goal. An evaluation model picks an operation and an observed element on every step; actions run through the normal command pipeline. Pending confirmations stop safely and are returned with their confirmation ID. Uses the goal provider selected by the nested goal config or AGENT_BROWSER_GOAL_PROVIDER: Vercel by default, or Cloudflare. Set AGENT_BROWSER_CONFIG on the MCP server, or pass --config through extraArgs for one call. Verify the outcome afterwards; DONE is the model's opinion.",
+            "Drive the open page toward one natural-language goal. An evaluation model picks an operation and an observed element on every step; actions run through the normal command pipeline. Pending confirmations stop safely and are returned with their confirmation ID. On DONE, one live get url read refreshes the final URL within 1000 ms and the remaining goal budget; a failed or unusable read retains DONE and the last observed URL. This includes a missing live page, an oversized response, or launch/relaunch lifecycle metadata. The read never launches or replaces a browser, creates a tab, retries, respawns the daemon, or prompts. The daemon reply is capped at 64 KiB. With WebDriver, the backend URL read also has a 1000 ms deadline and a 64 KiB cap including HTTP headers and chunk framing. Both paths require at least 10 ms remaining before JSON parsing and check the deadline while parsing. Oversized or late backend responses close the connection and release the daemon for subsequent commands. Standalone get url is unchanged. Step URLs stay historical, and this read does not wait for navigation to finish. Uses the goal provider selected by the nested goal config or AGENT_BROWSER_GOAL_PROVIDER: Vercel by default, or Cloudflare. Set AGENT_BROWSER_CONFIG on the MCP server, or pass --config through extraArgs for one call. Verify the outcome afterwards; DONE is the model's opinion.",
             json!({
                 "goal": { "type": "string", "description": "What to achieve on the open page, including when to stop." },
                 "maxSteps": { "type": "integer", "minimum": 1, "description": "Action budget (default 40)." },
-                "timeoutMs": { "type": "integer", "minimum": 1, "default": 120000, "description": "Goal time budget in milliseconds. The MCP subprocess receives an additional 10000 ms so the goal can return its structured timeout result." },
+                "timeoutMs": { "type": "integer", "minimum": 1, "default": 120000, "description": "Goal time budget in milliseconds, including the final URL read of up to 1000 ms within the remaining budget. The MCP subprocess receives an additional 10000 ms so the goal can return its structured timeout result." },
                 "evalModel": { "type": "string", "description": "Evaluation model (Vercel default typesafe-ai/jev; Cloudflare default typesafe/jev)." },
                 "textModel": { "type": "string", "description": "Text model for TYPE_TEXT (Vercel default inception/mercury-2.5; Cloudflare default @cf/qwen/qwen3-30b-a3b-fp8)." }
             }),
@@ -3685,6 +3685,10 @@ fn goal_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
 /// Run goal with enough MCP subprocess time for the goal loop to emit its own
 /// structured timeout result. Using the exact same deadline would race the
 /// child process before it can serialize that result.
+/// Delegate DONE's bounded final URL refresh and fallback to the CLI, preserving
+/// both its final URL and the historical observations in its step records.
+/// The CLI also bounds WebDriver backend responses and releases the daemon on
+/// oversized or late responses; MCP must not add a second read or retry.
 fn call_goal(arguments: &Value) -> Result<Value, ProtocolError> {
     validate_arguments_object(arguments)?;
     let session = optional_string(arguments, "session")?;
@@ -4898,6 +4902,42 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("AGENT_BROWSER_GOAL_PROVIDER"));
+        assert!(goal_tool["description"]
+            .as_str()
+            .unwrap()
+            .contains("one live get url read"));
+        assert!(goal_tool["description"]
+            .as_str()
+            .unwrap()
+            .contains("retains DONE and the last observed URL"));
+        assert!(goal_tool["description"]
+            .as_str()
+            .unwrap()
+            .contains("never launches or replaces a browser"));
+        assert!(goal_tool["description"]
+            .as_str()
+            .unwrap()
+            .contains("64 KiB"));
+        assert!(goal_tool["description"]
+            .as_str()
+            .unwrap()
+            .contains("backend URL read also has a 1000 ms deadline"));
+        assert!(goal_tool["description"]
+            .as_str()
+            .unwrap()
+            .contains("including HTTP headers and chunk framing"));
+        assert!(goal_tool["description"]
+            .as_str()
+            .unwrap()
+            .contains("require at least 10 ms remaining before JSON parsing"));
+        assert!(goal_tool["description"]
+            .as_str()
+            .unwrap()
+            .contains("release the daemon for subsequent commands"));
+        assert!(goal_tool["description"]
+            .as_str()
+            .unwrap()
+            .contains("Standalone get url is unchanged"));
         assert!(
             goal_tool["inputSchema"]["properties"]["evalModel"]["description"]
                 .as_str()
@@ -4911,6 +4951,65 @@ mod tests {
                 .contains("@cf/qwen/qwen3-30b-a3b-fp8")
         );
         assert!(goal_args(&json!({})).is_err());
+    }
+
+    #[test]
+    fn goal_mcp_preserves_refreshed_final_url_and_historical_step_url() {
+        let response = json!({
+            "success": true,
+            "data": {
+                "status": "done",
+                "url": "https://example.com/attendance",
+                "steps": [{
+                    "operation": "CLICK",
+                    "url": "https://example.com/home",
+                    "pageChanged": true
+                }]
+            },
+            "error": null
+        });
+        let result = tool_result_from_run(CliRun {
+            exit_code: Some(0),
+            stdout: response.to_string(),
+            stderr: String::new(),
+        });
+
+        assert_eq!(result["isError"], false);
+        assert_eq!(
+            result["content"][0]["text"],
+            "https://example.com/attendance"
+        );
+        assert_eq!(result["structuredContent"]["response"], response);
+        assert_eq!(result["structuredContent"]["exitCode"], 0);
+    }
+
+    #[test]
+    fn goal_mcp_preserves_done_with_fallback_url() {
+        // The CLI keeps DONE when its final URL read fails. MCP must preserve
+        // that success and the fallback URL without reinterpreting the result.
+        let response = json!({
+            "success": true,
+            "data": {
+                "status": "done",
+                "url": "https://example.com/home",
+                "steps": [{
+                    "operation": "CLICK",
+                    "url": "https://example.com/home",
+                    "pageChanged": true
+                }]
+            },
+            "error": null
+        });
+        let result = tool_result_from_run(CliRun {
+            exit_code: Some(0),
+            stdout: response.to_string(),
+            stderr: String::new(),
+        });
+
+        assert_eq!(result["isError"], false);
+        assert_eq!(result["content"][0]["text"], "https://example.com/home");
+        assert_eq!(result["structuredContent"]["response"], response);
+        assert_eq!(result["structuredContent"]["exitCode"], 0);
     }
 
     #[test]
