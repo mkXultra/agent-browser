@@ -3898,6 +3898,12 @@ Start here (for AI agents):
   skills get <name>            Load a specialized skill (electron, slack, ...)
   skills path [name]           Print skill directory path
 
+Transport outcomes:
+  If a daemon reply is lost after a command may have been sent, the command
+  may already have executed. Mutating commands are not replayed automatically.
+  Inspect the browser before deciding whether to repeat an uncertain action.
+  Connection or write failures before any request byte is sent can recover.
+
 Core Commands:
   open <url>                 Navigate to URL
   read [url]                 Fetch agent-readable text

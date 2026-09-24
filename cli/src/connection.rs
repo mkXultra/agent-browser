@@ -1010,35 +1010,94 @@ fn connect(session: &str) -> Result<Connection, String> {
     }
 }
 
+/// Whether a request could have reached the daemon. A write failure before
+/// any bytes are transferred is not sent; any positive write is conservative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DispatchPhase {
+    NotSent,
+    PossiblySent,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct TransportError {
+    pub phase: DispatchPhase,
+    pub message: String,
+}
+
+impl std::fmt::Display for TransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.phase == DispatchPhase::PossiblySent {
+            write!(
+                f,
+                "Command outcome uncertain; it may have executed. Inspect the browser before deciding whether to repeat it: {}",
+                self.message
+            )
+        } else {
+            f.write_str(&self.message)
+        }
+    }
+}
+
+/// Only the completion URL read bypasses launch, restore, tab selection and
+/// session setting changes in execute_command. Ordinary reads can have those
+/// effects, and wrappers or unknown actions may contain mutations.
+fn replay_safe_after_dispatch(cmd: &Value) -> bool {
+    cmd.get("action").and_then(Value::as_str) == Some("url")
+        && cmd.get("existingBrowserOnly").and_then(Value::as_bool) == Some(true)
+}
+
 pub fn send_command(cmd: Value, session: &str) -> Result<Response, String> {
-    // Retry logic for transient errors (EAGAIN/EWOULDBLOCK/connection issues)
+    send_command_result(cmd, session).map_err(|error| error.to_string())
+}
+
+pub(crate) fn send_command_result(cmd: Value, session: &str) -> Result<Response, TransportError> {
+    send_command_result_with_timeout(cmd, session, None)
+}
+
+fn send_command_result_with_timeout(
+    cmd: Value,
+    session: &str,
+    read_timeout: Option<Duration>,
+) -> Result<Response, TransportError> {
+    retry_command(&cmd, || send_command_once(&cmd, session, read_timeout))
+}
+
+fn retry_command(
+    cmd: &Value,
+    mut attempt_command: impl FnMut() -> Result<Response, TransportError>,
+) -> Result<Response, TransportError> {
+    // Retry transient connection failures before dispatch and the guarded URL
+    // read after dispatch. Never infer dispatch from the error's wording.
     const MAX_RETRIES: u32 = 5;
     const RETRY_DELAY_MS: u64 = 200;
 
-    let mut last_error = String::new();
+    let mut last_error = None;
 
     for attempt in 0..MAX_RETRIES {
         if attempt > 0 {
             thread::sleep(Duration::from_millis(RETRY_DELAY_MS * (attempt as u64)));
         }
 
-        match send_command_once(&cmd, session) {
+        match attempt_command() {
             Ok(response) => return Ok(response),
             Err(e) => {
-                if is_transient_error(&e) {
-                    last_error = e;
+                if is_transient_error(&e.message)
+                    && (e.phase == DispatchPhase::NotSent || replay_safe_after_dispatch(cmd))
+                {
+                    last_error = Some(e);
                     continue;
                 }
-                // Non-transient error, fail immediately
                 return Err(e);
             }
         }
     }
 
-    Err(format!(
-        "{} (after {} retries - daemon may be busy or unresponsive)",
-        last_error, MAX_RETRIES
-    ))
+    let mut error = last_error.expect("retry loop records its last error");
+    error.message = format!(
+        "{} (after {} retries; daemon may be busy or unresponsive)",
+        error.message, MAX_RETRIES
+    );
+    Err(error)
 }
 
 /// Send one best-effort command from the synchronous CLI, without retrying.
@@ -1152,24 +1211,28 @@ fn parse_response_before(bytes: &[u8], deadline: Instant) -> Result<Response, St
     response.map_err(|e| format!("Invalid response: {}", e))
 }
 
-/// Check if an error is transient and worth retrying against the SAME daemon.
+/// Check whether a transport error is transient. DispatchPhase and the command's
+/// lifecycle effects decide separately whether another request is safe.
 /// Transient errors include:
 /// - EAGAIN/EWOULDBLOCK (os error 35 on macOS, 11 on Linux)
 /// - EOF errors (daemon closed connection before responding)
 /// - Connection reset/broken pipe (daemon crashed or restarting)
+/// - WriteZero (the writer accepted no bytes on an attempt)
 ///
 /// Connection refused / missing socket are NOT transient: no daemon is
 /// listening, so backing off cannot help. Callers use daemon_unreachable()
 /// to respawn via ensure_daemon and retry once instead.
 fn is_transient_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
     has_os_error(error, 35) // EAGAIN on macOS
         || has_os_error(error, 11) // EAGAIN on Linux
-        || error.contains("WouldBlock")
-        || error.contains("Resource temporarily unavailable")
-        || error.contains("EOF")
-        || error.contains("line 1 column 0") // Empty JSON response
-        || error.contains("Connection reset")
-        || error.contains("Broken pipe")
+        || lower.contains("wouldblock")
+        || lower.contains("resource temporarily unavailable")
+        || lower.contains("eof")
+        || lower.contains("line 1 column 0") // Empty JSON response
+        || lower.contains("connection reset")
+        || lower.contains("broken pipe")
+        || lower.contains("writezero")
         || has_os_error(error, 54) // Connection reset by peer (macOS)
         || has_os_error(error, 104) // Connection reset by peer (Linux)
         || has_os_error(error, 10054) // Connection reset by peer (Windows)
@@ -1198,7 +1261,7 @@ fn has_os_error(error: &str, code: u32) -> bool {
 /// parse_command stamps with AGENT_BROWSER_DEFAULT_TIMEOUT when no explicit
 /// --timeout is given) get that timeout plus margin, so the daemon can report
 /// a proper operation timeout instead of the client dying with EAGAIN at 30s
-/// and the retry loop re-sending the whole long-running command.
+/// and the client reporting an uncertain outcome for the long-running command.
 ///
 /// The env var is deliberately NOT consulted here. Reading it would apply a
 /// long wait budget to every command, so a genuinely hung daemon on a simple
@@ -1214,32 +1277,130 @@ fn read_timeout_for(cmd: &Value) -> Duration {
     Duration::from_millis(op_ms.saturating_add(10_000).max(30_000))
 }
 
-fn send_command_once(cmd: &Value, session: &str) -> Result<Response, String> {
-    let mut stream = connect(session)?;
-
-    stream.set_read_timeout(Some(read_timeout_for(cmd))).ok();
-    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
-
-    let mut json_str = serde_json::to_string(cmd).map_err(|e| e.to_string())?;
-    json_str.push('\n');
+fn send_command_once(
+    cmd: &Value,
+    session: &str,
+    timeout: Option<Duration>,
+) -> Result<Response, TransportError> {
+    let mut stream = connect(session).map_err(|message| TransportError {
+        phase: DispatchPhase::NotSent,
+        message,
+    })?;
 
     stream
-        .write_all(json_str.as_bytes())
-        .map_err(|e| format!("Failed to send: {}", e))?;
+        .set_read_timeout(Some(timeout.unwrap_or_else(|| read_timeout_for(cmd))))
+        .ok();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
 
+    let mut json_str = serde_json::to_string(cmd).map_err(|e| TransportError {
+        phase: DispatchPhase::NotSent,
+        message: e.to_string(),
+    })?;
+    json_str.push('\n');
+
+    write_request(&mut stream, json_str.as_bytes())?;
+
+    read_response(stream)
+}
+
+fn read_response(stream: impl Read) -> Result<Response, TransportError> {
     let mut reader = BufReader::new(stream);
     let mut response_line = String::new();
     reader
         .read_line(&mut response_line)
-        .map_err(|e| format!("Failed to read: {}", e))?;
+        .map_err(|e| TransportError {
+            phase: DispatchPhase::PossiblySent,
+            message: format!("Failed to read: {}", e),
+        })?;
 
-    serde_json::from_str(&response_line).map_err(|e| format!("Invalid response: {}", e))
+    serde_json::from_str(&response_line).map_err(|e| TransportError {
+        phase: DispatchPhase::PossiblySent,
+        message: format!("Invalid response: {}", e),
+    })
+}
+
+fn write_request(stream: &mut impl Write, request: &[u8]) -> Result<(), TransportError> {
+    // Track successful writes because write_all discards that count on error.
+    // A partial line may still be buffered and later completed by the peer;
+    // do not replay it even if the final write fails.
+    let mut written = 0;
+    while written < request.len() {
+        match stream.write(&request[written..]) {
+            Ok(0) => {
+                return Err(TransportError {
+                    phase: if written == 0 {
+                        DispatchPhase::NotSent
+                    } else {
+                        DispatchPhase::PossiblySent
+                    },
+                    message: "Failed to send: WriteZero (writer accepted no bytes)".to_string(),
+                });
+            }
+            Ok(count) => written += count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(TransportError {
+                    phase: if written == 0 {
+                        DispatchPhase::NotSent
+                    } else {
+                        DispatchPhase::PossiblySent
+                    },
+                    message: format!("Failed to send: {}", error),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_utils::EnvGuard;
+
+    #[cfg(unix)]
+    #[test]
+    fn lost_reply_click_dispatches_exactly_once() {
+        with_deadline_socket(|listener| {
+            let server = thread::spawn(move || {
+                let (stream, first) = accept_deadline_request(&listener);
+                drop(stream);
+                let mut executions = vec![first["action"].as_str().unwrap().to_string()];
+                let deadline = Instant::now() + Duration::from_millis(400);
+                while Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream.set_nonblocking(false).unwrap();
+                            let mut request = String::new();
+                            BufReader::new(&mut stream).read_line(&mut request).unwrap();
+                            let second: Value = serde_json::from_str(&request).unwrap();
+                            executions.push(second["action"].as_str().unwrap().to_string());
+                            stream.write_all(b"{\"success\":true}\n").unwrap();
+                            break;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => panic!("unexpected accept error: {error}"),
+                    }
+                }
+                executions
+            });
+            let outcome = send_command(
+                json!({ "action": "click", "selector": "#local" }),
+                "bounded-url",
+            );
+            let executions = server.join().unwrap();
+            eprintln!(
+                "fake daemon executed count={} actions={:?}; command returned success={}",
+                executions.len(),
+                executions,
+                outcome.is_ok()
+            );
+            assert_eq!(executions.len(), 1, "lost reply must not duplicate click");
+            assert!(outcome.is_err(), "lost reply must be surfaced");
+        });
+    }
 
     #[cfg(unix)]
     fn with_deadline_socket(test: impl FnOnce(std::os::unix::net::UnixListener)) {
@@ -1281,6 +1442,418 @@ mod tests {
         let mut request = String::new();
         BufReader::new(&mut stream).read_line(&mut request).unwrap();
         (stream, serde_json::from_str(&request).unwrap())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatched_mutation_is_not_replayed_after_lost_reply() {
+        for reply in ["", "not-json\n"] {
+            with_deadline_socket(|listener| {
+                let server = thread::spawn(move || {
+                    let (mut stream, request) = accept_deadline_request(&listener);
+                    assert_eq!(request["action"], "click");
+                    stream.write_all(reply.as_bytes()).unwrap();
+                    drop(stream);
+                    reply_to_unexpected_retry(&listener)
+                });
+                let error = send_command(
+                    json!({ "action": "click", "selector": "#local" }),
+                    "bounded-url",
+                )
+                .err()
+                .expect("lost reply must be reported");
+                let replayed = server.join().unwrap();
+                assert!(error.contains("outcome uncertain"), "{error}");
+                assert!(!replayed, "mutation was dispatched twice");
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    fn reply_to_unexpected_retry(listener: &std::os::unix::net::UnixListener) -> bool {
+        let deadline = Instant::now() + Duration::from_millis(400);
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut request = String::new();
+                    BufReader::new(&mut stream).read_line(&mut request).unwrap();
+                    stream.write_all(b"{\"success\":true}\n").unwrap();
+                    return true;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("unexpected socket error: {error}"),
+            }
+        }
+        false
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executing_confirmation_is_not_replayed_after_lost_reply() {
+        with_deadline_socket(|listener| {
+            let server = thread::spawn(move || {
+                let (stream, request) = accept_deadline_request(&listener);
+                assert_eq!(request["action"], "confirm");
+                drop(stream);
+                reply_to_unexpected_retry(&listener)
+            });
+            let error = send_command(
+                json!({ "action": "confirm", "confirmationId": "local" }),
+                "bounded-url",
+            )
+            .err()
+            .unwrap();
+            let replayed = server.join().unwrap();
+            assert!(error.contains("outcome uncertain"), "{error}");
+            assert!(!replayed, "confirmation was dispatched twice");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn abrupt_close_after_dispatch_does_not_replay_mutation() {
+        use std::os::fd::AsRawFd;
+        with_deadline_socket(|listener| {
+            let server = thread::spawn(move || {
+                let (stream, request) = accept_deadline_request(&listener);
+                assert_eq!(request["action"], "click");
+                let linger = libc::linger {
+                    l_onoff: 1,
+                    l_linger: 0,
+                };
+                let result = unsafe {
+                    libc::setsockopt(
+                        stream.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_LINGER,
+                        (&linger as *const libc::linger).cast(),
+                        std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                    )
+                };
+                assert_eq!(result, 0);
+                drop(stream);
+                reply_to_unexpected_retry(&listener)
+            });
+            let outcome = send_command(
+                json!({ "action": "click", "selector": "#local" }),
+                "bounded-url",
+            );
+            let replayed = server.join().unwrap();
+            assert!(outcome.err().unwrap().contains("outcome uncertain"));
+            assert!(!replayed, "abruptly closed mutation was dispatched twice");
+        });
+    }
+
+    #[test]
+    fn injected_connection_reset_after_dispatch_does_not_retry() {
+        struct ResetReader;
+        impl Read for ResetReader {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::ConnectionReset.into())
+            }
+        }
+        let mut attempts = 0;
+        let error = retry_command(&json!({ "action": "click" }), || {
+            attempts += 1;
+            read_response(ResetReader)
+        })
+        .err()
+        .unwrap();
+        assert_eq!(error.phase, DispatchPhase::PossiblySent);
+        assert_eq!(attempts, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrapped_and_unknown_commands_are_not_replayed() {
+        for command in [
+            json!({ "action": "batch", "commands": [["click", "#local"]] }),
+            json!({ "action": "future_wrapper", "inner": { "action": "fill" } }),
+        ] {
+            with_deadline_socket(|listener| {
+                let expected = command["action"].clone();
+                let server = thread::spawn(move || {
+                    let (stream, request) = accept_deadline_request(&listener);
+                    assert_eq!(request["action"], expected);
+                    drop(stream);
+                    reply_to_unexpected_retry(&listener)
+                });
+                let error = send_command(command, "bounded-url").err().unwrap();
+                let replayed = server.join().unwrap();
+                assert!(error.contains("outcome uncertain"), "{error}");
+                assert!(!replayed, "wrapped or unknown command was dispatched twice");
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timed_out_mutation_is_not_replayed_while_daemon_can_still_execute_it() {
+        with_deadline_socket(|listener| {
+            let (release, released) = std::sync::mpsc::channel();
+            let server = thread::spawn(move || {
+                let (stream, request) = accept_deadline_request(&listener);
+                assert_eq!(request["action"], "fill");
+                released.recv_timeout(Duration::from_secs(1)).unwrap();
+                drop(stream);
+                reply_to_unexpected_retry(&listener)
+            });
+            let started = Instant::now();
+            let error = send_command_result_with_timeout(
+                json!({ "action": "fill", "selector": "#local", "value": "once" }),
+                "bounded-url",
+                Some(Duration::from_millis(60)),
+            )
+            .err()
+            .unwrap();
+            release.send(()).unwrap();
+            let replayed = server.join().unwrap();
+            assert_eq!(error.phase, DispatchPhase::PossiblySent);
+            assert!(started.elapsed() < Duration::from_secs(1));
+            assert!(!replayed, "timed-out mutation was dispatched twice");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_url_read_can_recover_after_lost_reply() {
+        with_deadline_socket(|listener| {
+            let server = thread::spawn(move || {
+                let (stream, first) = accept_deadline_request(&listener);
+                assert_eq!(first["existingBrowserOnly"], true);
+                drop(stream);
+                let (mut stream, second) = accept_deadline_request(&listener);
+                assert_eq!(second, first);
+                stream
+                    .write_all(b"{\"success\":true,\"data\":{\"url\":\"about:blank\"}}\n")
+                    .unwrap();
+            });
+            let response = send_command(
+                json!({ "action": "url", "existingBrowserOnly": true }),
+                "bounded-url",
+            )
+            .unwrap();
+            server.join().unwrap();
+            assert_eq!(response.data.unwrap()["url"], "about:blank");
+        });
+    }
+
+    #[test]
+    fn only_guarded_url_read_is_replay_safe_after_dispatch() {
+        assert!(replay_safe_after_dispatch(
+            &json!({ "action": "url", "existingBrowserOnly": true })
+        ));
+        for command in [
+            json!({ "action": "url" }),
+            json!({ "action": "launch" }),
+            json!({ "action": "confirm" }),
+            json!({ "action": "batch", "commands": [["click", "#local"]] }),
+            json!({ "action": "plugin_command_run", "command": "click" }),
+            json!({ "action": "future_read" }),
+        ] {
+            assert!(!replay_safe_after_dispatch(&command), "{command}");
+        }
+    }
+
+    #[test]
+    fn partial_write_failure_is_possibly_dispatched() {
+        struct PartialWriter(usize);
+        impl Write for PartialWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.0 == 0 {
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+                let count = bytes.len().min(self.0);
+                self.0 -= count;
+                Ok(count)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let error = write_request(&mut PartialWriter(4), b"{\"action\":\"click\"}\n")
+            .err()
+            .unwrap();
+        assert_eq!(error.phase, DispatchPhase::PossiblySent);
+    }
+
+    #[test]
+    fn partial_write_failure_does_not_retry_mutation() {
+        struct PartialThenBroken(bool);
+        impl Write for PartialThenBroken {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.0 {
+                    self.0 = false;
+                    Ok(bytes.len().min(4))
+                } else {
+                    Err(std::io::ErrorKind::BrokenPipe.into())
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut attempts = 0;
+        let error = retry_command(&json!({ "action": "click" }), || {
+            attempts += 1;
+            write_request(&mut PartialThenBroken(true), b"request\n")?;
+            unreachable!();
+        })
+        .err()
+        .unwrap();
+        assert_eq!(error.phase, DispatchPhase::PossiblySent);
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn first_write_failure_is_not_sent() {
+        struct FailBeforeWrite;
+        impl Write for FailBeforeWrite {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let error = write_request(&mut FailBeforeWrite, b"request\n")
+            .err()
+            .unwrap();
+        assert_eq!(error.phase, DispatchPhase::NotSent);
+        assert!(is_transient_error(&error.message));
+    }
+
+    #[test]
+    fn zero_byte_write_is_not_sent_but_partial_write_zero_is_uncertain() {
+        struct StopsWriting {
+            first_write: usize,
+        }
+        impl Write for StopsWriting {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let count = bytes.len().min(self.first_write);
+                self.first_write = 0;
+                Ok(count)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for (first_write, phase) in [
+            (0, DispatchPhase::NotSent),
+            (4, DispatchPhase::PossiblySent),
+        ] {
+            let error = write_request(&mut StopsWriting { first_write }, b"request\n")
+                .err()
+                .unwrap();
+            assert_eq!(error.phase, phase);
+            assert!(error.message.contains("Failed to send"));
+            assert!(is_transient_error(&error.message));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_write_failure_reconnects_and_dispatches_once() {
+        struct FailBeforeWrite;
+        impl Write for FailBeforeWrite {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        with_deadline_socket(|listener| {
+            let server = thread::spawn(move || {
+                let (mut stream, request) = accept_deadline_request(&listener);
+                assert_eq!(request["action"], "click");
+                stream.write_all(b"{\"success\":true}\n").unwrap();
+                !reply_to_unexpected_retry(&listener)
+            });
+            let command = json!({ "action": "click", "selector": "#local" });
+            let mut attempts = 0;
+            let response = retry_command(&command, || {
+                attempts += 1;
+                if attempts == 1 {
+                    write_request(&mut FailBeforeWrite, b"request\n")?;
+                    unreachable!();
+                }
+                send_command_once(&command, "bounded-url", Some(Duration::from_millis(100)))
+            })
+            .unwrap();
+            assert!(response.success);
+            assert_eq!(attempts, 2);
+            assert!(
+                server.join().unwrap(),
+                "exactly one socket dispatch expected"
+            );
+        });
+    }
+
+    #[test]
+    fn interrupted_write_retries_without_losing_byte_count() {
+        struct InterruptedThenPartial {
+            calls: usize,
+        }
+        impl Write for InterruptedThenPartial {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                match self.calls {
+                    1 => Err(std::io::ErrorKind::Interrupted.into()),
+                    2 => Ok(bytes.len().min(3)),
+                    _ => Err(std::io::ErrorKind::BrokenPipe.into()),
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut writer = InterruptedThenPartial { calls: 0 };
+        let error = write_request(&mut writer, b"request\n").err().unwrap();
+        assert_eq!(writer.calls, 3);
+        assert_eq!(error.phase, DispatchPhase::PossiblySent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connection_refused_before_write_is_known_not_sent() {
+        with_deadline_socket(|listener| {
+            drop(listener);
+            let error = send_command_result(
+                json!({ "action": "click", "selector": "#local" }),
+                "bounded-url",
+            )
+            .err()
+            .unwrap();
+            assert_eq!(error.phase, DispatchPhase::NotSent);
+            assert!(daemon_unreachable(&error.message));
+        });
+    }
+
+    #[test]
+    fn transient_pre_send_failure_recovers_without_changing_command() {
+        let mut attempts = 0;
+        let command = json!({ "action": "click", "selector": "#local" });
+        let response = retry_command(&command, || {
+            attempts += 1;
+            if attempts == 1 {
+                Err(TransportError {
+                    phase: DispatchPhase::NotSent,
+                    message: "Failed to connect: Resource temporarily unavailable (os error 11)"
+                        .into(),
+                })
+            } else {
+                Ok(Response {
+                    success: true,
+                    ..Response::default()
+                })
+            }
+        })
+        .unwrap();
+        assert!(response.success);
+        assert_eq!(attempts, 2);
     }
 
     #[cfg(unix)]
@@ -1876,6 +2449,7 @@ mod tests {
     #[test]
     fn test_is_transient_error_connection_reset() {
         assert!(is_transient_error("Connection reset by peer"));
+        assert!(is_transient_error("Failed to send: connection reset"));
     }
 
     #[test]

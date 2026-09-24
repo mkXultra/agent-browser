@@ -36,7 +36,7 @@ use windows_sys::Win32::System::Threading::OpenProcess;
 use commands::{attach_ca_cert_to_launch_command, gen_id, parse_command, ParseError};
 use connection::{
     cleanup_stale_files, daemon_unreachable, ensure_daemon, get_socket_dir, is_pid_alive,
-    send_command, walk_daemons, DaemonOptions, Response,
+    send_command, walk_daemons, DaemonOptions, DispatchPhase, Response, TransportError,
 };
 use flags::{clean_args, parse_flags, Flags};
 use install::run_install;
@@ -388,7 +388,7 @@ fn unwrap_confirmed_response(resp: Response) -> Response {
 enum ConfirmationResolutionError {
     Denied,
     DeadlineExpired,
-    Command(String),
+    Command(TransportError),
 }
 
 impl ConfirmationResolutionError {
@@ -398,7 +398,7 @@ impl ConfirmationResolutionError {
             Self::DeadlineExpired => {
                 "Goal time budget expired while awaiting confirmation".to_string()
             }
-            Self::Command(message) => message,
+            Self::Command(error) => error.to_string(),
         }
     }
 }
@@ -490,13 +490,13 @@ fn resolve_interactive_confirmations_before(
             return Err(ConfirmationResolutionError::DeadlineExpired);
         }
         if !approved {
-            return match send_command(confirm_cmd, &flags.session) {
+            return match connection::send_command_result(confirm_cmd, &flags.session) {
                 Ok(_) => Err(ConfirmationResolutionError::Denied),
                 Err(_) if deadline.is_some() => Err(ConfirmationResolutionError::Denied),
-                Err(message) => Err(ConfirmationResolutionError::Command(message)),
+                Err(error) => Err(ConfirmationResolutionError::Command(error)),
             };
         }
-        let next_resp = send_command(confirm_cmd, &flags.session)
+        let next_resp = connection::send_command_result(confirm_cmd, &flags.session)
             .map_err(ConfirmationResolutionError::Command)?;
         // Unwrap exactly the confirmation envelope returned for this
         // approval. The executed command's own `data.result` is page or
@@ -2210,9 +2210,18 @@ fn run_words(
     words: &[String],
     flags: &Flags,
     daemon_opts: &DaemonOptions,
-) -> Result<connection::Response, String> {
-    let parsed = parse_session_command(words, flags)?;
-    send_command_with_respawn(parsed, &flags.session, daemon_opts)
+) -> Result<connection::Response, goal::CommandRunError> {
+    let parsed = parse_session_command(words, flags).map_err(goal::CommandRunError::Failed)?;
+    send_command_with_respawn_result(parsed, &flags.session, daemon_opts)
+        .map_err(goal_error_from_transport)
+}
+
+fn goal_error_from_transport(error: TransportError) -> goal::CommandRunError {
+    if error.phase == DispatchPhase::PossiblySent {
+        goal::CommandRunError::Uncertain(error.to_string())
+    } else {
+        goal::CommandRunError::Failed(error.to_string())
+    }
 }
 
 /// Share CLI parsing and session context between ordinary goal commands and
@@ -2233,16 +2242,13 @@ struct GoalCommandRunner<'a> {
 
 impl goal::CommandRunner for GoalCommandRunner<'_> {
     fn run(&self, words: &[String], deadline: Instant) -> Result<Response, goal::CommandRunError> {
-        let resp = run_words(words, self.flags, self.daemon_opts)
-            .map_err(goal::CommandRunError::Failed)?;
+        let resp = run_words(words, self.flags, self.daemon_opts)?;
         if self.flags.confirm_interactive && confirmation_prompt_from_response(&resp).is_some() {
             resolve_interactive_confirmations_before(resp, self.flags, Some(deadline)).map_err(
                 |error| match error {
                     ConfirmationResolutionError::Denied => goal::CommandRunError::Denied,
                     ConfirmationResolutionError::DeadlineExpired => goal::CommandRunError::Timeout,
-                    ConfirmationResolutionError::Command(message) => {
-                        goal::CommandRunError::Failed(message)
-                    }
+                    ConfirmationResolutionError::Command(error) => goal_error_from_transport(error),
                 },
             )
         } else {
@@ -2268,20 +2274,33 @@ impl goal::CommandRunner for GoalCommandRunner<'_> {
 /// send_command plus the daemon-shutdown-race recovery: ensure_daemon no
 /// longer pays a settle-sleep on every invocation, so a daemon that exited
 /// right after its liveness check surfaces as an unreachable socket on the
-/// request itself. Respawn once and retry before reporting failure.
+/// request itself. Respawn once only when transport phase proves that the
+/// request was not sent. A lost reply cannot authorize replay.
 fn send_command_with_respawn(
     cmd: serde_json::Value,
     session: &str,
     daemon_opts: &DaemonOptions,
 ) -> Result<connection::Response, String> {
-    let first_attempt = send_command(cmd.clone(), session);
+    send_command_with_respawn_result(cmd, session, daemon_opts).map_err(|error| error.to_string())
+}
+
+fn send_command_with_respawn_result(
+    cmd: serde_json::Value,
+    session: &str,
+    daemon_opts: &DaemonOptions,
+) -> Result<connection::Response, TransportError> {
+    let first_attempt = connection::send_command_result(cmd.clone(), session);
     match first_attempt {
-        Err(ref e) if daemon_unreachable(e) => match ensure_daemon(session, daemon_opts) {
-            Ok(_) => send_command(cmd, session),
+        Err(ref e) if should_respawn_after(e) => match ensure_daemon(session, daemon_opts) {
+            Ok(_) => connection::send_command_result(cmd, session),
             Err(_) => first_attempt,
         },
         other => other,
     }
+}
+
+fn should_respawn_after(error: &TransportError) -> bool {
+    error.phase == DispatchPhase::NotSent && daemon_unreachable(&error.message)
 }
 
 fn run_batch(
@@ -2453,6 +2472,20 @@ fn run_batch(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn respawn_requires_proven_pre_send_failure() {
+        let error = super::TransportError {
+            phase: super::DispatchPhase::PossiblySent,
+            message: "Failed to connect: Connection refused (os error 111)".into(),
+        };
+        assert!(!super::should_respawn_after(&error));
+        let unsent = super::TransportError {
+            phase: super::DispatchPhase::NotSent,
+            ..error
+        };
+        assert!(super::should_respawn_after(&unsent));
+    }
+
     #[test]
     fn input_mode_session_setting_preserves_command_override() {
         let args: Vec<String> = ["--input-mode", "smooth", "click", "#button", "--human"]
@@ -2804,6 +2837,41 @@ mod tests {
                 });
                 assert!(confirmation_prompt_from_response(&response).is_some());
                 assert_eq!(serde_json::to_value(response).unwrap(), expected);
+            });
+        }
+
+        #[test]
+        fn goal_mutation_lost_reply_does_not_retry_or_respawn() {
+            with_runner("mutation-eof", |runner, _| {
+                let listener = listener(runner);
+                let server = thread::spawn(move || {
+                    let (stream, request) = accept_request(&listener);
+                    assert_eq!(request["action"], "click");
+                    drop(stream);
+                    let deadline = Instant::now() + Duration::from_millis(400);
+                    while Instant::now() < deadline {
+                        match listener.accept() {
+                            Ok((mut stream, _)) => {
+                                let mut request = String::new();
+                                BufReader::new(&mut stream).read_line(&mut request).unwrap();
+                                stream.write_all(b"{\"success\":true}\n").unwrap();
+                                return true;
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                thread::sleep(Duration::from_millis(2));
+                            }
+                            Err(error) => panic!("unexpected socket error: {error}"),
+                        }
+                    }
+                    false
+                });
+                let result = runner.run(
+                    &["click".into(), "#local".into()],
+                    Instant::now() + Duration::from_secs(1),
+                );
+                let replayed = server.join().unwrap();
+                assert!(matches!(result, Err(goal::CommandRunError::Uncertain(_))));
+                assert!(!replayed, "goal mutation was dispatched twice");
             });
         }
 

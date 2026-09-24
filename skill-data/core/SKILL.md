@@ -453,6 +453,8 @@ agent-browser doctor --json              # structured output for programmatic co
 
 ## Troubleshooting
 
+**`Command outcome uncertain`** The daemon reply was lost after the request may have reached it. A click, fill, confirmation, batch, launch, or other effectful command may already have run. Inspect the current page and session before deciding whether to send another command. Goal stops on this outcome instead of retrying the action as a stale target. CLI and MCP share this behavior. A connection or write failure known to transfer zero request bytes can still recover automatically; any positive write is treated conservatively.
+
 **"Ref not found" / "Element not found: @eN"** Page changed since the snapshot. Run `agent-browser snapshot -i` again, then use the new refs.
 
 **Element exists in the DOM but not in the snapshot** It's probably off-screen or not yet rendered. Try:

@@ -744,6 +744,9 @@ fn nonempty_value(value: Option<&String>) -> Option<String> {
 /// entries in the executed step history.
 pub(crate) enum CommandRunError {
     Failed(String),
+    /// A request may have executed before its transport reply was lost.
+    /// Never treat this as a stale element or a safe action retry.
+    Uncertain(String),
     Denied,
     Timeout,
 }
@@ -1346,7 +1349,9 @@ fn run_or_error(
     let resp = run
         .run(&words(parts), deadline)
         .map_err(|error| match error {
-            CommandRunError::Failed(message) => GoalLoopError::Message(message),
+            CommandRunError::Failed(message) | CommandRunError::Uncertain(message) => {
+                GoalLoopError::Message(message)
+            }
             CommandRunError::Denied => GoalLoopError::Denied,
             CommandRunError::Timeout => GoalLoopError::Timeout,
         })?;
@@ -2057,6 +2062,9 @@ pub(crate) fn run_goal_loop(
                     stale_total,
                     Some(timeout_error(config.timeout_ms)),
                 );
+            }
+            Err(CommandRunError::Uncertain(error)) => {
+                return finish("error", &page, &history, stale_total, Some(error));
             }
             Err(CommandRunError::Failed(error)) => Some(error),
         };
@@ -4543,6 +4551,36 @@ mod tests {
             vec!["click @e4", "fill @e3 Zurich"]
         );
         assert_eq!(outcome.steps.len(), 1, "a stale decision is not a step");
+    }
+
+    #[test]
+    fn uncertain_action_never_enters_stale_retry_even_when_error_mentions_coverage() {
+        let daemon = FakeDaemon::new(vec![FORM]);
+        let oracle = FakeOracle::new(vec![("CLICK", Some("2")), ("DONE", None)]);
+        let base = daemon.runner();
+        let runner = |words: &[String], deadline: Instant| {
+            if words.first().map(String::as_str) == Some("click") {
+                daemon.requests.borrow_mut().push(words.join(" "));
+                return Err(CommandRunError::Uncertain(
+                    "Command outcome uncertain; reply lost while covered by overlay".into(),
+                ));
+            }
+            base(words, deadline)
+        };
+        let outcome = run_goal_loop(&config("fly"), &oracle, &runner, |_| {});
+        assert_eq!(outcome.status, "error");
+        assert_eq!(outcome.stale_decisions, 0);
+        assert!(outcome.steps.is_empty());
+        assert_eq!(
+            daemon
+                .requests
+                .borrow()
+                .iter()
+                .filter(|w| w.starts_with("click"))
+                .count(),
+            1
+        );
+        assert_eq!(oracle.seen.borrow().len(), 1);
     }
 
     #[test]

@@ -1315,7 +1315,9 @@ Override the default timeout via environment variable:
 export AGENT_BROWSER_DEFAULT_TIMEOUT=45000
 ```
 
-> **Note:** Setting this above 30000 (30s) may cause EAGAIN errors on slow operations because the CLI's read timeout will expire before the daemon responds. The CLI retries transient errors automatically, but response times will increase.
+> **Note:** Setting this above 30000 (30s) may cause a client read timeout before the daemon responds. The command may still execute after the client stops waiting. If its outcome is uncertain, inspect the browser before deciding whether to repeat it.
+
+If the daemon reply is lost after a command may have been sent, agent-browser reports `Command outcome uncertain` and does not automatically replay a browser mutation. This includes clicks, fills, confirmations, launches, and batches. The CLI and MCP tool result cannot infer whether the daemon executed the command from a socket error. Connection and write failures proven to transfer zero request bytes can still recover automatically. Any positive write is treated conservatively. Ordinary reads can launch or restore a browser, so they receive the same conservative treatment after dispatch. A guarded completion URL read that cannot change browser lifecycle state may be retried by the transport; the goal's final URL read remains a single bounded attempt.
 
 | Variable                        | Description                              |
 | ------------------------------- | ---------------------------------------- |

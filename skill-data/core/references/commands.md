@@ -2,6 +2,8 @@
 
 Complete reference for all agent-browser commands. For quick start and common patterns, see SKILL.md.
 
+When the CLI or MCP reports `Command outcome uncertain`, the daemon may have executed a command before its reply was lost. Mutating commands and batches are sent at most once by automatic transport recovery after possible dispatch. Inspect the page before deciding whether to repeat an action. A connection or write failure known to transfer zero request bytes can still recover; any positive write means a later socket error cannot establish that nothing happened. Ordinary reads can also launch or restore a browser. Only reads explicitly guarded against lifecycle changes qualify for post-dispatch transport retry.
+
 ## Navigation
 
 ```bash

@@ -853,7 +853,7 @@ fn tools() -> Vec<Value> {
         tool(
             TOOL_CLICK,
             "Click element",
-            "Click an element by @ref or CSS selector. Reference clicks account for iframe offsets and transforms, including cross-origin frames, and reject clicks blocked by another element.",
+            "Click an element by @ref or CSS selector. Reference clicks account for iframe offsets and transforms, including cross-origin frames, and reject clicks blocked by another element. If the daemon reply is lost after dispatch, the CLI reports an uncertain outcome without replaying the click; inspect the page before deciding what to do next.",
             json!({
                 "selector": selector_schema(),
                 "newTab": { "type": "boolean", "default": false, "description": "Open link targets in a new tab after applying session setup." },
@@ -864,7 +864,7 @@ fn tools() -> Vec<Value> {
         tool(
             TOOL_FILL,
             "Fill input",
-            "Clear and fill an input by @ref or CSS selector.",
+            "Clear and fill an input by @ref or CSS selector. A lost reply after dispatch yields an uncertain outcome without automatically repeating the fill.",
             json!({
                 "selector": selector_schema(),
                 "text": { "type": "string", "description": "Text to fill." }
@@ -1632,7 +1632,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_BATCH,
             "Batch",
-            "Run multiple commands sequentially.",
+            "Run multiple commands sequentially. A lost reply after dispatch may mean some commands ran; the batch is not automatically replayed.",
             json!({ "commands": { "type": "array", "items": { "type": "array", "items": { "type": "string" }, "minItems": 1 }, "minItems": 1 }, "bail": { "type": "boolean" } }),
             &["commands"],
         ),
@@ -1707,7 +1707,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_CONFIRM,
             "Confirm action",
-            "Approve a pending action.",
+            "Approve and execute a pending action. A lost reply after dispatch may mean it executed; confirmation is not automatically repeated.",
             json!({ "id": { "type": "string" } }),
             &["id"],
         ),
@@ -1898,7 +1898,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_GOAL,
             "Goal",
-            "Drive the open page toward one natural-language goal. An evaluation model picks an operation and an observed element on every step; actions run through the normal command pipeline. Pending confirmations stop safely and are returned with their confirmation ID. On DONE, one live get url read refreshes the final URL within 1000 ms and the remaining goal budget; a failed or unusable read retains DONE and the last observed URL. This includes a missing live page, an oversized response, or launch/relaunch lifecycle metadata. The read never launches or replaces a browser, creates a tab, retries, respawns the daemon, or prompts. The daemon reply is capped at 64 KiB. With WebDriver, the backend URL read also has a 1000 ms deadline and a 64 KiB cap including HTTP headers and chunk framing. Both paths require at least 10 ms remaining before JSON parsing and check the deadline while parsing. Oversized or late backend responses close the connection and release the daemon for subsequent commands. Standalone get url is unchanged. Step URLs stay historical, and this read does not wait for navigation to finish. Uses the goal provider selected by the nested goal config or AGENT_BROWSER_GOAL_PROVIDER: Vercel by default, or Cloudflare. Set AGENT_BROWSER_CONFIG on the MCP server, or pass --config through extraArgs for one call. Verify the outcome afterwards; DONE is the model's opinion.",
+            "Drive the open page toward one natural-language goal. An evaluation model picks an operation and an observed element on every step; actions run through the normal command pipeline. A lost daemon reply after an action yields an uncertain outcome and stops the goal without replaying the action or treating it as a stale element. Pending confirmations stop safely and are returned with their confirmation ID. On DONE, one live get url read refreshes the final URL within 1000 ms and the remaining goal budget; a failed or unusable read retains DONE and the last observed URL. This includes a missing live page, an oversized response, or launch/relaunch lifecycle metadata. The read never launches or replaces a browser, creates a tab, retries, respawns the daemon, or prompts. The daemon reply is capped at 64 KiB. With WebDriver, the backend URL read also has a 1000 ms deadline and a 64 KiB cap including HTTP headers and chunk framing. Both paths require at least 10 ms remaining before JSON parsing and check the deadline while parsing. Oversized or late backend responses close the connection and release the daemon for subsequent commands. Standalone get url is unchanged. Step URLs stay historical, and this read does not wait for navigation to finish. Uses the goal provider selected by the nested goal config or AGENT_BROWSER_GOAL_PROVIDER: Vercel by default, or Cloudflare. Set AGENT_BROWSER_CONFIG on the MCP server, or pass --config through extraArgs for one call. Verify the outcome afterwards; DONE is the model's opinion.",
             json!({
                 "goal": { "type": "string", "description": "What to achieve on the open page, including when to stop." },
                 "maxSteps": { "type": "integer", "minimum": 1, "description": "Action budget (default 40)." },
@@ -4800,6 +4800,34 @@ mod tests {
         let payload: Value = serde_json::from_str(&args[5]).unwrap();
         assert_eq!(payload["siteKey"], "abc");
         assert_eq!(payload["url"], "https://example.com");
+    }
+
+    #[test]
+    fn mutation_tools_keep_cli_dispatch_and_uncertain_outcome_diagnostic() {
+        let arguments = json!({ "selector": "#local" });
+        let cli_args =
+            cli_tool_args(&arguments, click_command_args(&arguments).unwrap(), None).unwrap();
+        let flags = crate::flags::parse_flags(&cli_args);
+        let words = crate::flags::clean_args(&cli_args);
+        let command = crate::commands::parse_command(&words, &flags).unwrap();
+        assert_eq!(command["action"], "click");
+
+        let message = "Command outcome uncertain; it may have executed. Inspect the browser before deciding whether to repeat it: Failed to read: connection closed";
+        let result = tool_result_from_run(CliRun {
+            exit_code: Some(1),
+            stdout: json!({ "success": false, "error": message }).to_string(),
+            stderr: String::new(),
+        });
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["structuredContent"]["response"]["error"], message);
+        let click_tool = tools()
+            .into_iter()
+            .find(|tool| tool["name"] == TOOL_CLICK)
+            .unwrap();
+        assert!(click_tool["description"]
+            .as_str()
+            .unwrap()
+            .contains("without replaying the click"));
     }
 
     #[test]
