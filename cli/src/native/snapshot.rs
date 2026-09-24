@@ -719,7 +719,7 @@ pub async fn take_snapshot(
 }
 
 /// Resolve the child frame ID for an iframe element given its backendNodeId.
-fn frame_loader<'a>(tree: &'a Value, frame_id: Option<&str>) -> Option<&'a str> {
+pub(crate) fn frame_loader<'a>(tree: &'a Value, frame_id: Option<&str>) -> Option<&'a str> {
     let frame = &tree["frame"];
     if frame_id.is_none() || frame["id"].as_str() == frame_id {
         return frame["loaderId"].as_str().filter(|id| !id.is_empty());

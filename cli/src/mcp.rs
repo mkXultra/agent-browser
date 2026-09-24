@@ -1898,7 +1898,12 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_GOAL,
             "Goal",
-            "Drive the open page toward one natural-language goal. An evaluation model picks an operation and an observed element on every step; actions run through the normal command pipeline. A lost daemon reply after an action yields an uncertain outcome and stops the goal without replaying the action or treating it as a stale element. Pending confirmations stop safely and are returned with their confirmation ID. On DONE, one live get url read refreshes the final URL within 1000 ms and the remaining goal budget; a failed or unusable read retains DONE and the last observed URL. This includes a missing live page, an oversized response, or launch/relaunch lifecycle metadata. The read never launches or replaces a browser, creates a tab, retries, respawns the daemon, or prompts. The daemon reply is capped at 64 KiB. With WebDriver, the backend URL read also has a 1000 ms deadline and a 64 KiB cap including HTTP headers and chunk framing. Both paths require at least 10 ms remaining before JSON parsing and check the deadline while parsing. Oversized or late backend responses close the connection and release the daemon for subsequent commands. Standalone get url is unchanged. Step URLs stay historical, and this read does not wait for navigation to finish. Uses the goal provider selected by the nested goal config or AGENT_BROWSER_GOAL_PROVIDER: Vercel by default, or Cloudflare. Set AGENT_BROWSER_CONFIG on the MCP server, or pass --config through extraArgs for one call. Verify the outcome afterwards; DONE is the model's opinion.",
+            concat!(
+                "Drive the open page toward one natural-language goal. An evaluation model picks an operation and an observed element on every step; actions run through the normal command pipeline. A lost daemon reply after an action yields an uncertain outcome and stops the goal without replaying the action or treating it as a stale element. ",
+                "Goal operates on an already open page and never launches a browser. After a successful click, goal polls the exact snapshot node while covered within a fixed 1500 ms local cap and the overall timeout. Two Ready samples can proceed with unchanged snapshot text; later coverage resumes only within the original cap. At the cap, covered or unknown targets are withheld from CLICK choices while other controls and WAIT stay available; later WAIT can reveal readiness without renewing the cap. An unavailable node is reobserved within the original click cap before retirement or withholding. If that read fails, old element indices are withheld and WAIT may request a later fresh observation. Spinner text and unrelated counters do not stop polling. Text-only and unstructured one-button overlays do not qualify as useful dialogs. A visible dialog attached to the actual covering element but not enclosing the clicked target, with an enabled control and no visible busy or progress region, plus changed page content keeps the trigger withheld but permits a fresh model DONE assessment; content change alone never completes the goal. Delayed observed changes count as click progress. A changed page during evaluation of a guarded repeat or terminal decision while the click guard is active discards the old decision. Guarded clicks may scroll the exact node within its deadline, then recheck current document identity and coverage after confirmation. A lost reply or late input acknowledgement leaves a possibly dispatched click uncertain without automatic replay. Unknown checks and cross-process iframe ancestor coverage are not ready. A verified local component visual inside an existing target-owning dialog remains eligible only while the same node stays at the click point. A new or different sibling cover, including busy or progress content, is rejected during guarded dispatch and after approval; ordinary reference clicks retain their component visual allowance. Readiness is actionability now, not application completion. The private probe has no separate MCP tool; snapshot policy governs it and normal click policy governs dispatch. Human approval uses the remaining goal or original click-local deadline; approved work gets a fresh bounded execution slice within that allowance and a new exact-node check; late approval or explicit denial uses bounded nonexecuting cleanup. ",
+                "A verified local component visual hit may operate a guarded control, including after approval, while a different sibling hit remains coverage. An existing target-owning dialog reached through an open or closed shadow slot is not a new useful interface. After WAIT, a fresh observation lacking the old ref can supply replacement choices without a second full read; fingerprint change alone cannot retire it. A policy-denied read stops with its reason, while an operational read failure may recover after WAIT. ",
+                "Pending confirmations stop safely and are returned with their confirmation ID. On DONE, one live get url read refreshes the final URL within 1000 ms and the remaining goal budget; a failed or unusable read retains DONE and the last observed URL. This includes a missing live page, an oversized response, or launch/relaunch lifecycle metadata. The read never launches or replaces a browser, creates a tab, retries, respawns the daemon, or prompts. The daemon reply is capped at 64 KiB. With WebDriver, the backend URL read also has a 1000 ms deadline and a 64 KiB cap including HTTP headers and chunk framing. Both paths require at least 10 ms remaining before JSON parsing and check the deadline while parsing. Oversized or late backend responses close the connection and release the daemon for subsequent commands. Standalone get url is unchanged. Step URLs stay historical, and this read does not wait for navigation to finish. Uses the goal provider selected by the nested goal config or AGENT_BROWSER_GOAL_PROVIDER: Vercel by default, or Cloudflare. Set AGENT_BROWSER_CONFIG on the MCP server, or pass --config through extraArgs for one call. Verify the outcome afterwards; DONE is the model's opinion."
+            ),
             json!({
                 "goal": { "type": "string", "description": "What to achieve on the open page, including when to stop." },
                 "maxSteps": { "type": "integer", "minimum": 1, "description": "Action budget (default 40)." },
@@ -4930,6 +4935,34 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("AGENT_BROWSER_GOAL_PROVIDER"));
+        for detail in [
+            "1500 ms local cap",
+            "withheld from CLICK choices",
+            "terminal decision while the click guard is active",
+            "no separate MCP tool",
+            "Readiness is actionability now",
+            "content change alone never completes the goal",
+            "Delayed observed changes count as click progress",
+            "Spinner text and unrelated counters do not stop polling",
+            "Text-only and unstructured one-button overlays do not qualify",
+            "existing target-owning dialog remains eligible",
+            "new or different sibling cover",
+            "including busy or progress content",
+            "actual covering element",
+            "enabled control and no visible busy or progress region",
+            "old element indices are withheld",
+            "unavailable node is reobserved within the original click cap",
+            "fresh bounded execution slice",
+            "Guarded clicks may scroll the exact node within its deadline",
+            "late approval or explicit denial uses bounded nonexecuting cleanup",
+            "verified local component visual hit",
+            "different sibling hit remains coverage",
+            "open or closed shadow slot",
+            "fresh observation lacking the old ref",
+            "policy-denied read stops with its reason",
+        ] {
+            assert!(goal_tool["description"].as_str().unwrap().contains(detail));
+        }
         assert!(goal_tool["description"]
             .as_str()
             .unwrap()

@@ -3641,6 +3641,39 @@ Actions run through the normal command pipeline (click @eN, fill @eN, scroll,
 wait), so action policies, --confirm-actions, --allowed-domains, and session
 isolation apply unchanged. The run stops on DONE, BLOCKED, the step budget,
 the time budget, or three consecutive actions that do not change the page.
+After a successful CLICK, goal checks the original node without scrolling or
+retargeting it. If a spinner or overlay covers it, goal polls within a fixed
+1500 ms local cap and the overall timeout. Ready can proceed even when the
+snapshot is unchanged. At the cap, covered or unknown targets are withheld
+from CLICK choices while other controls and WAIT remain available. A later
+WAIT can reveal fresh readiness without renewing the cap. A removed node is
+reobserved within the original cap before retirement, then the model assesses the new page.
+If that read fails, old element indices are withheld; WAIT can request a later fresh read. Goal
+discards a stale guarded repeat or terminal decision while the click guard is
+active. If coverage begins later, polling resumes only within the original
+cap. Text in a spinner or an unrelated counter does not stop polling.
+Text-only and unstructured one-button overlays do not qualify. When the
+actual covering element contains a visible dialog that does not enclose the
+clicked target, has an enabled control and no visible busy or progress region,
+and page content changes,
+the trigger remains unavailable but a fresh model decision may say DONE;
+changed content alone never completes the goal. Delayed observed changes count
+as action progress. Native goal clicks may scroll the exact node within the
+deadline, then recheck document
+identity and coverage after confirmation. A late input reply leaves the click
+outcome uncertain.
+An unsupported or uncertain probe never means ready. Guarded goal clicks
+keep an established local component visual hit, such as a switch track or
+ripple surface, only while that same node remains at the click point. A new
+sibling cover is rejected, including after approval. A visual inside its
+existing target-owning dialog remains eligible; busy or progress covers do not.
+Ordinary reference
+clicks retain their component visual allowance. Cross-process iframe
+coverage is conservatively unsupported. This checks
+actionability, not completion of an application's background work.
+After WAIT, a fresh page that omits the old ref can supply replacement choices
+without another full read. A policy-denied observation stops the goal with
+the policy reason; operational read failures may still allow a later WAIT.
 After the last allowed action, one final model assessment may return DONE but
 no further action can run. Scroll movement counts as page progress. A pending
 confirmation is never counted as an executed step. Without
@@ -3648,6 +3681,12 @@ confirmation is never counted as an executed step. Without
 a TTY uses the normal prompt; non-TTY stdin keeps the CLI's auto-denial behavior
 and goal returns denied. Approval after the goal deadline triggers safe denial
 cleanup, returns timeout, and does not dispatch the pending action.
+An explicit denial after the deadline uses the same bounded nonexecuting
+cleanup and still returns denied.
+Private probes execute within 500 ms; observations and guarded clicks get up
+to 30 s per execution. Interactive approval may use the remaining goal time
+or original click wait cap; approved work gets a fresh bounded execution slice
+and repeats the exact-node check.
 On DONE, the final URL is refreshed once with get url, allowing at most 1000 ms
 within the remaining goal time budget. Failed, timed-out, oversized, or unusable
 reads keep DONE and the last observed URL, including a missing live browser/page
@@ -3672,7 +3711,8 @@ reset explicit model IDs; override them too, or omit model settings to use the
 selected provider's defaults. Credentials in JSON are plaintext, so prefer
 ~/.agent-browser/config.json with mode 600 and never commit them in
 agent-browser.json. Config discovery does not load .env files. Start from a page
-that is already open in the session; goal does not navigate on its own.
+that is already open in the session; goal never launches a browser or navigates
+on its own.
 
 Goal Options:
   --max-steps <n>        Action budget (default: 40)

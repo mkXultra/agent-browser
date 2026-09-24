@@ -1018,9 +1018,16 @@ pub(crate) enum DispatchPhase {
     PossiblySent,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransportErrorKind {
+    Other,
+    Deadline,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct TransportError {
     pub phase: DispatchPhase,
+    pub kind: TransportErrorKind,
     pub message: String,
 }
 
@@ -1112,69 +1119,192 @@ pub fn send_command_before(
     session: &str,
     deadline: Instant,
 ) -> Result<Response, String> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    send_command_before_limit(cmd, session, deadline, MAX_DEADLINE_RESPONSE_BYTES)
+}
+
+/// One bounded, non-retried goal observation. Full snapshots may exceed the
+/// completion URL's small response cap, but remain bounded in time and size.
+pub(crate) fn send_goal_observation_before_result(
+    cmd: Value,
+    session: &str,
+    deadline: Instant,
+) -> Result<Response, TransportError> {
+    send_command_before_limit_result(cmd, session, deadline, 4 * 1024 * 1024)
+}
+
+fn send_command_before_limit(
+    cmd: Value,
+    session: &str,
+    deadline: Instant,
+    max_response_bytes: usize,
+) -> Result<Response, String> {
+    send_command_before_limit_result(cmd, session, deadline, max_response_bytes)
+        .map_err(|error| error.message)
+}
+
+/// A bounded goal command retains the accepted-byte phase and retries only a
+/// transient request that has provably sent no bytes within this deadline.
+pub(crate) fn send_goal_command_before(
+    cmd: Value,
+    session: &str,
+    deadline: Instant,
+) -> Result<Response, TransportError> {
+    retry_goal_not_sent_before(deadline, || {
+        send_command_before_limit_result(cmd.clone(), session, deadline, 4 * 1024 * 1024)
+    })
+}
+
+fn retry_goal_not_sent_before(
+    deadline: Instant,
+    mut attempt: impl FnMut() -> Result<Response, TransportError>,
+) -> Result<Response, TransportError> {
+    for retry in 0..3 {
+        match attempt() {
+            Err(error)
+                if retry < 2
+                    && error.phase == DispatchPhase::NotSent
+                    && error.kind != TransportErrorKind::Deadline
+                    && is_transient_error(&error.message)
+                    && Instant::now() < deadline =>
+            {
+                let pause = Duration::from_millis(10 * (retry + 1));
+                thread::sleep(pause.min(deadline.saturating_duration_since(Instant::now())));
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the bounded retry returns on its final attempt")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BoundedError {
+    Deadline,
+    Message(String),
+}
+
+async fn write_request_before(
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
+    request: &[u8],
+    phase: &std::cell::Cell<DispatchPhase>,
+) -> Result<(), BoundedError> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut written = 0;
+    while written < request.len() {
+        match stream.write(&request[written..]).await {
+            Ok(0) => {
+                return Err(BoundedError::Message(
+                    "Failed to send: WriteZero (writer accepted no bytes)".into(),
+                ));
+            }
+            Ok(count) => {
+                phase.set(DispatchPhase::PossiblySent);
+                written += count;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(BoundedError::Message(format!("Failed to send: {}", error)));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn send_command_before_limit_result(
+    cmd: Value,
+    session: &str,
+    deadline: Instant,
+    max_response_bytes: usize,
+) -> Result<Response, TransportError> {
+    use tokio::io::AsyncReadExt;
+
+    let phase = std::cell::Cell::new(DispatchPhase::NotSent);
+    let error = |message: String| TransportError {
+        phase: phase.get(),
+        kind: TransportErrorKind::Other,
+        message,
+    };
+    let deadline_error = || TransportError {
+        phase: phase.get(),
+        kind: TransportErrorKind::Deadline,
+        message: "Command deadline expired".into(),
+    };
 
     if Instant::now() >= deadline {
-        return Err("Command deadline expired".to_string());
+        return Err(deadline_error());
     }
-    let mut request = serde_json::to_string(&cmd).map_err(|e| e.to_string())?;
+    let mut request = serde_json::to_string(&cmd).map_err(|e| error(e.to_string()))?;
     request.push('\n');
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|e| format!("Failed to create command runtime: {}", e))?;
+        .map_err(|e| error(format!("Failed to create command runtime: {}", e)))?;
 
-    let response_bytes = runtime.block_on(async {
-        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
-            // Do not dispatch if preparing the request exhausted the budget.
-            if Instant::now() >= deadline {
-                return Err("Command deadline expired".to_string());
-            }
-            #[cfg(unix)]
-            let mut stream = tokio::net::UnixStream::connect(get_socket_path(session))
-                .await
-                .map_err(|e| format!("Failed to connect: {}", e))?;
-            #[cfg(windows)]
-            let mut stream = tokio::net::TcpStream::connect((
-                std::net::Ipv4Addr::LOCALHOST,
-                resolve_port(session),
-            ))
-            .await
-            .map_err(|e| format!("Failed to connect: {}", e))?;
-
-            stream
-                .write_all(request.as_bytes())
-                .await
-                .map_err(|e| format!("Failed to send: {}", e))?;
-            // One extra byte distinguishes an oversized response from a valid
-            // response exactly at the limit. No read or allocation can grow
-            // beyond this fixed buffer, even if the daemon never sends a newline.
-            let mut response = vec![0; MAX_DEADLINE_RESPONSE_BYTES + 1];
-            let mut used = 0;
-            loop {
-                let count = stream
-                    .read(&mut response[used..])
+    let response_bytes = runtime
+        .block_on(async {
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+                // Do not dispatch if preparing the request exhausted the budget.
+                if Instant::now() >= deadline {
+                    return Err(BoundedError::Deadline);
+                }
+                #[cfg(unix)]
+                let mut stream = tokio::net::UnixStream::connect(get_socket_path(session))
                     .await
-                    .map_err(|e| format!("Failed to read: {}", e))?;
-                let newline = response[used..used + count]
-                    .iter()
-                    .position(|byte| *byte == b'\n');
-                used += newline.map_or(count, |offset| offset + 1);
-                if used > MAX_DEADLINE_RESPONSE_BYTES {
-                    return Err("Command response exceeds 64 KiB limit".to_string());
+                    .map_err(|e| BoundedError::Message(format!("Failed to connect: {}", e)))?;
+                #[cfg(windows)]
+                let mut stream = tokio::net::TcpStream::connect((
+                    std::net::Ipv4Addr::LOCALHOST,
+                    resolve_port(session),
+                ))
+                .await
+                .map_err(|e| BoundedError::Message(format!("Failed to connect: {}", e)))?;
+
+                write_request_before(&mut stream, request.as_bytes(), &phase).await?;
+                // One extra byte distinguishes an oversized response from a valid
+                // response exactly at the limit. No read or allocation can grow
+                // beyond this fixed buffer, even if the daemon never sends a newline.
+                let mut response = vec![0; max_response_bytes + 1];
+                let mut used = 0;
+                loop {
+                    let count = stream
+                        .read(&mut response[used..])
+                        .await
+                        .map_err(|e| BoundedError::Message(format!("Failed to read: {}", e)))?;
+                    let newline = response[used..used + count]
+                        .iter()
+                        .position(|byte| *byte == b'\n');
+                    used += newline.map_or(count, |offset| offset + 1);
+                    if used > max_response_bytes {
+                        return Err(BoundedError::Message(
+                            if max_response_bytes == MAX_DEADLINE_RESPONSE_BYTES {
+                                "Command response exceeds 64 KiB limit".to_string()
+                            } else {
+                                format!(
+                                    "Command response exceeds {} byte limit",
+                                    max_response_bytes
+                                )
+                            },
+                        ));
+                    }
+                    if newline.is_some() || count == 0 {
+                        response.truncate(used);
+                        return Ok(response);
+                    }
                 }
-                if newline.is_some() || count == 0 {
-                    response.truncate(used);
-                    return Ok(response);
-                }
-            }
+            })
+            .await
+            .map_err(|_| BoundedError::Deadline)?
         })
-        .await
-        .map_err(|_| "Command deadline expired".to_string())?
-    })?;
+        .map_err(|failure| match failure {
+            BoundedError::Deadline => deadline_error(),
+            BoundedError::Message(message) => error(message),
+        })?;
     // Parsing is synchronous and cannot be cancelled by Tokio's timeout. Keep
     // it outside that future and bound both its input and its remaining budget.
-    parse_response_before(&response_bytes, deadline)
+    parse_response_before(&response_bytes, deadline).map_err(|failure| match failure {
+        BoundedError::Deadline => deadline_error(),
+        BoundedError::Message(message) => error(message),
+    })
 }
 
 const MAX_DEADLINE_RESPONSE_BYTES: usize = 64 * 1024;
@@ -1197,18 +1327,24 @@ impl Read for DeadlineResponseReader<'_> {
     }
 }
 
-fn parse_response_before(bytes: &[u8], deadline: Instant) -> Result<Response, String> {
+fn parse_response_before(bytes: &[u8], deadline: Instant) -> Result<Response, BoundedError> {
     if deadline.saturating_duration_since(Instant::now()) < DEADLINE_RESPONSE_PARSE_RESERVE {
-        return Err("Command deadline expired".to_string());
+        return Err(BoundedError::Deadline);
     }
     // serde_json's reader consumes bytes through Read, allowing deadline checks
     // during parsing instead of only before and after an uninterruptible parse.
     // The wire limit also bounds Value allocations and cleanup on any error.
     let response = serde_json::from_reader(DeadlineResponseReader { bytes, deadline });
     if Instant::now() >= deadline {
-        return Err("Command deadline expired".to_string());
+        return Err(BoundedError::Deadline);
     }
-    response.map_err(|e| format!("Invalid response: {}", e))
+    response.map_err(|e: serde_json::Error| {
+        if e.io_error_kind() == Some(std::io::ErrorKind::TimedOut) {
+            BoundedError::Deadline
+        } else {
+            BoundedError::Message(format!("Invalid response: {}", e))
+        }
+    })
 }
 
 /// Check whether a transport error is transient. DispatchPhase and the command's
@@ -1284,6 +1420,7 @@ fn send_command_once(
 ) -> Result<Response, TransportError> {
     let mut stream = connect(session).map_err(|message| TransportError {
         phase: DispatchPhase::NotSent,
+        kind: TransportErrorKind::Other,
         message,
     })?;
 
@@ -1294,6 +1431,7 @@ fn send_command_once(
 
     let mut json_str = serde_json::to_string(cmd).map_err(|e| TransportError {
         phase: DispatchPhase::NotSent,
+        kind: TransportErrorKind::Other,
         message: e.to_string(),
     })?;
     json_str.push('\n');
@@ -1310,11 +1448,13 @@ fn read_response(stream: impl Read) -> Result<Response, TransportError> {
         .read_line(&mut response_line)
         .map_err(|e| TransportError {
             phase: DispatchPhase::PossiblySent,
+            kind: TransportErrorKind::Other,
             message: format!("Failed to read: {}", e),
         })?;
 
     serde_json::from_str(&response_line).map_err(|e| TransportError {
         phase: DispatchPhase::PossiblySent,
+        kind: TransportErrorKind::Other,
         message: format!("Invalid response: {}", e),
     })
 }
@@ -1333,6 +1473,7 @@ fn write_request(stream: &mut impl Write, request: &[u8]) -> Result<(), Transpor
                     } else {
                         DispatchPhase::PossiblySent
                     },
+                    kind: TransportErrorKind::Other,
                     message: "Failed to send: WriteZero (writer accepted no bytes)".to_string(),
                 });
             }
@@ -1345,6 +1486,7 @@ fn write_request(stream: &mut impl Write, request: &[u8]) -> Result<(), Transpor
                     } else {
                         DispatchPhase::PossiblySent
                     },
+                    kind: TransportErrorKind::Other,
                     message: format!("Failed to send: {}", error),
                 });
             }
@@ -1657,6 +1799,119 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn bounded_goal_writer_counts_zero_and_partial_bytes() {
+        use std::collections::VecDeque;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::AsyncWrite;
+
+        enum WriteStep {
+            Interrupted,
+            Zero,
+            Accept(usize),
+            BrokenPipe,
+        }
+        struct Writer {
+            steps: VecDeque<WriteStep>,
+            accepted: Vec<u8>,
+        }
+        impl AsyncWrite for Writer {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Poll::Ready(match self.steps.pop_front().unwrap() {
+                    WriteStep::Interrupted => Err(std::io::ErrorKind::Interrupted.into()),
+                    WriteStep::Zero => Ok(0),
+                    WriteStep::Accept(count) => {
+                        self.accepted.extend_from_slice(&bytes[..count]);
+                        Ok(count)
+                    }
+                    WriteStep::BrokenPipe => Err(std::io::ErrorKind::BrokenPipe.into()),
+                })
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        for steps in [
+            vec![WriteStep::Interrupted, WriteStep::Zero],
+            vec![WriteStep::BrokenPipe],
+        ] {
+            let phase = std::cell::Cell::new(DispatchPhase::NotSent);
+            let mut writer = Writer {
+                steps: steps.into(),
+                accepted: Vec::new(),
+            };
+            assert!(write_request_before(&mut writer, b"request\n", &phase)
+                .await
+                .is_err());
+            assert_eq!(phase.get(), DispatchPhase::NotSent);
+            assert!(writer.accepted.is_empty());
+        }
+
+        let phase = std::cell::Cell::new(DispatchPhase::NotSent);
+        let mut writer = Writer {
+            steps: vec![WriteStep::Accept(3), WriteStep::BrokenPipe].into(),
+            accepted: Vec::new(),
+        };
+        assert!(write_request_before(&mut writer, b"request\n", &phase)
+            .await
+            .is_err());
+        assert_eq!(phase.get(), DispatchPhase::PossiblySent);
+        assert_eq!(writer.accepted, b"req");
+    }
+
+    #[test]
+    fn bounded_goal_retry_only_recovers_not_sent_mutations() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut attempts = 0;
+        let response = retry_goal_not_sent_before(deadline, || {
+            attempts += 1;
+            if attempts == 1 {
+                Err(TransportError {
+                    phase: DispatchPhase::NotSent,
+                    kind: TransportErrorKind::Other,
+                    message: "Failed to send: Broken pipe".into(),
+                })
+            } else {
+                Ok(Response {
+                    success: true,
+                    ..Response::default()
+                })
+            }
+        })
+        .unwrap();
+        assert!(response.success);
+        assert_eq!(attempts, 2);
+
+        attempts = 0;
+        let error = retry_goal_not_sent_before(deadline, || {
+            attempts += 1;
+            Err(TransportError {
+                phase: DispatchPhase::PossiblySent,
+                kind: TransportErrorKind::Other,
+                message: "Failed to send: Broken pipe after 3 bytes".into(),
+            })
+        })
+        .err()
+        .expect("possibly sent command must not retry");
+        assert_eq!(error.phase, DispatchPhase::PossiblySent);
+        assert_eq!(attempts, 1);
+    }
+
     #[test]
     fn partial_write_failure_is_possibly_dispatched() {
         struct PartialWriter(usize);
@@ -1841,6 +2096,7 @@ mod tests {
             if attempts == 1 {
                 Err(TransportError {
                     phase: DispatchPhase::NotSent,
+                    kind: TransportErrorKind::Other,
                     message: "Failed to connect: Resource temporarily unavailable (os error 11)"
                         .into(),
                 })
@@ -1878,6 +2134,62 @@ mod tests {
             server.join().unwrap();
             assert!(response.success);
             assert_eq!(response.data.unwrap()["url"], "https://example.com/new");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_goal_observation_accepts_full_snapshot_over_url_limit() {
+        with_deadline_socket(|listener| {
+            let snapshot = "x".repeat(MAX_DEADLINE_RESPONSE_BYTES + 1024);
+            let reply = format!(
+                "{{\"success\":true,\"data\":{{\"snapshot\":\"{}\"}}}}\n",
+                snapshot
+            );
+            let server = thread::spawn(move || {
+                let (mut stream, request) = accept_deadline_request(&listener);
+                assert_eq!(request["action"], "snapshot");
+                stream.write_all(reply.as_bytes()).unwrap();
+            });
+            let response = send_goal_observation_before_result(
+                json!({"action":"snapshot","goalExistingOnly":true}),
+                "bounded-url",
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap();
+            server.join().unwrap();
+            assert_eq!(
+                response.data.unwrap()["snapshot"].as_str().unwrap().len(),
+                snapshot.len()
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_goal_observation_times_out_stalled_fake_daemon_without_retry() {
+        with_deadline_socket(|listener| {
+            let server = thread::spawn(move || {
+                let (mut stream, _) = accept_deadline_request(&listener);
+                thread::sleep(Duration::from_millis(120));
+                assert_deadline_socket_closed(&mut stream);
+                listener
+            });
+            let started = Instant::now();
+            let error = send_goal_observation_before_result(
+                json!({"action":"snapshot","goalExistingOnly":true}),
+                "bounded-url",
+                started + Duration::from_millis(50),
+            )
+            .err()
+            .unwrap();
+            let listener = server.join().unwrap();
+            assert_eq!(error.kind, TransportErrorKind::Deadline);
+            assert!(started.elapsed() < Duration::from_millis(250));
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
         });
     }
 
@@ -2105,7 +2417,7 @@ mod tests {
         )
         .err()
         .unwrap();
-        assert_eq!(error, "Command deadline expired");
+        assert_eq!(error, BoundedError::Deadline);
     }
 
     #[test]

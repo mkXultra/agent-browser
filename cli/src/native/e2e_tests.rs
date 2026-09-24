@@ -33,6 +33,826 @@ fn get_data(resp: &Value) -> &Value {
     resp.get("data").expect("Missing 'data' in response")
 }
 
+async fn goal_fixture_command(cmd: &Value, state: &mut DaemonState) -> Value {
+    Box::pin(execute_command(cmd, state)).await
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_goal_guarded_click_waits_for_local_spinner_and_rejects_replaced_node() {
+    let mut state = DaemonState::new();
+    assert_success(
+        &goal_fixture_command(&json!({"action":"launch","headless":true}), &mut state).await,
+    );
+    let html = r#"<h1 id='month'>June</h1><button id='previous' onclick='window.clicks++; document.getElementById("spinner").style.display="block"; window.transition = new Promise(resolve => window.releaseTransition = () => { document.getElementById("month").textContent="May"; document.getElementById("spinner").style.display="none"; resolve(); });'>Previous</button><div id='spinner' style='display:none;position:fixed;inset:0;z-index:10;background:rgba(0,0,0,.1)'></div><script>window.clicks=0</script>"#;
+    let url = format!("data:text/html;base64,{}", STANDARD.encode(html));
+    assert_success(
+        &goal_fixture_command(&json!({"action":"navigate","url":url}), &mut state).await,
+    );
+    let snapshot = goal_fixture_command(&json!({"action":"snapshot"}), &mut state).await;
+    assert_success(&snapshot);
+    let reference = get_data(&snapshot)["refs"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(_, entry)| entry["name"] == "Previous")
+        .map(|(name, _)| name.clone())
+        .unwrap();
+    let selector = format!("@{reference}");
+    let probe = goal_fixture_command(
+        &json!({"action":"__goal_probe","selector":selector,"goalTimeoutMs":500}),
+        &mut state,
+    )
+    .await;
+    assert_success(&probe);
+    assert_eq!(probe["data"]["status"], "ready", "{probe}");
+    let identity = probe["data"]["identity"].clone();
+    let expiry = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 30_000;
+    let clicked = goal_fixture_command(&json!({"action":"click","selector":selector,"goalGuard":identity,"goalTimeoutMs":1000,"goalDeadlineUnixMs":expiry}), &mut state).await;
+    assert_success(&clicked);
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let covered = goal_fixture_command(&json!({"action":"__goal_probe","selector":selector,"expectedIdentity":identity,"goalTimeoutMs":500}), &mut state).await;
+    assert_success(&covered);
+    assert_eq!(covered["data"]["status"], "covered", "{covered}");
+    let refused = goal_fixture_command(&json!({"action":"click","selector":selector,"goalGuard":identity,"goalTimeoutMs":500,"goalDeadlineUnixMs":expiry}), &mut state).await;
+    assert_eq!(refused["success"], false, "{refused}");
+    assert_success(
+        &goal_fixture_command(
+            &json!({"action":"evaluate","script":"window.releaseTransition()"}),
+            &mut state,
+        )
+        .await,
+    );
+    let ready = goal_fixture_command(&json!({"action":"__goal_probe","selector":selector,"expectedIdentity":identity,"goalTimeoutMs":500}), &mut state).await;
+    assert_eq!(ready["data"]["status"], "ready", "{ready}");
+    assert_success(&goal_fixture_command(&json!({"action":"evaluate","script":"document.getElementById('previous').outerHTML = '<button id=\"previous\" onclick=\"window.clicks++\">Previous</button>'"}), &mut state).await);
+    let replaced = goal_fixture_command(&json!({"action":"click","selector":selector,"goalGuard":identity,"goalTimeoutMs":500,"goalDeadlineUnixMs":expiry}), &mut state).await;
+    assert_eq!(replaced["success"], false, "{replaced}");
+    let fresh_snapshot = goal_fixture_command(&json!({"action":"snapshot"}), &mut state).await;
+    let fresh_ref = get_data(&fresh_snapshot)["refs"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(_, entry)| entry["name"] == "Previous")
+        .map(|(name, _)| name.clone())
+        .unwrap();
+    let fresh_selector = format!("@{fresh_ref}");
+    let fresh_probe = goal_fixture_command(
+        &json!({"action":"__goal_probe","selector":fresh_selector,"goalTimeoutMs":500}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(fresh_probe["data"]["status"], "ready", "{fresh_probe}");
+    let policy_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(policy_file.path(), r#"{"confirm":["click"]}"#).unwrap();
+    state.policy =
+        Some(super::policy::ActionPolicy::load(policy_file.path().to_str().unwrap()).unwrap());
+    let pending = goal_fixture_command(&json!({"action":"click","selector":fresh_selector,"goalGuard":fresh_probe["data"]["identity"],"goalTimeoutMs":1000,"goalDeadlineUnixMs":expiry}), &mut state).await;
+    assert_eq!(pending["data"]["confirmation_required"], true, "{pending}");
+    assert_success(&goal_fixture_command(&json!({"action":"evaluate","script":"document.getElementById('previous').outerHTML = '<button id=\"previous\" onclick=\"window.clicks++\">Previous</button>'"}), &mut state).await);
+    let confirmed = goal_fixture_command(&json!({"action":"confirm"}), &mut state).await;
+    assert_eq!(confirmed["data"]["result"]["success"], false, "{confirmed}");
+    assert!(
+        confirmed["data"]["result"]["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Goal target unavailable"),
+        "{confirmed}"
+    );
+    assert_success(&goal_fixture_command(&json!({"action":"evaluate","script":"window.clicks === 1 && document.getElementById('month').textContent === 'May'"}), &mut state).await);
+    let count = goal_fixture_command(
+        &json!({"action":"evaluate","script":"window.clicks"}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(get_data(&count)["result"], 1);
+    let _ = close_current_browser(&mut state).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_goal_covering_dialog_must_be_new_visible_and_useful() {
+    let mut state = DaemonState::new();
+    assert_success(
+        &goal_fixture_command(&json!({"action":"launch","headless":true}), &mut state).await,
+    );
+    let cases = [
+        (
+            "existing target dialog",
+            "<section role='dialog' style='position:relative'><button>Previous</button><div id='cover' hidden style='position:absolute;inset:0;z-index:10;background:#eee'>Loading...</div></section>",
+            false,
+        ),
+        (
+            "busy-only dialog",
+            "<button>Previous</button><div id='cover' hidden role='dialog' style='position:fixed;inset:0;z-index:10;background:#eee'>Loading...</div>",
+            false,
+        ),
+        (
+            "busy-only dialog with detail",
+            "<button>Previous</button><div id='cover' hidden role='dialog' style='position:fixed;inset:0;z-index:10;background:#eee'>Loading your calendar...</div>",
+            false,
+        ),
+        (
+            "localized loading dialog",
+            "<button>Previous</button><div id='cover' hidden role='dialog' style='position:fixed;inset:0;z-index:10;background:#eee'>読み込み中...</div>",
+            false,
+        ),
+        (
+            "text-only settings dialog",
+            "<button>Previous</button><div id='cover' hidden role='dialog' style='position:fixed;inset:0;z-index:10;background:#eee'>Settings open</div>",
+            false,
+        ),
+        (
+            "busy dialog with cancel",
+            "<button>Previous</button><div id='cover' hidden role='dialog' style='position:fixed;inset:0;z-index:10;background:#eee'><div role='progressbar'></div><button>Cancel</button></div>",
+            false,
+        ),
+        (
+            "unstructured spinner with cancel",
+            "<button>Previous</button><div id='cover' hidden role='dialog' style='position:fixed;inset:0;z-index:10;background:#eee'>Loading...<button>Cancel</button></div>",
+            false,
+        ),
+        (
+            "disabled dialog control",
+            "<button>Previous</button><div id='cover' hidden role='dialog' style='position:fixed;inset:0;z-index:10;background:#eee'><button aria-disabled='true'>Cancel</button></div>",
+            false,
+        ),
+        (
+            "visible dialog after hidden sibling",
+            "<button>Previous</button><div id='cover' hidden style='position:fixed;inset:0;z-index:10;background:#eee'><div role='dialog' hidden><button>Inactive</button></div><div role='dialog' aria-label='Settings'>Settings open <button>Dismiss</button></div></div>",
+            true,
+        ),
+    ];
+    for (name, html, expected_interface) in cases {
+        let url = format!("data:text/html;base64,{}", STANDARD.encode(html));
+        assert_success(
+            &goal_fixture_command(&json!({"action":"navigate","url":url}), &mut state).await,
+        );
+        let snapshot = goal_fixture_command(&json!({"action":"snapshot"}), &mut state).await;
+        let selector = get_data(&snapshot)["refs"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .find(|(_, entry)| entry["name"] == "Previous")
+            .map(|(reference, _)| format!("@{reference}"))
+            .unwrap_or_else(|| panic!("missing Previous ref for {name}: {snapshot}"));
+        assert_success(
+            &goal_fixture_command(
+                &json!({"action":"evaluate","script":"document.getElementById('cover').hidden=false"}),
+                &mut state,
+            )
+            .await,
+        );
+        let probe = goal_fixture_command(
+            &json!({"action":"__goal_probe","selector":selector,"goalTimeoutMs":500}),
+            &mut state,
+        )
+        .await;
+        assert_success(&probe);
+        assert_eq!(probe["data"]["status"], "covered", "{name}: {probe}");
+        assert_eq!(
+            probe["data"]["coveringInterface"], expected_interface,
+            "{name}: {probe}"
+        );
+    }
+    // The assigning slot is the target's rendered parent even when a closed
+    // root hides assignedSlot from the light-DOM button.
+    for mode in ["open", "closed"] {
+        let slotted = r#"<x-calendar><button slot='target' onclick='window.clicks++'>Previous</button></x-calendar>
+<script>customElements.define('x-calendar', class extends HTMLElement {
+  connectedCallback() {
+    window.fixtureRoot=this.attachShadow({mode:'open'});
+    window.fixtureRoot.innerHTML = `<div role='dialog' aria-label='Owner settings' style='position:relative;width:300px;height:120px'><slot name='target'></slot><div id='cover' hidden style='position:fixed;inset:0;z-index:2147483647;background:#eee;pointer-events:auto'><button>Dismiss</button></div></div>`;
+  }
+});window.clicks=0;</script>"#.replace("mode:'open'", &format!("mode:'{mode}'"));
+        let url = format!("data:text/html;base64,{}", STANDARD.encode(slotted));
+        assert_success(
+            &goal_fixture_command(&json!({"action":"navigate","url":url}), &mut state).await,
+        );
+        let snapshot = goal_fixture_command(&json!({"action":"snapshot"}), &mut state).await;
+        let selector = get_data(&snapshot)["refs"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .find(|(_, entry)| entry["name"] == "Previous")
+            .map(|(reference, _)| format!("@{reference}"))
+            .unwrap_or_else(|| panic!("missing slotted Previous: {snapshot}"));
+        assert_success(&goal_fixture_command(&json!({"action":"evaluate","script":"window.fixtureRoot.querySelector('#cover').hidden=false"}), &mut state).await);
+        let geometry = goal_fixture_command(
+        &json!({"action":"evaluate","script":"(()=>{const host=document.querySelector('x-calendar');const button=host.querySelector('button');const cover=window.fixtureRoot.querySelector('#cover');const box=button.getBoundingClientRect();const hit=window.fixtureRoot.elementFromPoint(box.x+box.width/2,box.y+box.height/2);return {hitInsideCover:cover.contains(hit),coverVisible:getComputedStyle(cover).display!=='none'}})()"}),
+        &mut state,
+    ).await;
+        assert_success(&geometry);
+        assert_eq!(
+            get_data(&geometry)["result"]["hitInsideCover"],
+            true,
+            "{geometry}"
+        );
+        let probe = goal_fixture_command(
+            &json!({"action":"__goal_probe","selector":selector,"goalTimeoutMs":500}),
+            &mut state,
+        )
+        .await;
+        assert_success(&probe);
+        assert_eq!(probe["data"]["status"], "covered", "{probe}");
+        assert_eq!(probe["data"]["coveringInterface"], false, "{probe}");
+        let expiry = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 1000;
+        let refused = goal_fixture_command(
+        &json!({"action":"click","selector":selector,"goalGuard":probe["data"]["identity"],"goalTimeoutMs":500,"goalDeadlineUnixMs":expiry}),
+        &mut state,
+    ).await;
+        assert_eq!(refused["success"], false, "{refused}");
+        let count = goal_fixture_command(
+            &json!({"action":"evaluate","script":"window.clicks"}),
+            &mut state,
+        )
+        .await;
+        assert_success(&count);
+        assert_eq!(get_data(&count)["result"], 0, "{count}");
+    }
+    let _ = close_current_browser(&mut state).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_goal_component_visuals_keep_exact_hit_through_repeat_and_approval() {
+    let html = r#"<!doctype html><body style='margin:0'><script>
+window.hits={ripple:0,toggle:0,decor:0,details:0,summary:0};
+function host(top,width,height) {
+  const h=document.createElement('div');
+  h.style=`position:absolute;left:20px;top:${top}px;width:${width}px;height:${height}px`;
+  document.body.append(h); return h;
+}
+const ripple=host(20,160,40), rr=ripple.attachShadow({mode:'open'});
+rr.innerHTML='<button style="width:160px;height:40px">Ripple target</button><div id="ripple" style="position:absolute;inset:0"></div>';
+rr.getElementById('ripple').attachShadow({mode:'closed'}).innerHTML='<div style="position:absolute;inset:0;background:#ccc"></div>';
+ripple.onclick=()=>hits.ripple++;
+const toggle=host(80,60,30), tr=toggle.attachShadow({mode:'open'});
+tr.innerHTML='<input type="checkbox" aria-label="Toggle target" style="position:absolute;inset:0;margin:0;width:60px;height:30px;opacity:.01"><span class="track" style="position:absolute;inset:0;background:#ccc"></span>';
+const ti=tr.querySelector('input');toggle.onclick=e=>{if(e.composedPath()[0]!==ti)ti.checked=!ti.checked;hits.toggle++};
+const decor=host(130,200,40), di=document.createElement('input');
+di.type='checkbox';di.setAttribute('aria-label','Decor target');di.style='position:absolute;inset:0;margin:0;width:200px;height:40px';decor.append(di);
+window.decorRoot=decor.attachShadow({mode:'open'});
+decorRoot.innerHTML='<slot></slot><span class="decor" style="position:absolute;inset:0;background:#ccc"></span>';
+decor.onclick=e=>{if(e.composedPath()[0]!==di)di.checked=!di.checked;hits.decor++};
+for(const [i,kind] of ['details','summary'].entries()) {
+  const h=host(200+i*110,240,80), root=h.attachShadow({mode:'open'});
+  const input='<input type="checkbox" aria-label="'+kind+' target" style="width:40px;height:40px;margin:0">';
+  root.innerHTML=(kind==='details'?'<details open><summary>Question</summary>'+input+'</details>':'<details><summary>'+input+'</summary>Body</details>')+
+    '<span class="visual" style="position:absolute;inset:0;background:#ddd"></span>';
+  const control=root.querySelector('input');h.onclick=e=>{if(e.composedPath()[0]!==control)control.checked=!control.checked;hits[kind]++};
+}
+</script></body>"#;
+    let mut state = DaemonState::new();
+    let snapshot = reference_relationship_page(&mut state, html).await;
+    let expiry = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 20_000;
+    let cases = [
+        ("Ripple target", "ripple"),
+        ("Toggle target", "toggle"),
+        ("Decor target", "decor"),
+        ("details target", "details"),
+        ("summary target", "summary"),
+    ];
+    let mut decor_identity = Value::Null;
+    let mut decor_selector = String::new();
+    for (name, kind) in cases {
+        let selector = format!("@{}", reference_named(&snapshot, name));
+        let probe = goal_fixture_command(
+            &json!({"action":"__goal_probe","selector":selector,"goalTimeoutMs":500}),
+            &mut state,
+        )
+        .await;
+        assert_eq!(probe["data"]["status"], "ready", "{name}: {probe}");
+        let identity = probe["data"]["identity"].clone();
+        assert!(
+            identity["componentVisualHit"].is_number(),
+            "{name}: {probe}"
+        );
+        if kind == "decor" {
+            decor_identity = identity.clone();
+            decor_selector = selector.clone();
+        }
+        for expected in [1, 2] {
+            let ready = goal_fixture_command(&json!({"action":"__goal_probe","selector":selector,"expectedIdentity":identity,"goalTimeoutMs":500}), &mut state).await;
+            assert_eq!(ready["data"]["status"], "ready", "{name}: {ready}");
+            let clicked = goal_fixture_command(&json!({"action":"click","selector":selector,"goalGuard":identity,"goalTimeoutMs":1000,"goalDeadlineUnixMs":expiry}), &mut state).await;
+            assert_success(&clicked);
+            let count = goal_fixture_command(
+                &json!({"action":"evaluate","script":format!("window.hits.{kind}")}),
+                &mut state,
+            )
+            .await;
+            assert_eq!(get_data(&count)["result"], expected, "{name}: {count}");
+        }
+    }
+    let policy_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(policy_file.path(), r#"{"confirm":["click"]}"#).unwrap();
+    state.policy =
+        Some(super::policy::ActionPolicy::load(policy_file.path().to_str().unwrap()).unwrap());
+    let ripple = format!("@{}", reference_named(&snapshot, "Ripple target"));
+    let ripple_probe = goal_fixture_command(
+        &json!({"action":"__goal_probe","selector":ripple,"goalTimeoutMs":500}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(ripple_probe["data"]["status"], "ready", "{ripple_probe}");
+    let pending = goal_fixture_command(&json!({"action":"click","selector":ripple,"goalGuard":ripple_probe["data"]["identity"],"goalTimeoutMs":1000,"goalDeadlineUnixMs":expiry}), &mut state).await;
+    assert_eq!(pending["data"]["confirmation_required"], true, "{pending}");
+    let confirmed = goal_fixture_command(&json!({"action":"confirm"}), &mut state).await;
+    assert_eq!(confirmed["data"]["result"]["success"], true, "{confirmed}");
+    let count = goal_fixture_command(
+        &json!({"action":"evaluate","script":"window.hits.ripple"}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(get_data(&count)["result"], 3);
+    let pending_decor = goal_fixture_command(&json!({"action":"click","selector":decor_selector,"goalGuard":decor_identity,"goalTimeoutMs":1000,"goalDeadlineUnixMs":expiry}), &mut state).await;
+    assert_eq!(
+        pending_decor["data"]["confirmation_required"], true,
+        "{pending_decor}"
+    );
+    assert_success(&goal_fixture_command(&json!({"action":"evaluate","script":"const cover=document.createElement('div');cover.id='new-cover';cover.style='position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.1)';window.decorRoot.append(cover)"}), &mut state).await);
+    let refused_after_approval =
+        goal_fixture_command(&json!({"action":"confirm"}), &mut state).await;
+    assert_eq!(
+        refused_after_approval["data"]["result"]["success"], false,
+        "{refused_after_approval}"
+    );
+    state.policy = None;
+    let covered = goal_fixture_command(&json!({"action":"__goal_probe","selector":decor_selector,"expectedIdentity":decor_identity,"goalTimeoutMs":500}), &mut state).await;
+    assert_eq!(covered["data"]["status"], "covered", "{covered}");
+    let refused = goal_fixture_command(&json!({"action":"click","selector":decor_selector,"goalGuard":decor_identity,"goalTimeoutMs":500,"goalDeadlineUnixMs":expiry}), &mut state).await;
+    assert_eq!(refused["success"], false, "{refused}");
+    let count = goal_fixture_command(
+        &json!({"action":"evaluate","script":"window.hits.decor"}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(get_data(&count)["result"], 2);
+    let _ = close_current_browser(&mut state).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_goal_component_visual_inside_owner_dialog_respects_approval_and_busy_cover() {
+    let html = r#"<!doctype html><body><x-panel></x-panel><script>
+window.hits=0;
+customElements.define('x-panel', class extends HTMLElement { connectedCallback() {
+  const root=this.attachShadow({mode:'open'});window.panelRoot=root;
+  root.innerHTML='<div role="dialog" aria-modal="true" aria-label="Settings" style="position:absolute;left:20px;top:60px;padding:12px;background:white">'+
+    '<h2>Settings</h2><div class="switch" style="position:relative;width:60px;height:30px">'+
+    '<input type="checkbox" aria-label="Notifications" style="position:absolute;inset:0;width:60px;height:30px;margin:0;opacity:.01">'+
+    '<span class="track" style="position:absolute;inset:0;background:#ccc"></span></div></div>';
+  const input=root.querySelector('input');root.querySelector('.switch').onclick=e=>{
+    if(e.composedPath()[0]!==input)input.checked=!input.checked;window.hits++;
+  };
+} });</script></body>"#;
+    let mut state = DaemonState::new();
+    let snapshot = reference_relationship_page(&mut state, html).await;
+    let selector = format!("@{}", reference_named(&snapshot, "Notifications"));
+    let probe = goal_fixture_command(
+        &json!({"action":"__goal_probe","selector":selector,"goalTimeoutMs":500}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(probe["data"]["status"], "ready", "{probe}");
+    let identity = probe["data"]["identity"].clone();
+    assert!(identity["componentVisualHit"].is_number(), "{probe}");
+    let expiry = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 20_000;
+    let click = json!({"action":"click","selector":selector,"goalGuard":identity,
+        "goalTimeoutMs":1000,"goalDeadlineUnixMs":expiry});
+    assert_success(&goal_fixture_command(&click, &mut state).await);
+    let count = goal_fixture_command(
+        &json!({"action":"evaluate","script":"window.hits"}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(get_data(&count)["result"], 1, "{count}");
+    let policy_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(policy_file.path(), r#"{"confirm":["click"]}"#).unwrap();
+    state.policy =
+        Some(super::policy::ActionPolicy::load(policy_file.path().to_str().unwrap()).unwrap());
+    let pending = goal_fixture_command(&click, &mut state).await;
+    assert_eq!(pending["data"]["confirmation_required"], true, "{pending}");
+    let approved = goal_fixture_command(&json!({"action":"confirm"}), &mut state).await;
+    assert_eq!(approved["data"]["result"]["success"], true, "{approved}");
+    let count = goal_fixture_command(
+        &json!({"action":"evaluate","script":"window.hits"}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(get_data(&count)["result"], 2, "{count}");
+    let pending = goal_fixture_command(&click, &mut state).await;
+    assert_eq!(pending["data"]["confirmation_required"], true, "{pending}");
+    assert_success(&goal_fixture_command(&json!({"action":"evaluate","script":
+        "const cover=document.createElement('div');cover.setAttribute('role','progressbar');cover.style='position:absolute;inset:0;background:#999';window.panelRoot.querySelector('.switch').append(cover)"}), &mut state).await);
+    let refused = goal_fixture_command(&json!({"action":"confirm"}), &mut state).await;
+    assert_eq!(refused["data"]["result"]["success"], false, "{refused}");
+    let count = goal_fixture_command(
+        &json!({"action":"evaluate","script":"window.hits"}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(get_data(&count)["result"], 2, "{count}");
+    let _ = close_current_browser(&mut state).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_goal_expired_deadline_prevents_click_and_late_approval() {
+    let mut state = DaemonState::new();
+    assert_success(
+        &goal_fixture_command(&json!({"action":"launch","headless":true}), &mut state).await,
+    );
+    let html =
+        "<button onclick='window.clicks++'>Previous</button><script>window.clicks=0</script>";
+    let url = format!("data:text/html;base64,{}", STANDARD.encode(html));
+    assert_success(
+        &goal_fixture_command(&json!({"action":"navigate","url":url}), &mut state).await,
+    );
+    let snapshot = goal_fixture_command(&json!({"action":"snapshot"}), &mut state).await;
+    let selector = get_data(&snapshot)["refs"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(_, entry)| entry["name"] == "Previous")
+        .map(|(name, _)| format!("@{name}"))
+        .unwrap();
+    let probe = goal_fixture_command(
+        &json!({"action":"__goal_probe","selector":selector,"goalTimeoutMs":500}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(probe["data"]["status"], "ready", "{probe}");
+    let identity = probe["data"]["identity"].clone();
+    let expired = goal_fixture_command(&json!({"action":"click","selector":selector,"goalGuard":identity,"goalTimeoutMs":500,"goalDeadlineUnixMs":0}), &mut state).await;
+    assert_eq!(expired["success"], false, "{expired}");
+    assert!(expired["error"].as_str().unwrap_or("").contains("deadline"));
+    let policy_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(policy_file.path(), r#"{"confirm":["click"]}"#).unwrap();
+    state.policy =
+        Some(super::policy::ActionPolicy::load(policy_file.path().to_str().unwrap()).unwrap());
+    let short_expiry = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 50;
+    let pending = goal_fixture_command(&json!({"action":"click","selector":selector,"goalGuard":identity,"goalTimeoutMs":500,"goalDeadlineUnixMs":short_expiry}), &mut state).await;
+    assert_eq!(pending["data"]["confirmation_required"], true, "{pending}");
+    tokio::time::sleep(std::time::Duration::from_millis(70)).await;
+    let confirmed = goal_fixture_command(&json!({"action":"confirm"}), &mut state).await;
+    assert_eq!(confirmed["data"]["result"]["success"], false, "{confirmed}");
+    assert!(confirmed["data"]["result"]["error"]
+        .as_str()
+        .unwrap_or("")
+        .contains("deadline"));
+    let count = goal_fixture_command(
+        &json!({"action":"evaluate","script":"window.clicks"}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(get_data(&count)["result"], 0);
+    let _ = close_current_browser(&mut state).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_goal_approval_gets_new_execution_slice_within_original_deadline() {
+    let mut state = DaemonState::new();
+    assert_success(
+        &goal_fixture_command(&json!({"action":"launch","headless":true}), &mut state).await,
+    );
+    let html =
+        "<button onclick='window.clicks++'>Previous</button><script>window.clicks=0</script>";
+    let url = format!("data:text/html;base64,{}", STANDARD.encode(html));
+    assert_success(
+        &goal_fixture_command(&json!({"action":"navigate","url":url}), &mut state).await,
+    );
+    let snapshot = goal_fixture_command(&json!({"action":"snapshot"}), &mut state).await;
+    let selector = get_data(&snapshot)["refs"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(_, entry)| entry["name"] == "Previous")
+        .map(|(name, _)| format!("@{name}"))
+        .unwrap();
+    let probe = goal_fixture_command(
+        &json!({"action":"__goal_probe","selector":selector,"goalTimeoutMs":500}),
+        &mut state,
+    )
+    .await;
+    let identity = probe["data"]["identity"].clone();
+    for action in ["snapshot", "click"] {
+        let policy_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(policy_file.path(), format!(r#"{{"confirm":["{action}"]}}"#)).unwrap();
+        state.policy =
+            Some(super::policy::ActionPolicy::load(policy_file.path().to_str().unwrap()).unwrap());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let mut command = json!({
+            "action": action,
+            "goalTimeoutMs": 250,
+            "goalDeadlineUnixMs": now + 250,
+            "goalApprovalDeadlineUnixMs": now + 3000,
+        });
+        if action == "snapshot" {
+            command["goalExistingOnly"] = json!(true);
+        } else {
+            command["selector"] = json!(selector);
+            command["goalGuard"] = identity.clone();
+        }
+        let pending = goal_fixture_command(&command, &mut state).await;
+        assert_eq!(pending["data"]["confirmation_required"], true, "{pending}");
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        let confirmed = goal_fixture_command(&json!({"action":"confirm"}), &mut state).await;
+        assert_eq!(confirmed["data"]["result"]["success"], true, "{confirmed}");
+        state.policy = None;
+    }
+    let count = goal_fixture_command(
+        &json!({"action":"evaluate","script":"window.clicks"}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(get_data(&count)["result"], 1);
+    let _ = close_current_browser(&mut state).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_goal_probe_rejects_prior_browser_incarnation() {
+    let mut state = DaemonState::new();
+    let html = "<button>Previous</button>";
+    let url = format!("data:text/html;base64,{}", STANDARD.encode(html));
+    assert_success(
+        &goal_fixture_command(&json!({"action":"launch","headless":true}), &mut state).await,
+    );
+    assert_success(
+        &goal_fixture_command(&json!({"action":"navigate","url":url}), &mut state).await,
+    );
+    let first = goal_fixture_command(&json!({"action":"snapshot"}), &mut state).await;
+    let first_ref = get_data(&first)["refs"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(_, entry)| entry["name"] == "Previous")
+        .map(|(name, _)| format!("@{name}"))
+        .unwrap();
+    let first_probe = goal_fixture_command(
+        &json!({"action":"__goal_probe","selector":first_ref,"goalTimeoutMs":500}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(first_probe["data"]["status"], "ready", "{first_probe}");
+    let identity = first_probe["data"]["identity"].clone();
+    let _ = close_current_browser(&mut state).await;
+    assert_success(
+        &goal_fixture_command(&json!({"action":"launch","headless":true}), &mut state).await,
+    );
+    let url = format!("data:text/html;base64,{}", STANDARD.encode(html));
+    assert_success(
+        &goal_fixture_command(&json!({"action":"navigate","url":url}), &mut state).await,
+    );
+    let second = goal_fixture_command(&json!({"action":"snapshot"}), &mut state).await;
+    let second_ref = get_data(&second)["refs"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(_, entry)| entry["name"] == "Previous")
+        .map(|(name, _)| format!("@{name}"))
+        .unwrap();
+    let stale = goal_fixture_command(&json!({"action":"__goal_probe","selector":second_ref,"expectedIdentity":identity,"goalTimeoutMs":500}), &mut state).await;
+    assert_eq!(stale["data"]["status"], "unavailable", "{stale}");
+    assert_eq!(stale["data"]["detail"], "Target context changed");
+    let _ = close_current_browser(&mut state).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_goal_probe_preserves_scroll_and_supports_shadow_and_same_process_frame() {
+    let mut state = DaemonState::new();
+    assert_success(
+        &goal_fixture_command(&json!({"action":"launch","headless":true}), &mut state).await,
+    );
+    let html = r#"<div id='host'></div><iframe srcdoc='<button onclick="parent.frameClicks++">Frame target</button>'></iframe><div style='height:1800px'></div><button onmouseover='window.farHovers++' onclick='window.farClicks++'>Far target</button><script>window.shadowClicks=0;window.frameClicks=0;window.farClicks=0;window.farHovers=0;document.getElementById('host').attachShadow({mode:'open'}).innerHTML='<button onclick="window.shadowClicks++">Shadow target</button>'</script>"#;
+    let url = format!("data:text/html;base64,{}", STANDARD.encode(html));
+    assert_success(
+        &goal_fixture_command(&json!({"action":"navigate","url":url}), &mut state).await,
+    );
+    let snapshot = goal_fixture_command(&json!({"action":"snapshot"}), &mut state).await;
+    assert_success(&snapshot);
+    let refs = get_data(&snapshot)["refs"].as_object().unwrap();
+    let target_ref = |name: &str| {
+        refs.iter()
+            .find(|(_, entry)| entry["name"] == name)
+            .map(|(reference, _)| format!("@{reference}"))
+            .unwrap_or_else(|| panic!("missing {name} ref in {snapshot}"))
+    };
+    let far = target_ref("Far target");
+    let before = goal_fixture_command(
+        &json!({"action":"evaluate","script":"window.scrollY"}),
+        &mut state,
+    )
+    .await;
+    let far_probe = goal_fixture_command(
+        &json!({"action":"__goal_probe","selector":far,"goalTimeoutMs":500}),
+        &mut state,
+    )
+    .await;
+    assert_success(&far_probe);
+    let after = goal_fixture_command(
+        &json!({"action":"evaluate","script":"window.scrollY"}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(
+        get_data(&before)["result"],
+        get_data(&after)["result"],
+        "probe must not scroll"
+    );
+    let expiry = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 10_000;
+    let far_click = goal_fixture_command(
+        &json!({"action":"click","selector":far,"goalGuard":far_probe["data"]["identity"],"goalTimeoutMs":2000,"goalDeadlineUnixMs":expiry}),
+        &mut state,
+    )
+    .await;
+    assert_success(&far_click);
+    let far_count = goal_fixture_command(
+        &json!({"action":"evaluate","script":"({clicks:window.farClicks,hovers:window.farHovers})"}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(get_data(&far_count)["result"]["clicks"], 1);
+    assert!(get_data(&far_count)["result"]["hovers"].as_u64().unwrap() >= 1);
+    assert_success(
+        &goal_fixture_command(
+            &json!({"action":"evaluate","script":"window.scrollTo(0,0)"}),
+            &mut state,
+        )
+        .await,
+    );
+    for name in ["Shadow target", "Frame target"] {
+        let selector = target_ref(name);
+        let probe = goal_fixture_command(
+            &json!({"action":"__goal_probe","selector":selector,"goalTimeoutMs":500}),
+            &mut state,
+        )
+        .await;
+        assert_eq!(probe["data"]["status"], "ready", "{name}: {probe}");
+        let expiry = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 10_000;
+        let clicked = goal_fixture_command(&json!({"action":"click","selector":selector,"goalGuard":probe["data"]["identity"],"goalTimeoutMs":1000,"goalDeadlineUnixMs":expiry}), &mut state).await;
+        assert_success(&clicked);
+    }
+    let counts = goal_fixture_command(&json!({"action":"evaluate","script":"({shadow:window.shadowClicks,frame:window.frameClicks})"}), &mut state).await;
+    assert_eq!(get_data(&counts)["result"], json!({"shadow":1,"frame":1}));
+    let _ = close_current_browser(&mut state).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_goal_guard_rejects_node_adopted_into_another_document() {
+    let mut state = DaemonState::new();
+    assert_success(
+        &goal_fixture_command(&json!({"action":"launch","headless":true}), &mut state).await,
+    );
+    let html = r#"<button id='move'>Move target</button><iframe id='frame'></iframe><script>window.clicks=0;document.getElementById('move').addEventListener('click',()=>window.clicks++)</script>"#;
+    let url = format!("data:text/html;base64,{}", STANDARD.encode(html));
+    for confirm in [false, true] {
+        assert_success(
+            &goal_fixture_command(&json!({"action":"navigate","url":url}), &mut state).await,
+        );
+        let snapshot = goal_fixture_command(&json!({"action":"snapshot"}), &mut state).await;
+        let reference = get_data(&snapshot)["refs"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .find(|(_, entry)| entry["name"] == "Move target")
+            .map(|(name, _)| format!("@{name}"))
+            .unwrap();
+        let probe = goal_fixture_command(
+            &json!({"action":"__goal_probe","selector":reference,"goalTimeoutMs":500}),
+            &mut state,
+        )
+        .await;
+        assert_eq!(probe["data"]["status"], "ready", "{probe}");
+        let identity = probe["data"]["identity"].clone();
+        let expiry = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 10_000;
+        let click = json!({"action":"click","selector":reference,"goalGuard":identity,"goalTimeoutMs":1000,"goalDeadlineUnixMs":expiry});
+        if confirm {
+            let policy_file = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(policy_file.path(), r#"{"confirm":["click"]}"#).unwrap();
+            state.policy = Some(
+                super::policy::ActionPolicy::load(policy_file.path().to_str().unwrap()).unwrap(),
+            );
+            let pending = goal_fixture_command(&click, &mut state).await;
+            assert_eq!(pending["data"]["confirmation_required"], true, "{pending}");
+        }
+        assert_success(&goal_fixture_command(&json!({"action":"evaluate","script":"document.getElementById('frame').contentDocument.body.appendChild(document.getElementById('move')); true"}), &mut state).await);
+        let moved = goal_fixture_command(&json!({"action":"__goal_probe","selector":reference,"expectedIdentity":identity,"goalTimeoutMs":500}), &mut state).await;
+        assert_eq!(moved["data"]["status"], "unavailable", "{moved}");
+        let refused = if confirm {
+            let confirmation = goal_fixture_command(&json!({"action":"confirm"}), &mut state).await;
+            confirmation["data"]["result"].clone()
+        } else {
+            goal_fixture_command(&click, &mut state).await
+        };
+        assert_eq!(refused["success"], false, "{refused}");
+        let count = goal_fixture_command(
+            &json!({"action":"evaluate","script":"window.clicks"}),
+            &mut state,
+        )
+        .await;
+        assert_eq!(get_data(&count)["result"], 0);
+        state.policy = None;
+    }
+    let _ = close_current_browser(&mut state).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_goal_slow_mouse_press_reports_uncertainty_before_late_release() {
+    let mut state = DaemonState::new();
+    assert_success(
+        &goal_fixture_command(&json!({"action":"launch","headless":true}), &mut state).await,
+    );
+    let html = r#"<button id='slow'>Slow target</button><script>window.clicks=0;const b=document.getElementById('slow');b.addEventListener('mousedown',()=>{const end=performance.now()+700;while(performance.now()<end){};});b.addEventListener('click',()=>window.clicks++);</script>"#;
+    let url = format!("data:text/html;base64,{}", STANDARD.encode(html));
+    for confirm in [false, true] {
+        assert_success(
+            &goal_fixture_command(&json!({"action":"navigate","url":url}), &mut state).await,
+        );
+        let snapshot = goal_fixture_command(&json!({"action":"snapshot"}), &mut state).await;
+        let reference = get_data(&snapshot)["refs"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .find(|(_, entry)| entry["name"] == "Slow target")
+            .map(|(name, _)| format!("@{name}"))
+            .unwrap();
+        let probe = goal_fixture_command(
+            &json!({"action":"__goal_probe","selector":reference,"goalTimeoutMs":500}),
+            &mut state,
+        )
+        .await;
+        assert_eq!(probe["data"]["status"], "ready", "{probe}");
+        let expiry = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 350;
+        let click = json!({"action":"click","selector":reference,"goalGuard":probe["data"]["identity"],"goalTimeoutMs":350,"goalDeadlineUnixMs":expiry});
+        if confirm {
+            let policy_file = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(policy_file.path(), r#"{"confirm":["click"]}"#).unwrap();
+            state.policy = Some(
+                super::policy::ActionPolicy::load(policy_file.path().to_str().unwrap()).unwrap(),
+            );
+            let pending = goal_fixture_command(&click, &mut state).await;
+            assert_eq!(pending["data"]["confirmation_required"], true, "{pending}");
+        }
+        let started = std::time::Instant::now();
+        let result = if confirm {
+            goal_fixture_command(&json!({"action":"confirm"}), &mut state).await["data"]["result"]
+                .clone()
+        } else {
+            goal_fixture_command(&click, &mut state).await
+        };
+        assert_eq!(result["code"], "goal_input_uncertain", "{result}");
+        assert!(started.elapsed() < std::time::Duration::from_millis(600));
+        state.policy = None;
+    }
+    let _ = close_current_browser(&mut state).await;
+}
+
 async fn select_values(
     state: &mut DaemonState,
     id: &str,
@@ -5384,6 +6204,60 @@ async fn e2e_iframe_reference_click_oopif() {
     for select_frame in [false, true] {
         assert_iframe_reference_click("oopif", "none", select_frame, "", false).await;
     }
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_goal_probe_reports_oopif_ancestor_coverage_unknown() {
+    let (child_port, child_server) = start_iframe_click_server(None, "none", "").await;
+    let child_url = format!("http://127.0.0.1:{child_port}/child");
+    let (parent_port, parent_server) =
+        start_iframe_click_server(Some(child_url), "none", "parent").await;
+    let mut state = DaemonState::new();
+    assert_success(&execute_command(&json!({"action":"launch","headless":true}), &mut state).await);
+    assert_success(
+        &execute_command(
+            &json!({"action":"navigate","url":format!("http://localhost:{parent_port}/")}),
+            &mut state,
+        )
+        .await,
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let ready = execute_command(
+                &json!({"action":"evaluate","script":"window.childReady"}),
+                &mut state,
+            )
+            .await;
+            if get_data(&ready)["result"] == true {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let snapshot = execute_command(&json!({"action":"snapshot"}), &mut state).await;
+    let target = get_data(&snapshot)["refs"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(_, entry)| entry["name"] == "Frame target")
+        .map(|(name, _)| format!("@{name}"))
+        .unwrap();
+    let probe = execute_command(
+        &json!({"action":"__goal_probe","selector":target,"goalTimeoutMs":500}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(probe["data"]["status"], "unknown", "{probe}");
+    assert!(probe["data"]["detail"]
+        .as_str()
+        .unwrap_or("")
+        .contains("ancestor coverage"));
+    let _ = close_current_browser(&mut state).await;
+    child_server.abort();
+    parent_server.abort();
 }
 
 #[tokio::test]

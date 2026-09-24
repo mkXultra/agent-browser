@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::cdp::client::CdpClient;
@@ -13,6 +14,52 @@ pub struct RefEntry {
     pub nth: Option<usize>,
     pub selector: Option<String>,
     pub frame_id: Option<String>,
+}
+
+/// Exact browser and DOM identity used by goal's read-only readiness probe and
+/// checked again immediately before a guarded click. It is never resolved by
+/// role, name, or a replacement accessibility ref.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoalTargetIdentity {
+    pub daemon: String,
+    pub browser: String,
+    pub page_session: String,
+    pub frame_id: Option<String>,
+    pub document_session: String,
+    pub loader: String,
+    pub backend_node_id: i64,
+    /// The native hit for a verified component visual, when it differs from
+    /// the control. A newly covering sibling cannot inherit this allowance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_visual_hit: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoalProbeResult {
+    pub status: String,
+    pub identity: Option<GoalTargetIdentity>,
+    pub detail: Option<String>,
+    pub x: Option<f64>,
+    pub y: Option<f64>,
+    pub session: Option<String>,
+    /// True only when the actual hit element owns a visible dialog interface.
+    pub covering_interface: bool,
+}
+
+impl GoalProbeResult {
+    fn new(status: &str, identity: Option<GoalTargetIdentity>, detail: Option<String>) -> Self {
+        Self {
+            status: status.into(),
+            identity,
+            detail,
+            x: None,
+            y: None,
+            session: None,
+            covering_interface: false,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -94,6 +141,17 @@ impl RefMap {
 
     pub fn get(&self, ref_id: &str) -> Option<&RefEntry> {
         self.map.get(ref_id)
+    }
+
+    pub fn document_identity(
+        &self,
+        page_session: &str,
+        frame: Option<&str>,
+    ) -> Option<(&str, &str)> {
+        let key = (page_session.to_string(), frame.map(str::to_string));
+        self.documents
+            .get(&key)
+            .map(|document| (document.session.as_str(), document.loader.as_str()))
     }
 
     pub fn entries_sorted(&self) -> Vec<(String, RefEntry)> {
@@ -496,6 +554,400 @@ pub async fn resolve_element_center(
     Ok((x, y, session_id.to_string()))
 }
 
+/// Inspect one snapshot node without changing the page. A failed CDP lookup is
+/// Unknown, never evidence that a click would be safe. Cross-process frame
+/// ancestors are not yet hit-tested by this path, so those targets stay Unknown.
+pub async fn probe_goal_target(
+    client: &CdpClient,
+    page_session: &str,
+    ref_map: &RefMap,
+    selector: &str,
+    iframe_sessions: &HashMap<String, String>,
+    incarnations: (&str, &str),
+    expected: Option<&GoalTargetIdentity>,
+) -> GoalProbeResult {
+    let Some(ref_id) = parse_ref(selector) else {
+        return GoalProbeResult::new(
+            "unknown",
+            None,
+            Some("Goal target is not a snapshot ref".into()),
+        );
+    };
+    let Some(entry) = ref_map.get(&ref_id) else {
+        return GoalProbeResult::new(
+            "unavailable",
+            None,
+            Some("Snapshot target is unavailable".into()),
+        );
+    };
+    let Some(node) = entry.backend_node_id else {
+        return GoalProbeResult::new(
+            "unknown",
+            None,
+            Some("Target has no native node identity".into()),
+        );
+    };
+    let frame = entry.frame_id.as_deref();
+    let Some((session, loader)) = ref_map.document_identity(page_session, frame) else {
+        return GoalProbeResult::new(
+            "unknown",
+            None,
+            Some("Document identity is unavailable".into()),
+        );
+    };
+    let mut identity = GoalTargetIdentity {
+        daemon: incarnations.0.to_string(),
+        browser: incarnations.1.to_string(),
+        page_session: page_session.to_string(),
+        frame_id: entry.frame_id.clone(),
+        document_session: session.to_string(),
+        loader: loader.to_string(),
+        backend_node_id: node,
+        component_visual_hit: expected.and_then(|prior| prior.component_visual_hit),
+    };
+    if expected.is_some_and(|prior| *prior != identity) {
+        return GoalProbeResult::new(
+            "unavailable",
+            Some(identity),
+            Some("Target context changed".into()),
+        );
+    }
+    if iframe_sessions.values().any(|value| value == session) {
+        return GoalProbeResult::new(
+            "unknown",
+            Some(identity),
+            Some("Cross-process frame ancestor coverage is unsupported".into()),
+        );
+    }
+    if session != page_session {
+        return GoalProbeResult::new(
+            "unknown",
+            Some(identity),
+            Some("Target session is unsupported".into()),
+        );
+    }
+    let tree = match client
+        .send_command_no_params("Page.getFrameTree", Some(session))
+        .await
+    {
+        Ok(tree) => tree,
+        Err(_) => {
+            return GoalProbeResult::new(
+                "unknown",
+                Some(identity),
+                Some("Cannot inspect document identity".into()),
+            )
+        }
+    };
+    if super::snapshot::frame_loader(&tree["frameTree"], frame) != Some(loader) {
+        return GoalProbeResult::new(
+            "unavailable",
+            Some(identity),
+            Some("Target document changed".into()),
+        );
+    }
+    match goal_owner_matches(client, session, node, frame).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return GoalProbeResult::new(
+                "unavailable",
+                Some(identity),
+                Some("Target moved to another document".into()),
+            )
+        }
+        Err(_) => {
+            return GoalProbeResult::new(
+                "unknown",
+                Some(identity),
+                Some("Cannot verify target owner document".into()),
+            )
+        }
+    }
+    let model: DomGetBoxModelResult = match client
+        .send_command_typed(
+            "DOM.getBoxModel",
+            &DomGetBoxModelParams {
+                backend_node_id: Some(node),
+                node_id: None,
+                object_id: None,
+            },
+            Some(session),
+        )
+        .await
+    {
+        Ok(model) => model,
+        Err(_) => {
+            return GoalProbeResult::new(
+                "unavailable",
+                Some(identity),
+                Some("Target node is unavailable".into()),
+            )
+        }
+    };
+    let (x, y) = box_model_center(&model.model);
+    // Start with exact ancestry. A component's visual sibling is accepted
+    // only after the native component relation and local surface are checked.
+    // Once recorded, only that same hit may receive later guarded input.
+    let strict = node_interception(client, session, node, frame, x, y, false).await;
+    let interception = match strict {
+        Ok((_, _, Some(_), Some(hit_id)))
+            if expected
+                .map(|prior| prior.component_visual_hit == Some(hit_id))
+                .unwrap_or(true)
+                && component_visual_is_local(client, session, node, hit_id).await =>
+        {
+            let component = node_interception(client, session, node, frame, x, y, true).await;
+            match component {
+                Ok((x, y, None, Some(verified_hit))) if verified_hit == hit_id => {
+                    identity.component_visual_hit = Some(hit_id);
+                    Ok((x, y, None, Some(hit_id)))
+                }
+                // The visual may disappear and expose the actual control.
+                Ok((x, y, None, None)) => Ok((x, y, None, None)),
+                Ok((_, _, None, Some(_))) => Ok((
+                    x,
+                    y,
+                    Some("Component visual changed during hit testing".into()),
+                    Some(hit_id),
+                )),
+                other => other,
+            }
+        }
+        other => other,
+    };
+    match interception {
+        Ok((x, y, None, _)) => {
+            let mut result = GoalProbeResult::new("ready", Some(identity), None);
+            result.x = Some(x);
+            result.y = Some(y);
+            result.session = Some(session.to_string());
+            result
+        }
+        Ok((_, _, Some(blocker), hit_id)) => {
+            let mut result = GoalProbeResult::new(
+                "covered",
+                Some(identity),
+                Some(blocker.chars().take(160).collect()),
+            );
+            if let Some(hit_id) = hit_id {
+                result.covering_interface = hit_has_visible_dialog(client, session, hit_id, node)
+                    .await
+                    .unwrap_or(false);
+            }
+            result
+        }
+        Err(_) => GoalProbeResult::new(
+            "unknown",
+            Some(identity),
+            Some("Cannot verify target coverage".into()),
+        ),
+    }
+}
+
+/// A component visual must occupy the control's local click surface. This
+/// excludes page-sized sibling covers and busy/progress interfaces before the
+/// existing native component relationship can grant its visual exemption.
+/// A dialog enclosing both the target and visual is their existing owner;
+/// a separate dialog over the visual remains coverage.
+async fn component_visual_is_local(
+    client: &CdpClient,
+    session: &str,
+    target_id: i64,
+    hit_id: i64,
+) -> bool {
+    let resolve = |backend_node_id| DomResolveNodeParams {
+        backend_node_id: Some(backend_node_id),
+        node_id: None,
+        object_group: Some("agent-browser-goal-visual".into()),
+    };
+    let target: Result<DomResolveNodeResult, _> = client
+        .send_command_typed("DOM.resolveNode", &resolve(target_id), Some(session))
+        .await;
+    let Ok(target) = target else {
+        return false;
+    };
+    let hit: Result<DomResolveNodeResult, _> = client
+        .send_command_typed("DOM.resolveNode", &resolve(hit_id), Some(session))
+        .await;
+    let Ok(hit) = hit else {
+        return false;
+    };
+    let (Some(target), Some(hit)) = (target.object.object_id, hit.object.object_id) else {
+        return false;
+    };
+    let result = client
+        .send_command(
+            "Runtime.callFunctionOn",
+            Some(serde_json::json!({
+                "objectId": target,
+                "functionDeclaration": r#"function(hit) {
+                    const control = this.getBoundingClientRect();
+                    const visual = hit.getBoundingClientRect();
+                    if (!control.width || !control.height || !visual.width || !visual.height) return false;
+                    if (visual.width > control.width * 8 || visual.height > control.height * 8 ||
+                        visual.width * visual.height > control.width * control.height * 16) return false;
+                    if (control.left + control.width / 2 < visual.left ||
+                        control.left + control.width / 2 > visual.right ||
+                        control.top + control.height / 2 < visual.top ||
+                        control.top + control.height / 2 > visual.bottom) return false;
+                    const busy = '[aria-busy="true"], [role="progressbar"], progress, [role="status"]';
+                    if (hit.matches(busy) || hit.closest(busy) || hit.querySelector(busy)) return false;
+                    // A sibling control or a cover containing one is not a
+                    // decorative surface of the original target, even when
+                    // both sit inside the target's owning dialog.
+                    const controls = 'button, a[href], input, select, textarea, [role="button"], [role="link"]';
+                    if (hit.closest(controls) || hit.querySelector(controls)) return false;
+                    const dialogs = 'dialog[open], [role="dialog"], [role="alertdialog"], [aria-modal="true"]';
+                    if (hit.querySelector(dialogs)) return false;
+                    const slots = new Map();
+                    for (let current = hit; current; ) {
+                        const root = current.getRootNode();
+                        if (!root.host) break;
+                        for (const slot of root.querySelectorAll('slot')) {
+                            for (const assigned of slot.assignedNodes()) slots.set(assigned, slot);
+                        }
+                        current = root.host;
+                    }
+                    const ownsTarget = dialog => {
+                        for (let current = this; current; ) {
+                            if (current === dialog) return true;
+                            const root = current.getRootNode && current.getRootNode();
+                            current = current.assignedSlot || slots.get(current) || current.parentNode ||
+                                (root && root.host) || null;
+                        }
+                        return false;
+                    };
+                    for (let current = hit; current; current = current.parentElement) {
+                        if (current.matches(dialogs) && !ownsTarget(current)) return false;
+                    }
+                    return true;
+                }"#,
+                "arguments": [{"objectId": hit}],
+                "returnByValue": true,
+            })),
+            Some(session),
+        )
+        .await;
+    result
+        .ok()
+        .and_then(|value| value.pointer("/result/value").and_then(Value::as_bool))
+        == Some(true)
+}
+
+/// Compare the node's live ownerDocument with the original frame's document.
+/// This catches DOM adoption, which preserves backendNodeId and the cached
+/// RefMap token even though the node now belongs to another document.
+async fn goal_owner_matches(
+    client: &CdpClient,
+    session: &str,
+    node: i64,
+    frame: Option<&str>,
+) -> Result<bool, String> {
+    let group = "agent-browser-goal-owner";
+    let target: DomResolveNodeResult = client
+        .send_command_typed(
+            "DOM.resolveNode",
+            &DomResolveNodeParams {
+                backend_node_id: Some(node),
+                node_id: None,
+                object_group: Some(group.into()),
+            },
+            Some(session),
+        )
+        .await?;
+    let object_id = target
+        .object
+        .object_id
+        .ok_or("Missing goal target object")?;
+    let document = client
+        .send_command(
+            "Runtime.callFunctionOn",
+            Some(serde_json::json!({
+                "objectId": object_id,
+                "functionDeclaration": "function() { return this.ownerDocument; }",
+                "returnByValue": false
+            })),
+            Some(session),
+        )
+        .await?;
+    let document_object = document["result"]["objectId"]
+        .as_str()
+        .ok_or("Missing target owner document")?;
+    let owner = client
+        .send_command(
+            "DOM.describeNode",
+            Some(serde_json::json!({"objectId": document_object, "depth": 0})),
+            Some(session),
+        )
+        .await?;
+    let owner_id = owner["node"]["backendNodeId"]
+        .as_i64()
+        .ok_or("Missing target owner document id")?;
+    let expected_id = if let Some(frame) = frame {
+        let frame_owner = client
+            .send_command(
+                "DOM.getFrameOwner",
+                Some(serde_json::json!({"frameId": frame})),
+                Some(session),
+            )
+            .await?;
+        let frame_owner_id = frame_owner["backendNodeId"]
+            .as_i64()
+            .ok_or("Missing frame owner")?;
+        let described = client
+            .send_command(
+                "DOM.describeNode",
+                Some(serde_json::json!({"backendNodeId": frame_owner_id, "depth": 1})),
+                Some(session),
+            )
+            .await?;
+        described["node"]["contentDocument"]["backendNodeId"]
+            .as_i64()
+            .ok_or("Missing frame document id")?
+    } else {
+        let root = client
+            .send_command(
+                "DOM.getDocument",
+                Some(serde_json::json!({"depth": 0})),
+                Some(session),
+            )
+            .await?;
+        root["root"]["backendNodeId"]
+            .as_i64()
+            .ok_or("Missing page document id")?
+    };
+    let _ = client
+        .send_command(
+            "Runtime.releaseObjectGroup",
+            Some(serde_json::json!({"objectGroup": group})),
+            Some(session),
+        )
+        .await;
+    Ok(owner_id == expected_id)
+}
+
+/// Dispatch-only scroll of the original backend node. Readiness probes never
+/// call this; the guarded click re-probes geometry and cover after scrolling.
+pub async fn scroll_goal_node_into_view(
+    client: &CdpClient,
+    session: &str,
+    node: i64,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    if std::time::Instant::now() >= deadline {
+        return Err("Goal deadline expired before target scroll".into());
+    }
+    client
+        .send_command_typed_before::<_, Value>(
+            "DOM.scrollIntoViewIfNeeded",
+            &serde_json::json!({"backendNodeId": node}),
+            Some(session),
+            deadline,
+        )
+        .await?;
+    Ok(())
+}
+
 /// Origin of a CDP session's viewport in the recorded page's CSS coordinates.
 /// Input sent to an OOPIF is local to that session; cursor history is page-local.
 /// Walk owner sessions for nested OOPIFs. Content quads include iframe borders
@@ -580,9 +1032,9 @@ async fn check_node_interception(
     x: f64,
     y: f64,
 ) -> Result<(f64, f64), String> {
-    match node_interception(client, session_id, backend_node_id, frame_id, x, y).await {
-        Ok((_, _, Some(blocker))) => Err(intercepted_error(target, &blocker)),
-        Ok((x, y, None)) => Ok((x, y)),
+    match node_interception(client, session_id, backend_node_id, frame_id, x, y, true).await {
+        Ok((_, _, Some(blocker), _)) => Err(intercepted_error(target, &blocker)),
+        Ok((x, y, None, _)) => Ok((x, y)),
         Err(_) => Ok((x, y)),
     }
 }
@@ -594,7 +1046,8 @@ async fn node_interception(
     frame_id: Option<&str>,
     x: f64,
     y: f64,
-) -> Result<(f64, f64, Option<String>), String> {
+    allow_component_visual: bool,
+) -> Result<(f64, f64, Option<String>, Option<i64>), String> {
     // getBoxModel/Input use the session's viewport, while getNodeForLocation
     // uses its root document's CSS pixels. Add only that viewport's scroll
     // offset, including for OOPIF sessions. The hit-test API takes integers:
@@ -624,7 +1077,7 @@ async fn node_interception(
         .await?;
     let mut hit_id = hit["backendNodeId"].as_i64().ok_or("Missing hit node")?;
     if hit_id == backend_node_id {
-        return Ok((x, y, None));
+        return Ok((x, y, None, None));
     }
 
     // Map a native frame hit to the hit-side owner in the lowest common
@@ -656,7 +1109,7 @@ async fn node_interception(
                 .as_i64()
                 .ok_or("Missing frame owner")?;
             if compare_relationship && hit_id == backend_node_id {
-                return Ok((x, y, None));
+                return Ok((x, y, None, None));
             }
         }
         if !compare_relationship {
@@ -707,18 +1160,19 @@ async fn node_interception(
                 Some(serde_json::json!({
                     "objectId": target_object,
                     "functionDeclaration": function,
-                    "arguments": [{"objectId": hit_object}, {"value": true}],
+                    "arguments": [{"objectId": hit_object}, {"value": allow_component_visual}],
                     "returnByValue": true,
                 })),
                 Some(session_id),
             )
             .await;
-        if result
-            .as_ref()
-            .ok()
-            .and_then(|v| v.pointer("/result/value"))
-            .and_then(Value::as_bool)
-            == Some(true)
+        if allow_component_visual
+            && result
+                .as_ref()
+                .ok()
+                .and_then(|v| v.pointer("/result/value"))
+                .and_then(Value::as_bool)
+                == Some(true)
         {
             // Only a component-visual exemption needs this extra native walk.
             // Neither JS node may expose the target's closed slot assignment;
@@ -757,7 +1211,7 @@ async fn node_interception(
         if let Ok(value) = result {
             if let Some(blocker) = value.pointer("/result/value") {
                 if blocker.is_null() || blocker.is_string() {
-                    return Ok((x, y, blocker.as_str().map(String::from)));
+                    return Ok((x, y, blocker.as_str().map(String::from), Some(hit_id)));
                 }
             }
         }
@@ -791,7 +1245,115 @@ async fn node_interception(
         Err(_) if !compare_relationship => "another element".to_string(),
         Err(error) => return Err(error),
     };
-    Ok((x, y, Some(blocker)))
+    Ok((x, y, Some(blocker), Some(hit_id)))
+}
+
+/// A covering interface must be attached to the hit at the target's click
+/// point and separate from the target's own enclosing dialog. Only a visible,
+/// enabled control in a non-busy interface qualifies; text alone cannot prove
+/// that a newly covering dialog offers a useful choice.
+async fn hit_has_visible_dialog(
+    client: &CdpClient,
+    session: &str,
+    hit_id: i64,
+    target_id: i64,
+) -> Result<bool, String> {
+    let hit: DomResolveNodeResult = client
+        .send_command_typed(
+            "DOM.resolveNode",
+            &DomResolveNodeParams {
+                backend_node_id: Some(hit_id),
+                node_id: None,
+                object_group: Some("agent-browser".into()),
+            },
+            Some(session),
+        )
+        .await?;
+    let object_id = hit.object.object_id.ok_or("Missing covering node object")?;
+    let target: DomResolveNodeResult = client
+        .send_command_typed(
+            "DOM.resolveNode",
+            &DomResolveNodeParams {
+                backend_node_id: Some(target_id),
+                node_id: None,
+                object_group: Some("agent-browser".into()),
+            },
+            Some(session),
+        )
+        .await?;
+    let target_object_id = target
+        .object
+        .object_id
+        .ok_or("Missing target node object")?;
+    let result = client
+        .send_command(
+            "Runtime.callFunctionOn",
+            Some(serde_json::json!({
+                "objectId": object_id,
+                "functionDeclaration": r#"function(target) {
+                    if (this === document.body || this === document.documentElement) return false;
+                    const selector = 'dialog[open], [role="dialog"], [role="alertdialog"], [aria-modal="true"]';
+                    const candidates = [];
+                    if (this.closest) candidates.push(this.closest(selector));
+                    if (this.querySelectorAll) candidates.push(...this.querySelectorAll(selector));
+                    const containsTarget = node => {
+                        // A light-DOM target's assignedSlot is null in a closed
+                        // root. The hit is inside that root, so its slot map is
+                        // available even though the host cannot expose it.
+                        const slots = new Map();
+                        for (const start of [this, node]) {
+                            for (let current = start; current; ) {
+                                const root = current.getRootNode();
+                                if (!root.host) break;
+                                for (const slot of root.querySelectorAll('slot')) {
+                                    for (const assigned of slot.assignedNodes()) slots.set(assigned, slot);
+                                }
+                                current = root.host;
+                            }
+                        }
+                        for (let current = target; current; ) {
+                            if (current === node) return true;
+                            const root = current.getRootNode && current.getRootNode();
+                            current = current.assignedSlot || slots.get(current) || current.parentNode ||
+                                (root && root.host) || null;
+                        }
+                        return false;
+                    };
+                    const visible = node => node.getClientRects().length > 0 &&
+                        getComputedStyle(node).visibility !== 'hidden' &&
+                        getComputedStyle(node).display !== 'none';
+                    const busy = '[aria-busy="true"], [role="progressbar"], progress, [role="status"]';
+                    const useful = node => {
+                        if (node.matches(busy) || [...node.querySelectorAll(busy)].some(visible)) return false;
+                        const controls = node.querySelectorAll('button, a[href], input, select, textarea, [role="button"], [role="link"]');
+                        const enabled = [...controls].filter(control => visible(control) &&
+                            !control.disabled && !control.matches(':disabled') &&
+                            !control.closest('[aria-disabled="true"], [inert]') &&
+                            !control.closest(busy));
+                        // One generic Cancel button under a spinner is not
+                        // enough evidence of a new usable interface. A named
+                        // or headed dialog, a form field, or multiple controls
+                        // supplies positive structure without reading words.
+                        const label = (node.getAttribute('aria-label') || '').trim();
+                        const heading = [...node.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]')].some(visible);
+                        const labelled = (node.getAttribute('aria-labelledby') || '').split(/\s+/).some(id => {
+                            const root = node.getRootNode();
+                            const labelNode = id && root.getElementById && root.getElementById(id);
+                            return labelNode && visible(labelNode) && (labelNode.textContent || '').trim();
+                        });
+                        const formField = enabled.some(control => control.matches('input, select, textarea'));
+                        return enabled.length > 0 && (label || heading || labelled || formField || enabled.length > 1);
+                    };
+                    return candidates.some(node => node && visible(node) &&
+                        !containsTarget(node) && useful(node));
+                }"#,
+                "arguments": [{"objectId": target_object_id}],
+                "returnByValue": true,
+            })),
+            Some(session),
+        )
+        .await?;
+    Ok(result.pointer("/result/value").and_then(Value::as_bool) == Some(true))
 }
 
 /// Describe a known blocker without running relationship or component checks.

@@ -535,6 +535,12 @@ impl SessionSetup {
 }
 
 pub struct DaemonState {
+    /// Changes on every daemon start; goal target identities cannot survive a respawn.
+    goal_incarnation: String,
+    /// A weak client identity detects browser replacement even within one daemon.
+    /// Keeping the weak allocation prevents a new client's pointer from reusing it.
+    goal_browser_client: Option<std::sync::Weak<CdpClient>>,
+    goal_browser_incarnation: String,
     pub browser: Option<BrowserManager>,
     pub appium: Option<AppiumManager>,
     pub safari_driver: Option<safari::SafariDriverProcess>,
@@ -685,6 +691,9 @@ impl DaemonState {
             .flatten()
             .is_some_and(|b| b.pinned);
         Self {
+            goal_incarnation: uuid::Uuid::new_v4().to_string(),
+            goal_browser_client: None,
+            goal_browser_incarnation: uuid::Uuid::new_v4().to_string(),
             browser: None,
             appium: None,
             safari_driver: None,
@@ -2493,7 +2502,8 @@ fn skip_launch_action(action: &str) -> bool {
 
     matches!(
         action,
-        "" | "launch"
+        "" | "__goal_probe"
+            | "launch"
             | "close"
             | "read"
             | "har_stop"
@@ -2531,7 +2541,14 @@ fn policy_actions_for_command(
     action: &str,
     needs_implicit_launch: bool,
 ) -> Vec<String> {
-    let mut actions = vec![action.to_string()];
+    // The private goal probe is an observation governed by snapshot policy.
+    // A guarded click retains the ordinary click policy and confirmation path.
+    let mut actions = vec![if action == "__goal_probe" {
+        "snapshot"
+    } else {
+        action
+    }
+    .to_string()];
     // `a11y <url>` performs a real browser navigation before the audit. Keep
     // navigation deny and confirmation policies effective for the compound
     // command instead of treating it as a read-only audit.
@@ -2575,13 +2592,105 @@ fn policy_actions_for_command(
     actions
 }
 
+/// Allocate the private goal command future before entering the large shared
+/// execute_command poll frame. Ordinary commands retain their existing stack
+/// budget, including launch and reference clicks.
+fn goal_existing_command<'a>(
+    cmd: &'a Value,
+    state: &'a mut DaemonState,
+    action: &'a str,
+    cmd_start: std::time::Instant,
+    goal_probe: bool,
+    goal_observation: bool,
+    goal_guarded_click: bool,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        if command_changes_restore_key(cmd, state)
+            || cmd
+                .get("pinTab")
+                .and_then(Value::as_bool)
+                .is_some_and(|pin| pin != state.pin_tab)
+        {
+            return Err("Goal target check cannot change session settings".to_string());
+        }
+        if state
+            .browser
+            .as_mut()
+            .is_some_and(BrowserManager::has_process_exited)
+        {
+            return Err("Browser has exited".to_string());
+        }
+        if state.pending_dialog.is_some() {
+            return Err("A JavaScript dialog is blocking the goal target".to_string());
+        }
+        let timeout_ms = cmd
+            .get("goalTimeoutMs")
+            .and_then(Value::as_u64)
+            .unwrap_or(500)
+            .min(if goal_observation || goal_guarded_click {
+                30_000
+            } else {
+                500
+            });
+        let timeout_ms = if cmd.get("goalDeadlineUnixMs").is_some() {
+            match goal_deadline_remaining(cmd) {
+                Ok(remaining) => timeout_ms.min(remaining.as_millis() as u64),
+                Err(_) => 0,
+            }
+        } else {
+            timeout_ms
+        };
+        let probe_deadline = cmd_start + std::time::Duration::from_millis(timeout_ms);
+        if goal_probe {
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(probe_deadline),
+                handle_goal_probe(cmd, state),
+            )
+            .await
+            .unwrap_or_else(|_| Ok(json!({"status":"unknown","detail":"Target probe timed out"})))
+        } else if goal_observation {
+            tokio::time::timeout_at(tokio::time::Instant::from_std(probe_deadline), async {
+                match action {
+                    "snapshot" => handle_snapshot(cmd, state).await,
+                    "url" => handle_url(state).await,
+                    _ => handle_title(state).await,
+                }
+            })
+            .await
+            .unwrap_or_else(|_| Err("Goal observation timed out".to_string()))
+        } else {
+            handle_goal_guarded_click(cmd, state, probe_deadline).await
+        }
+    })
+}
+
+/// Launch is the largest future in the shared dispatcher. Keep its state off
+/// the caller's test-thread stack after adding private goal handling.
+fn boxed_launch<'a>(
+    cmd: &'a Value,
+    state: &'a mut DaemonState,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(handle_launch(cmd, state))
+}
+
 pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     let action = cmd.get("action").and_then(|v| v.as_str()).unwrap_or("");
+    if cmd.get("goalDeadlineUnixMs").is_some() && goal_deadline_remaining(cmd).is_err() {
+        return error_response(
+            cmd.get("id").and_then(Value::as_str).unwrap_or(""),
+            "Goal deadline expired before daemon execution",
+        );
+    }
     // A goal's completion read must only observe the browser already in this
     // session. In particular, skip recovery, target discovery and session
     // changes that could replace the final page with a newly opened blank tab.
     let existing_browser_only =
         action == "url" && cmd.get("existingBrowserOnly").and_then(Value::as_bool) == Some(true);
+    let goal_probe = action == "__goal_probe";
+    let goal_guarded_click = action == "click" && cmd.get("goalGuard").is_some();
+    let goal_observation = matches!(action, "snapshot" | "url" | "title")
+        && cmd.get("goalExistingOnly").and_then(Value::as_bool) == Some(true);
+    let goal_existing_only = goal_probe || goal_guarded_click || goal_observation;
     // Unlike normal auth login, no-navigation mode must never launch a
     // browser or manufacture an about:blank page to satisfy the command.
     let auth_login_no_navigate = action == "auth_login"
@@ -2591,7 +2700,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
             .unwrap_or(false);
     if let Some(mode @ ("instant" | "smooth" | "human")) = cmd
         .get("defaultInputMode")
-        .filter(|_| !existing_browser_only)
+        .filter(|_| !existing_browser_only && !goal_existing_only)
         .and_then(Value::as_str)
     {
         // Only an explicit session setting persists. inputMode is an override
@@ -2626,10 +2735,11 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         return resp;
     }
 
-    if let Some(ref server) = state.stream_server {
+    if let Some(server) = state.stream_server.as_ref().filter(|_| !goal_existing_only) {
         let mut broadcast_cmd;
         let has_internal_fields = cmd.get("plugins").is_some()
             || cmd.get("existingBrowserOnly").is_some()
+            || goal_existing_only
             || cmd.get("pinTab").is_some()
             || cmd.get("restoreKey").is_some()
             || cmd.get("restoreSave").is_some()
@@ -2641,6 +2751,12 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
             if let Some(obj) = broadcast_cmd.as_object_mut() {
                 obj.remove("plugins");
                 obj.remove("existingBrowserOnly");
+                obj.remove("goalGuard");
+                obj.remove("goalTimeoutMs");
+                obj.remove("goalDeadlineUnixMs");
+                obj.remove("goalApprovalDeadlineUnixMs");
+                obj.remove("goalExistingOnly");
+                obj.remove("expectedIdentity");
                 obj.remove("pinTab");
                 obj.remove("restoreKey");
                 obj.remove("restoreSave");
@@ -2656,7 +2772,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     }
 
     // Drain and apply pending CDP events (console, errors, screencast frames, target lifecycle)
-    if !existing_browser_only {
+    if !existing_browser_only && !goal_existing_only {
         if let Err(e) = state.drain_cdp_events_background().await {
             return error_response(&id, &super::browser::to_ai_friendly_error(&e));
         }
@@ -2673,7 +2789,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     // absence of the field leaves the current state untouched.
     match cmd
         .get("pinTab")
-        .filter(|_| !existing_browser_only)
+        .filter(|_| !existing_browser_only && !goal_existing_only)
         .and_then(Value::as_bool)
     {
         Some(pin) if pin != state.pin_tab => {
@@ -2723,20 +2839,22 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     let restore_key_change_needs_launch = !skip_launch
         && command_changes_restore_key(cmd, state)
         && has_active_browser_session(state);
-    let needs_launch = if !skip_launch && !auth_login_no_navigate && !existing_browser_only {
-        // Check if existing connection is stale and needs re-launch.
-        // This must happen before policy evaluation so plugin capability
-        // actions are gated when recovery relaunches would invoke plugins.
-        if restore_key_change_needs_launch {
-            true
-        } else if let Some(ref mut mgr) = state.browser {
-            mgr.has_process_exited() || !mgr.is_connection_alive().await
+    let needs_launch =
+        if !skip_launch && !auth_login_no_navigate && !existing_browser_only && !goal_existing_only
+        {
+            // Check if existing connection is stale and needs re-launch.
+            // This must happen before policy evaluation so plugin capability
+            // actions are gated when recovery relaunches would invoke plugins.
+            if restore_key_change_needs_launch {
+                true
+            } else if let Some(ref mut mgr) = state.browser {
+                mgr.has_process_exited() || !mgr.is_connection_alive().await
+            } else {
+                true
+            }
         } else {
-            true
-        }
-    } else {
-        false
-    };
+            false
+        };
     let mut lifecycle_reused = false;
     let mut lifecycle_launched = false;
     let mut lifecycle_relaunched_browser = false;
@@ -2750,10 +2868,15 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
             match policy.check(policy_action) {
                 PolicyResult::Allow => {}
                 PolicyResult::Deny(reason) => {
-                    return error_response(
+                    let mut denied = error_response(
                         &id,
                         &format!("Action '{}' denied by policy: {}", policy_action, reason),
                     );
+                    // Preserve the reason in error and the origin as a typed
+                    // code. Goal may recover an operational read error, but a
+                    // policy decision must stop that recovery immediately.
+                    denied["code"] = json!("policy_denied");
+                    return denied;
                 }
                 PolicyResult::RequiresConfirmation => {
                     if !state.confirmed_policy_actions.contains(policy_action)
@@ -2848,6 +2971,38 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
             Err(error) => error_response(&id, &super::browser::to_ai_friendly_error(&error)),
         };
         attach_tab_gone_data(&mut resp, state);
+        inject_lifecycle(&mut resp, state, true, false, false);
+        return resp;
+    }
+
+    if goal_existing_only {
+        // Goal probes and guarded clicks use the existing page only. This
+        // branch is after normal action policy and confirmation, so an approval
+        // re-enters here and repeats the identity/coverage check before input.
+        let result = goal_existing_command(
+            cmd,
+            state,
+            action,
+            cmd_start,
+            goal_probe,
+            goal_observation,
+            goal_guarded_click,
+        )
+        .await;
+        let input_uncertain = result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error == interaction::GOAL_INPUT_UNCERTAIN);
+        let mut resp = match result {
+            Ok(data) => success_response(&id, data),
+            Err(error) => error_response(&id, &error),
+        };
+        if input_uncertain {
+            resp["code"] = json!("goal_input_uncertain");
+        }
+        if goal_guarded_click {
+            state.last_command_finished = Some(std::time::Instant::now());
+        }
         inject_lifecycle(&mut resp, state, true, false, false);
         return resp;
     }
@@ -2965,7 +3120,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
                 .get("webmcp")
                 .and_then(Value::as_bool)
                 .unwrap_or_else(|| launch_options_from_env().webmcp);
-            let result = handle_launch(cmd, state).await;
+            let result = boxed_launch(cmd, state).await;
             if result.is_ok() {
                 state.webmcp_enabled = webmcp_enabled;
             }
@@ -6212,6 +6367,209 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         return Ok(json!({ "clicked": selector, "dialogOpened": true }));
     }
     Ok(json!({ "clicked": selector }))
+}
+
+async fn handle_goal_probe(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let selector = cmd
+        .get("selector")
+        .and_then(Value::as_str)
+        .ok_or("Missing goal target")?;
+    let browser_incarnation = refresh_goal_browser_incarnation(state);
+    let Some(mgr) = state.browser.as_ref() else {
+        return Ok(json!({ "status": "unavailable", "detail": "Browser is unavailable" }));
+    };
+    let page_session = match mgr.active_session_id() {
+        Ok(session) => session,
+        Err(_) => return Ok(json!({ "status": "unavailable", "detail": "Page is unavailable" })),
+    };
+    let expected = cmd
+        .get("expectedIdentity")
+        .map(|value| serde_json::from_value::<super::element::GoalTargetIdentity>(value.clone()))
+        .transpose()
+        .map_err(|_| "Invalid goal target identity")?;
+    let result = super::element::probe_goal_target(
+        &mgr.client,
+        page_session,
+        &state.ref_map,
+        selector,
+        &state.iframe_sessions,
+        (&state.goal_incarnation, &browser_incarnation),
+        expected.as_ref(),
+    )
+    .await;
+    serde_json::to_value(result).map_err(|error| error.to_string())
+}
+
+async fn handle_goal_guarded_click(
+    cmd: &Value,
+    state: &mut DaemonState,
+    deadline: std::time::Instant,
+) -> Result<Value, String> {
+    let remaining = goal_deadline_remaining(cmd)?;
+    let deadline = deadline.min(std::time::Instant::now() + remaining);
+    let expected: super::element::GoalTargetIdentity =
+        serde_json::from_value(cmd.get("goalGuard").cloned().ok_or("Missing goal guard")?)
+            .map_err(|_| "Invalid goal guard")?;
+    let selector = cmd
+        .get("selector")
+        .and_then(Value::as_str)
+        .ok_or("Missing goal target")?;
+    let browser_incarnation = refresh_goal_browser_incarnation(state);
+    let mgr = state.browser.as_ref().ok_or("Browser is unavailable")?;
+    let page_session = mgr.active_session_id()?.to_string();
+    let before = tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline),
+        super::element::probe_goal_target(
+            &mgr.client,
+            &page_session,
+            &state.ref_map,
+            selector,
+            &state.iframe_sessions,
+            (&state.goal_incarnation, &browser_incarnation),
+            Some(&expected),
+        ),
+    )
+    .await
+    .map_err(|_| "Goal target check timed out before click")?;
+    if before.identity.as_ref() != Some(&expected) || before.status == "unavailable" {
+        return Err("Goal target unavailable: original context changed".into());
+    }
+    if before.status != "ready" {
+        // The read-only probe may see a below-fold point. Dispatch may scroll
+        // the exact backend node, then must re-probe cover and identity.
+        if std::time::Instant::now() >= deadline {
+            return Err("Goal deadline expired before target scroll".into());
+        }
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            super::element::scroll_goal_node_into_view(
+                &mgr.client,
+                &expected.document_session,
+                expected.backend_node_id,
+                deadline,
+            ),
+        )
+        .await
+        .map_err(|_| "Goal target scroll timed out before click")??;
+    }
+    let pre_hover = if before.status == "ready" {
+        before
+    } else {
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            super::element::probe_goal_target(
+                &mgr.client,
+                &page_session,
+                &state.ref_map,
+                selector,
+                &state.iframe_sessions,
+                (&state.goal_incarnation, &browser_incarnation),
+                Some(&expected),
+            ),
+        )
+        .await
+        .map_err(|_| "Goal target check timed out before click")?
+    };
+    if pre_hover.status != "ready" {
+        return Err(format!(
+            "Goal target {}: {}",
+            pre_hover.status,
+            pre_hover.detail.unwrap_or_default()
+        ));
+    }
+    interaction::hover_goal_point_before(
+        &mgr.client,
+        pre_hover
+            .session
+            .as_deref()
+            .ok_or("Missing target session")?,
+        (
+            pre_hover.x.ok_or("Missing target x")?,
+            pre_hover.y.ok_or("Missing target y")?,
+        ),
+        deadline,
+    )
+    .await?;
+    let probe = tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline),
+        super::element::probe_goal_target(
+            &mgr.client,
+            &page_session,
+            &state.ref_map,
+            selector,
+            &state.iframe_sessions,
+            (&state.goal_incarnation, &browser_incarnation),
+            Some(&expected),
+        ),
+    )
+    .await
+    .map_err(|_| "Goal target check timed out before click")?;
+    if probe.status != "ready" {
+        return Err(format!(
+            "Goal target {}: {}",
+            probe.status,
+            probe.detail.unwrap_or_default()
+        ));
+    }
+    if std::time::Instant::now() >= deadline {
+        return Err("Goal deadline expired before click".into());
+    }
+    let result = interaction::click_at_before(
+        &mgr.client,
+        interaction::ClickPoint {
+            page_session: &page_session,
+            target_session: probe.session.as_deref().ok_or("Missing target session")?,
+            x: probe.x.ok_or("Missing target x")?,
+            y: probe.y.ok_or("Missing target y")?,
+        },
+        "left",
+        1,
+        &state.iframe_sessions,
+        deadline,
+    )
+    .await?;
+    record_click_animation(
+        &result,
+        &mut state.mouse_state,
+        &state.recording_state.shared_cursor,
+    );
+    if result.dialog_opened {
+        state.pending_pointer_release = result.pending_release;
+        return Ok(json!({ "clicked": selector, "dialogOpened": true }));
+    }
+    Ok(json!({ "clicked": selector }))
+}
+
+fn refresh_goal_browser_incarnation(state: &mut DaemonState) -> String {
+    if let Some(browser) = state.browser.as_ref() {
+        let current = Arc::as_ptr(&browser.client);
+        let changed = state
+            .goal_browser_client
+            .as_ref()
+            .is_none_or(|prior| prior.as_ptr() != current);
+        if changed {
+            state.goal_browser_incarnation = uuid::Uuid::new_v4().to_string();
+            state.goal_browser_client = Some(Arc::downgrade(&browser.client));
+        }
+    }
+    state.goal_browser_incarnation.clone()
+}
+
+pub(super) fn goal_deadline_remaining(cmd: &Value) -> Result<std::time::Duration, String> {
+    let expiry = cmd
+        .get("goalDeadlineUnixMs")
+        .and_then(Value::as_u64)
+        .ok_or("Missing goal deadline")?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "Goal deadline expired")?
+        .as_millis();
+    if now >= expiry as u128 {
+        return Err("Goal deadline expired before click".into());
+    }
+    Ok(std::time::Duration::from_millis(
+        (expiry as u128 - now).min(u64::MAX as u128) as u64,
+    ))
 }
 
 async fn handle_dblclick(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -12677,6 +13035,41 @@ async fn handle_confirm(_cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         .take()
         .ok_or("No pending confirmation")?;
 
+    let mut approved_cmd = pending.cmd;
+    let approved_action = approved_cmd.get("action").and_then(Value::as_str);
+    let approval_bounded_goal = approved_action == Some("__goal_probe")
+        || (approved_cmd.get("goalExistingOnly") == Some(&json!(true))
+            && matches!(approved_action, Some("snapshot" | "url" | "title")))
+        || (approved_action == Some("click") && approved_cmd.get("goalGuard").is_some());
+    if approval_bounded_goal {
+        if let Some(approval_deadline) = approved_cmd
+            .get("goalApprovalDeadlineUnixMs")
+            .and_then(Value::as_u64)
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| "Goal approval deadline expired")?
+                .as_millis() as u64;
+            // Human approval is bounded by the caller's original allowance.
+            // Browser execution gets a fresh short slice, never beyond it.
+            if now >= approval_deadline {
+                return Ok(json!({
+                    "confirmed": true,
+                    "action": pending.action,
+                    "result": error_response("", "Goal approval deadline expired"),
+                }));
+            }
+            let execution_ms = if approved_action == Some("__goal_probe") {
+                500
+            } else {
+                30_000
+            };
+            let execution_deadline = approval_deadline.min(now.saturating_add(execution_ms));
+            approved_cmd["goalDeadlineUnixMs"] = json!(execution_deadline);
+            approved_cmd["goalTimeoutMs"] = json!(execution_deadline - now);
+        }
+    }
+
     let mut approved_actions = pending.approved_actions.clone();
     if !approved_actions.iter().any(|a| a == &pending.action) {
         approved_actions.push(pending.action.clone());
@@ -12685,7 +13078,7 @@ async fn handle_confirm(_cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         &mut state.confirmed_policy_actions,
         approved_actions.into_iter().collect(),
     );
-    let result = Box::pin(execute_command(&pending.cmd, state)).await;
+    let result = Box::pin(execute_command(&approved_cmd, state)).await;
     state.confirmed_policy_actions = previous_confirmed;
 
     Ok(json!({ "confirmed": true, "action": pending.action, "result": result }))
@@ -13471,6 +13864,51 @@ fn attach_tab_gone_data(resp: &mut Value, state: &DaemonState) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn private_goal_probe_and_guarded_click_keep_policy_classification() {
+        use serde_json::json;
+        assert_eq!(
+            super::policy_actions_for_command(
+                &json!({"action":"__goal_probe"}),
+                "__goal_probe",
+                false
+            ),
+            vec!["snapshot"]
+        );
+        assert_eq!(
+            super::policy_actions_for_command(
+                &json!({"action":"click","goalGuard":{}}),
+                "click",
+                false
+            ),
+            vec!["click"]
+        );
+    }
+
+    #[tokio::test]
+    async fn private_goal_reads_and_clicks_do_not_launch_a_missing_browser() {
+        use serde_json::json;
+        let mut state = super::DaemonState::new();
+        let probe = super::execute_command(
+            &json!({"action":"__goal_probe","selector":"@e1","goalTimeoutMs":50}),
+            &mut state,
+        )
+        .await;
+        assert_eq!(probe["success"], true);
+        assert_eq!(probe["data"]["status"], "unavailable");
+        assert!(state.browser.is_none());
+        let snapshot = super::execute_command(
+            &json!({"action":"snapshot","goalExistingOnly":true,"goalTimeoutMs":50}),
+            &mut state,
+        )
+        .await;
+        assert_eq!(snapshot["success"], false);
+        assert!(state.browser.is_none());
+        let click = super::execute_command(&json!({"action":"click","selector":"@e1","goalGuard":{},"goalDeadlineUnixMs":u64::MAX,"goalTimeoutMs":50}), &mut state).await;
+        assert_eq!(click["success"], false);
+        assert!(state.browser.is_none());
+    }
+
     #[tokio::test]
     async fn human_command_does_not_change_session_default() {
         let mut state = super::DaemonState::new();
@@ -14569,6 +15007,7 @@ mod tests {
 
         assert_eq!(resp["success"], false);
         assert!(resp["error"].as_str().unwrap().contains("read"));
+        assert_eq!(resp["code"], "policy_denied");
         assert!(state.browser.is_none());
     }
 

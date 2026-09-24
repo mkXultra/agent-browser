@@ -458,10 +458,30 @@ fn resolve_interactive_confirmations(resp: Response, flags: &Flags) -> Result<Re
 /// approval, callers print the executed inner response and derive their exit
 /// status from that response rather than the confirmation envelope.
 fn resolve_interactive_confirmations_before(
-    mut resp: Response,
+    resp: Response,
     flags: &Flags,
     deadline: Option<Instant>,
 ) -> Result<Response, ConfirmationResolutionError> {
+    resolve_interactive_confirmations_with_transport(resp, flags, deadline, false)
+}
+
+fn resolve_interactive_confirmations_with_transport(
+    mut resp: Response,
+    flags: &Flags,
+    deadline: Option<Instant>,
+    bounded_goal: bool,
+) -> Result<Response, ConfirmationResolutionError> {
+    let send_resolution = |command| {
+        if bounded_goal {
+            connection::send_goal_command_before(
+                command,
+                &flags.session,
+                deadline.expect("bounded goal confirmation has a deadline"),
+            )
+        } else {
+            connection::send_command_result(command, &flags.session)
+        }
+    };
     while let Some(prompt) = confirmation_prompt_from_response(&resp) {
         eprintln!("[agent-browser] Action requires confirmation:");
         if prompt.category.is_empty() {
@@ -483,21 +503,40 @@ fn resolve_interactive_confirmations_before(
             confirmation_resolution_command(&prompt, approved, deadline);
 
         if expired_approval {
-            // Clear the pending action with a best-effort denial. Never send
-            // `confirm` after the deadline, even if the user approved at the
-            // prompt before noticing the goal had expired.
-            let _ = send_command(confirm_cmd, &flags.session);
+            // Denial cannot execute the pending action. Give its cleanup a
+            // separate short allowance after the goal deadline; the expired
+            // goal allowance would reject it before connecting.
+            if bounded_goal {
+                let _ = connection::send_goal_command_before(
+                    confirm_cmd,
+                    &flags.session,
+                    Instant::now() + std::time::Duration::from_millis(500),
+                );
+            } else {
+                let _ = send_resolution(confirm_cmd);
+            }
             return Err(ConfirmationResolutionError::DeadlineExpired);
         }
         if !approved {
-            return match connection::send_command_result(confirm_cmd, &flags.session) {
+            // A denial never executes the pending action. A user can answer
+            // after the goal deadline, so cleanup gets a separate allowance.
+            let denied = if bounded_goal && deadline.is_some_and(|limit| Instant::now() >= limit) {
+                connection::send_goal_command_before(
+                    confirm_cmd,
+                    &flags.session,
+                    Instant::now() + std::time::Duration::from_millis(500),
+                )
+            } else {
+                send_resolution(confirm_cmd)
+            };
+            return match denied {
                 Ok(_) => Err(ConfirmationResolutionError::Denied),
                 Err(_) if deadline.is_some() => Err(ConfirmationResolutionError::Denied),
                 Err(error) => Err(ConfirmationResolutionError::Command(error)),
             };
         }
-        let next_resp = connection::send_command_result(confirm_cmd, &flags.session)
-            .map_err(ConfirmationResolutionError::Command)?;
+        let next_resp =
+            send_resolution(confirm_cmd).map_err(ConfirmationResolutionError::Command)?;
         // Unwrap exactly the confirmation envelope returned for this
         // approval. The executed command's own `data.result` is page or
         // command data and must never be interpreted as another Response.
@@ -2219,8 +2258,26 @@ fn run_words(
 fn goal_error_from_transport(error: TransportError) -> goal::CommandRunError {
     if error.phase == DispatchPhase::PossiblySent {
         goal::CommandRunError::Uncertain(error.to_string())
+    } else if error.kind == connection::TransportErrorKind::Deadline {
+        goal::CommandRunError::Timeout
     } else {
         goal::CommandRunError::Failed(error.to_string())
+    }
+}
+
+fn goal_read_error_from_transport(error: TransportError) -> goal::CommandRunError {
+    if error.kind == connection::TransportErrorKind::Deadline {
+        goal::CommandRunError::Timeout
+    } else {
+        goal::CommandRunError::Failed(error.to_string())
+    }
+}
+
+fn goal_confirmation_error(error: ConfirmationResolutionError) -> goal::CommandRunError {
+    match error {
+        ConfirmationResolutionError::Denied => goal::CommandRunError::Denied,
+        ConfirmationResolutionError::DeadlineExpired => goal::CommandRunError::Timeout,
+        ConfirmationResolutionError::Command(error) => goal_error_from_transport(error),
     }
 }
 
@@ -2233,6 +2290,18 @@ fn parse_session_command(words: &[String], flags: &Flags) -> Result<serde_json::
     attach_restore_config_to_command(&mut parsed, flags);
     attach_pin_tab_to_command(&mut parsed, flags);
     Ok(parsed)
+}
+
+fn goal_wire_deadline(deadline: Instant) -> Result<u64, goal::CommandRunError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| goal::CommandRunError::Timeout)?
+        .as_millis();
+    Ok((now
+        + deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis())
+    .min(u64::MAX as u128) as u64)
 }
 
 struct GoalCommandRunner<'a> {
@@ -2251,6 +2320,171 @@ impl goal::CommandRunner for GoalCommandRunner<'_> {
                     ConfirmationResolutionError::Command(error) => goal_error_from_transport(error),
                 },
             )
+        } else {
+            Ok(resp)
+        }
+    }
+
+    fn observe_command(
+        &self,
+        words: &[String],
+        deadline: Instant,
+    ) -> Result<Response, goal::CommandRunError> {
+        let mut parsed =
+            parse_session_command(words, self.flags).map_err(goal::CommandRunError::Failed)?;
+        let effective_deadline = deadline.min(Instant::now() + std::time::Duration::from_secs(30));
+        parsed["goalExistingOnly"] = json!(true);
+        parsed["goalTimeoutMs"] = json!(effective_deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis() as u64);
+        parsed["goalDeadlineUnixMs"] = json!(goal_wire_deadline(effective_deadline)?);
+        // The 30-second slice bounds browser work, not a human decision.
+        parsed["goalApprovalDeadlineUnixMs"] = json!(goal_wire_deadline(deadline)?);
+        let response = connection::send_goal_observation_before_result(
+            parsed,
+            &self.flags.session,
+            effective_deadline,
+        )
+        .map_err(goal_read_error_from_transport)?;
+        if self.flags.confirm_interactive && confirmation_prompt_from_response(&response).is_some()
+        {
+            resolve_interactive_confirmations_with_transport(
+                response,
+                self.flags,
+                Some(deadline),
+                true,
+            )
+            .map_err(goal_confirmation_error)
+        } else {
+            Ok(response)
+        }
+    }
+
+    fn probe_target(
+        &self,
+        ref_id: &str,
+        expected: Option<&serde_json::Value>,
+        deadline: Instant,
+    ) -> Result<goal::TargetProbe, goal::CommandRunError> {
+        let mut parsed = parse_session_command(&["snapshot".to_string()], self.flags)
+            .map_err(goal::CommandRunError::Failed)?;
+        parsed["action"] = json!("__goal_probe");
+        parsed["selector"] = json!(format!("@{}", ref_id));
+        if let Some(identity) = expected {
+            parsed["expectedIdentity"] = identity.clone();
+        }
+        let effective_deadline =
+            deadline.min(Instant::now() + std::time::Duration::from_millis(500));
+        parsed["goalTimeoutMs"] = json!(effective_deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis() as u64);
+        parsed["goalDeadlineUnixMs"] = json!(goal_wire_deadline(effective_deadline)?);
+        // The private browser probe executes for at most 500 ms. A human may
+        // approve it within the caller's remaining goal or click-local budget;
+        // confirmation reissues the same exact-node check with a new short
+        // execution allowance, never a new click-local allowance.
+        parsed["goalApprovalDeadlineUnixMs"] = json!(goal_wire_deadline(deadline)?);
+        let response = match connection::send_goal_observation_before_result(
+            parsed,
+            &self.flags.session,
+            effective_deadline,
+        ) {
+            Ok(response) => response,
+            Err(error)
+                if error.kind == connection::TransportErrorKind::Deadline
+                    && effective_deadline == deadline =>
+            {
+                return Err(goal::CommandRunError::Timeout);
+            }
+            Err(_) if Instant::now() < deadline => return Ok(goal::TargetProbe::unknown()),
+            Err(_) => return Err(goal::CommandRunError::Timeout),
+        };
+        let response = if self.flags.confirm_interactive
+            && confirmation_prompt_from_response(&response).is_some()
+        {
+            resolve_interactive_confirmations_with_transport(
+                response,
+                self.flags,
+                Some(deadline),
+                true,
+            )
+            .map_err(goal_confirmation_error)?
+        } else {
+            response
+        };
+        if let Some(pending) = goal::pending_confirmation(&response) {
+            return Err(goal::CommandRunError::Pending(pending));
+        }
+        if !response.success {
+            let error = response
+                .error
+                .unwrap_or_else(|| "Goal target probe failed".into());
+            return Err(if response.code.as_deref() == Some("policy_denied") {
+                goal::CommandRunError::PolicyDenied(error)
+            } else {
+                goal::CommandRunError::Failed(error)
+            });
+        }
+        Ok(goal::TargetProbe::from_response(response.data.as_ref()))
+    }
+
+    fn click_with_guard(
+        &self,
+        words: &[String],
+        identity: Option<&serde_json::Value>,
+        deadline: Instant,
+    ) -> Result<Response, goal::CommandRunError> {
+        let Some(identity) = identity else {
+            return Err(goal::CommandRunError::Failed(
+                "Goal click has no verified target identity".into(),
+            ));
+        };
+        let mut parsed =
+            parse_session_command(words, self.flags).map_err(goal::CommandRunError::Failed)?;
+        parsed["goalGuard"] = identity.clone();
+        let effective_deadline = deadline.min(Instant::now() + std::time::Duration::from_secs(30));
+        parsed["goalTimeoutMs"] = json!(effective_deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis() as u64);
+        parsed["goalDeadlineUnixMs"] = json!(goal_wire_deadline(effective_deadline)?);
+        // Approval retains the original click-local/global allowance. Native
+        // execution receives a fresh bounded slice after approval.
+        parsed["goalApprovalDeadlineUnixMs"] = json!(goal_wire_deadline(deadline)?);
+        let first = connection::send_goal_command_before(
+            parsed.clone(),
+            &self.flags.session,
+            effective_deadline,
+        );
+        let resp = match first {
+            Err(ref error)
+                if should_respawn_after(error) && Instant::now() < effective_deadline =>
+            {
+                if ensure_daemon(&self.flags.session, self.daemon_opts).is_ok() {
+                    connection::send_goal_command_before(
+                        parsed,
+                        &self.flags.session,
+                        effective_deadline,
+                    )
+                } else {
+                    first
+                }
+            }
+            other => other,
+        }
+        .map_err(goal_error_from_transport)?;
+        let resp = if self.flags.confirm_interactive
+            && confirmation_prompt_from_response(&resp).is_some()
+        {
+            resolve_interactive_confirmations_with_transport(resp, self.flags, Some(deadline), true)
+                .map_err(goal_confirmation_error)?
+        } else {
+            resp
+        };
+        if resp.code.as_deref() == Some("goal_input_uncertain") {
+            Err(goal::CommandRunError::Uncertain(
+                resp.error
+                    .unwrap_or_else(|| "Goal click outcome uncertain".into()),
+            ))
         } else {
             Ok(resp)
         }
@@ -2476,6 +2710,7 @@ mod tests {
     fn respawn_requires_proven_pre_send_failure() {
         let error = super::TransportError {
             phase: super::DispatchPhase::PossiblySent,
+            kind: super::connection::TransportErrorKind::Other,
             message: "Failed to connect: Connection refused (os error 111)".into(),
         };
         assert!(!super::should_respawn_after(&error));
@@ -2872,6 +3107,189 @@ mod tests {
                 let replayed = server.join().unwrap();
                 assert!(matches!(result, Err(goal::CommandRunError::Uncertain(_))));
                 assert!(!replayed, "goal mutation was dispatched twice");
+            });
+        }
+
+        #[test]
+        fn expired_explicit_goal_denial_reaches_daemon_with_fresh_cleanup_budget() {
+            with_runner("late-deny", |runner, _| {
+                let listener = listener(runner);
+                let server = thread::spawn(move || {
+                    let (mut stream, request) = accept_request(&listener);
+                    assert_eq!(request["action"], "deny");
+                    assert_eq!(request["confirmationId"], "late-deny-id");
+                    writeln!(stream, "{}", json!({"success":true,"data":{"denied":true}})).unwrap();
+                });
+                let pending = Response {
+                    success: true,
+                    data: Some(json!({
+                        "confirmation_required": true,
+                        "confirmation_id": "late-deny-id",
+                        "action": "snapshot"
+                    })),
+                    error: None,
+                    code: None,
+                    warning: None,
+                };
+                let result = resolve_interactive_confirmations_with_transport(
+                    pending,
+                    runner.flags,
+                    Some(Instant::now() - Duration::from_millis(1)),
+                    true,
+                );
+                assert!(matches!(result, Err(ConfirmationResolutionError::Denied)));
+                server.join().unwrap();
+            });
+        }
+
+        #[test]
+        fn goal_probe_and_observation_use_bounded_existing_page_requests() {
+            with_runner("goal-read", |runner, _| {
+                let listener = listener(runner);
+                let server = thread::spawn(move || {
+                    let (mut stream, probe) = accept_request(&listener);
+                    assert_eq!(probe["action"], "__goal_probe");
+                    assert_eq!(probe["selector"], "@e1");
+                    assert!(probe["goalTimeoutMs"].as_u64().is_some_and(|ms| ms <= 500));
+                    writeln!(
+                        stream,
+                        "{}",
+                        json!({"success":true,"data":{"status":"ready","identity":{"node":1}}})
+                    )
+                    .unwrap();
+                    let (mut stream, observation) = accept_request(&listener);
+                    assert_eq!(observation["action"], "snapshot");
+                    assert_eq!(observation["goalExistingOnly"], true);
+                    let snapshot = "x".repeat(70_000);
+                    writeln!(
+                        stream,
+                        "{}",
+                        json!({"success":true,"data":{"snapshot":snapshot}})
+                    )
+                    .unwrap();
+                });
+                let probe = runner
+                    .probe_target("e1", None, Instant::now() + Duration::from_secs(1))
+                    .unwrap();
+                assert_eq!(probe.status, goal::TargetReadiness::Ready);
+                let response = runner
+                    .observe_command(
+                        &["snapshot".into()],
+                        Instant::now() + Duration::from_secs(1),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    response.data.unwrap()["snapshot"].as_str().unwrap().len(),
+                    70_000
+                );
+                server.join().unwrap();
+            });
+        }
+
+        #[test]
+        fn goal_observation_allows_slow_snapshot_within_global_budget() {
+            with_runner("slow-snapshot", |runner, _| {
+                let listener = listener(runner);
+                let server = thread::spawn(move || {
+                    let (mut stream, request) = accept_request(&listener);
+                    assert_eq!(request["action"], "snapshot");
+                    assert!(request["goalTimeoutMs"].as_u64().unwrap() >= 2000);
+                    assert!(request["goalDeadlineUnixMs"].as_u64().is_some());
+                    thread::sleep(Duration::from_millis(1500));
+                    writeln!(
+                        stream,
+                        "{}",
+                        json!({"success":true,"data":{"snapshot":"slow page"}})
+                    )
+                    .unwrap();
+                });
+                let response = runner
+                    .observe_command(
+                        &["snapshot".into()],
+                        Instant::now() + Duration::from_secs(3),
+                    )
+                    .unwrap();
+                assert_eq!(response.data.unwrap()["snapshot"], "slow page");
+                server.join().unwrap();
+            });
+        }
+
+        #[test]
+        fn private_goal_observation_interactive_non_tty_denies_confirmation() {
+            with_runner("read-confirm", |runner, _| {
+                let listener = listener(runner);
+                let server = thread::spawn(move || {
+                    let (mut stream, request) = accept_request(&listener);
+                    assert_eq!(request["action"], "snapshot");
+                    writeln!(stream, "{}", json!({"success":true,"data":{"confirmation_required":true,"confirmation_id":"read-1","action":"snapshot"}})).unwrap();
+                    let (mut stream, resolution) = accept_request(&listener);
+                    assert_eq!(resolution["action"], "deny");
+                    writeln!(stream, "{}", json!({"success":true,"data":{}})).unwrap();
+                });
+                let result = runner.observe_command(
+                    &["snapshot".into()],
+                    Instant::now() + Duration::from_secs(2),
+                );
+                assert!(matches!(result, Err(goal::CommandRunError::Denied)));
+                server.join().unwrap();
+            });
+        }
+
+        #[test]
+        fn guarded_goal_click_lost_reply_stays_uncertain() {
+            with_runner("guarded-eof", |runner, _| {
+                let listener = listener(runner);
+                let server = thread::spawn(move || {
+                    let (stream, request) = accept_request(&listener);
+                    assert_eq!(request["action"], "click");
+                    assert_eq!(request["goalGuard"], json!({"node":1}));
+                    assert!(request["goalDeadlineUnixMs"].as_u64().is_some());
+                    drop(stream);
+                    thread::sleep(Duration::from_millis(100));
+                    assert_no_more_connections(&listener);
+                });
+                let response = runner.click_with_guard(
+                    &["click".into(), "@e1".into()],
+                    Some(&json!({"node":1})),
+                    Instant::now() + Duration::from_secs(1),
+                );
+                assert!(matches!(response, Err(goal::CommandRunError::Uncertain(_))));
+                server.join().unwrap();
+            });
+        }
+
+        #[test]
+        fn guarded_goal_click_read_timeout_keeps_uncertain_outcome() {
+            with_runner("guarded-stall", |runner, _| {
+                let listener = listener(runner);
+                let server = thread::spawn(move || {
+                    let (stream, request) = accept_request(&listener);
+                    assert_eq!(request["action"], "click");
+                    thread::sleep(Duration::from_millis(300));
+                    drop(stream);
+                    assert_no_more_connections(&listener);
+                });
+                let started = Instant::now();
+                let result = runner.click_with_guard(
+                    &["click".into(), "@e1".into()],
+                    Some(&json!({"node":1})),
+                    started + Duration::from_millis(100),
+                );
+                assert!(matches!(result, Err(goal::CommandRunError::Uncertain(_))));
+                assert!(started.elapsed() < Duration::from_millis(250));
+                server.join().unwrap();
+            });
+        }
+
+        #[test]
+        fn guarded_goal_click_without_identity_is_not_dispatched() {
+            with_runner("guarded-missing-identity", |runner, _| {
+                let result = runner.click_with_guard(
+                    &["click".into(), "@e1".into()],
+                    None,
+                    Instant::now() + Duration::from_secs(1),
+                );
+                assert!(matches!(result, Err(goal::CommandRunError::Failed(_))));
             });
         }
 

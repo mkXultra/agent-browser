@@ -1,5 +1,11 @@
 //! `agent-browser goal "<text>"`: goal-driven browsing with a System One evaluation model.
 //!
+//! After a successful click, the loop keeps one immutable local readiness cap
+//! for that target. It observes the page while the original node is covered,
+//! then checks for changes again after model evaluation. A native guarded click
+//! revalidates browser, document, node and hit testing at dispatch. This is a
+//! check that a target is actionable now, not that an app transition completed.
+//!
 //! Each step observes the current tab (one full `snapshot` plus `get url` and
 //! `get title`), turns the accessibility tree into an indexed element table
 //! and bounded, prioritized page text,
@@ -57,6 +63,10 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 /// Maximum time spent refreshing the URL after an accepted DONE decision.
 /// This is a single read, not a wait for navigation to finish.
 pub(crate) const FINAL_URL_TIMEOUT_MS: u64 = 1000;
+/// Maximum local wait for a click's target to become usable again. This cap is
+/// set once on click success and is never renewed by WAIT or model decisions.
+const CLICK_READY_WAIT_MS: u64 = 1500;
+const CLICK_READY_POLL_MS: u64 = 100;
 
 const PAGE_TEXT_LIMIT: usize = 6000;
 const DIAGNOSTIC_TEXT_LIMIT: usize = 3000;
@@ -467,12 +477,116 @@ pub(crate) fn parse_snapshot(snapshot: &str) -> (Vec<Element>, String) {
 }
 
 /// One observed page: what the model sees and what actions map back to.
+#[derive(Clone)]
 struct Page {
     url: String,
     title: String,
     text: String,
     elements: Vec<Element>,
     fingerprint: String,
+    unavailable_click_ref: Option<String>,
+    unavailable_reason: Option<String>,
+    // The last click changed context, but its mandatory replacement read did
+    // not complete. No element index or terminal claim may use this page.
+    observation_unresolved: bool,
+}
+
+impl Page {
+    fn unresolved_after_click(mut self, ref_id: &str) -> Self {
+        self.text = "Fresh page observation is unavailable after the previous click".into();
+        self.elements.clear();
+        self.unavailable_click_ref = Some(ref_id.into());
+        self.unavailable_reason = Some(
+            "Page context changed; no fresh element choices are available. WAIT to retry observation or report BLOCKED".into(),
+        );
+        self.observation_unresolved = true;
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TargetReadiness {
+    Ready,
+    Covered,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TargetProbe {
+    pub status: TargetReadiness,
+    pub identity: Option<Value>,
+    pub detail: Option<String>,
+    pub covering_interface: bool,
+}
+
+impl TargetProbe {
+    pub(crate) fn unknown() -> Self {
+        Self {
+            status: TargetReadiness::Unknown,
+            identity: None,
+            detail: None,
+            covering_interface: false,
+        }
+    }
+
+    pub(crate) fn from_response(data: Option<&Value>) -> Self {
+        let Some(data) = data else {
+            return Self::unknown();
+        };
+        let mut status = match data.get("status").and_then(Value::as_str) {
+            Some("ready") => TargetReadiness::Ready,
+            Some("covered") => TargetReadiness::Covered,
+            Some("unavailable") => TargetReadiness::Unavailable,
+            _ => TargetReadiness::Unknown,
+        };
+        let identity = data
+            .get("identity")
+            .filter(|value| value.is_object())
+            .cloned();
+        if status == TargetReadiness::Ready && identity.is_none() {
+            status = TargetReadiness::Unknown;
+        }
+        Self {
+            status,
+            identity,
+            detail: data
+                .get("detail")
+                .and_then(Value::as_str)
+                .map(|value| value.chars().take(160).collect()),
+            covering_interface: data.get("coveringInterface").and_then(Value::as_bool)
+                == Some(true),
+        }
+    }
+}
+
+struct LastClick {
+    ref_id: String,
+    identity: Option<Value>,
+    before_fingerprint: String,
+    before_content: String,
+    wait_until: Instant,
+    ready_samples: u8,
+    last_detail: Option<String>,
+    cap_reported: bool,
+    retired: bool,
+    ready_observed: bool,
+    progressed: bool,
+}
+
+/// Compare content the model can use for a decision. A textless generic
+/// spinner can change the raw snapshot fingerprint without changing this key.
+fn relevant_page_content(page: &Page) -> String {
+    let mut content = format!("{}\n{}\n{}", page.url, page.title, page.text);
+    for element in &page.elements {
+        content.push_str(&format!(
+            "\n{}|{}|{}",
+            element.role,
+            element.name,
+            element.value.as_deref().unwrap_or("")
+        ));
+    }
+    content
 }
 
 /// A record of one executed step, kept for the model and for the report.
@@ -491,6 +605,45 @@ pub(crate) struct Step {
     execute_ms: u128,
     page_changed: Option<bool>,
     url: String,
+}
+
+fn emit_settled_click_step(
+    history: &mut [Step],
+    pending: &mut Option<usize>,
+    observed_progress: bool,
+    on_step: &mut impl FnMut(&Step),
+) {
+    if let Some(index) = pending.take() {
+        let step = &mut history[index];
+        step.page_changed = Some(step.page_changed == Some(true) || observed_progress);
+        on_step(step);
+    }
+}
+
+/// A guarded observation can reveal a click's page change after its step was
+/// already emitted. Reconcile the stored step for model and stall accounting,
+/// but never emit it a second time or treat the discarded decision as input.
+fn credit_delayed_click_progress(history: &mut [Step], last: Option<&LastClick>, fresh: &Page) {
+    let Some(last) = last else { return };
+    if fresh.fingerprint == last.before_fingerprint {
+        return;
+    }
+    if let Some(step) = history.iter_mut().rev().find(|step| {
+        step.operation == "CLICK"
+            && step
+                .target
+                .as_ref()
+                .is_some_and(|target| target.ref_id == last.ref_id)
+    }) {
+        step.page_changed = Some(true);
+    }
+}
+
+fn three_actions_without_progress(history: &[Step]) -> bool {
+    history.len() >= 3
+        && history[history.len() - 3..]
+            .iter()
+            .all(|step| step.page_changed == Some(false) && step.operation != "WAIT")
 }
 
 impl Step {
@@ -742,11 +895,14 @@ fn nonempty_value(value: Option<&String>) -> Option<String> {
 /// A command outcome that the goal loop must distinguish from an executed
 /// browser action. Denials and pre-dispatch deadline expiry never become
 /// entries in the executed step history.
+#[derive(Debug)]
 pub(crate) enum CommandRunError {
     Failed(String),
+    PolicyDenied(String),
     /// A request may have executed before its transport reply was lost.
     /// Never treat this as a stale element or a safe action retry.
     Uncertain(String),
+    Pending(Value),
     Denied,
     Timeout,
 }
@@ -760,6 +916,31 @@ pub(crate) trait CommandRunner {
 
     /// Read the live URL once by `deadline`, without retrying or prompting.
     fn final_url(&self, deadline: Instant) -> Result<Response, CommandRunError>;
+
+    /// Bounded read of an existing goal page; no lifecycle recovery.
+    fn observe_command(
+        &self,
+        words: &[String],
+        deadline: Instant,
+    ) -> Result<Response, CommandRunError>;
+
+    /// Private, read-only check of the original snapshot node. Production
+    /// implementations must bound transport and daemon execution.
+    fn probe_target(
+        &self,
+        ref_id: &str,
+        expected: Option<&Value>,
+        deadline: Instant,
+    ) -> Result<TargetProbe, CommandRunError>;
+
+    /// Execute through the normal parsed click and confirmation path. A token
+    /// asks the daemon to revalidate native identity and coverage at dispatch.
+    fn click_with_guard(
+        &self,
+        words: &[String],
+        identity: Option<&Value>,
+        deadline: Instant,
+    ) -> Result<Response, CommandRunError>;
 }
 
 /// Test doubles can model both paths with the same command script.
@@ -774,6 +955,37 @@ where
 
     fn final_url(&self, deadline: Instant) -> Result<Response, CommandRunError> {
         self(&words(&["get", "url"]), deadline)
+    }
+
+    fn observe_command(
+        &self,
+        words: &[String],
+        deadline: Instant,
+    ) -> Result<Response, CommandRunError> {
+        self(words, deadline)
+    }
+
+    fn probe_target(
+        &self,
+        ref_id: &str,
+        _expected: Option<&Value>,
+        _deadline: Instant,
+    ) -> Result<TargetProbe, CommandRunError> {
+        Ok(TargetProbe {
+            status: TargetReadiness::Ready,
+            identity: Some(json!({"testRef": ref_id})),
+            detail: None,
+            covering_interface: false,
+        })
+    }
+
+    fn click_with_guard(
+        &self,
+        words: &[String],
+        _identity: Option<&Value>,
+        deadline: Instant,
+    ) -> Result<Response, CommandRunError> {
+        self(words, deadline)
     }
 }
 
@@ -1271,6 +1483,8 @@ pub(crate) fn is_stale_error(error: &str) -> bool {
         || e.contains("covered by")
         || e.contains("outside of the viewport")
         || e.contains("intercepts pointer events")
+        || e.starts_with("goal target covered:")
+        || e.starts_with("goal target unavailable:")
 }
 
 fn fingerprint(url: &str, snapshot: &str) -> String {
@@ -1307,7 +1521,7 @@ fn pending_confirmation_data(data: &Value) -> Option<&Value> {
         .and_then(pending_confirmation_data)
 }
 
-fn pending_confirmation(resp: &Response) -> Option<Value> {
+pub(crate) fn pending_confirmation(resp: &Response) -> Option<Value> {
     resp.data
         .as_ref()
         .and_then(pending_confirmation_data)
@@ -1333,10 +1547,11 @@ fn remaining(deadline: Instant) -> Result<Duration, String> {
         .ok_or_else(|| "Goal time budget expired".to_string())
 }
 
+#[derive(Debug)]
 enum GoalLoopError {
     Message(String),
     Confirmation(Value),
-    Denied,
+    Denied(Option<String>),
     Timeout,
 }
 
@@ -1345,21 +1560,26 @@ fn run_or_error(
     parts: &[&str],
     deadline: Instant,
 ) -> Result<Response, GoalLoopError> {
-    remaining(deadline).map_err(GoalLoopError::Message)?;
+    remaining(deadline).map_err(|_| GoalLoopError::Timeout)?;
     let resp = run
-        .run(&words(parts), deadline)
+        .observe_command(&words(parts), deadline)
         .map_err(|error| match error {
             CommandRunError::Failed(message) | CommandRunError::Uncertain(message) => {
                 GoalLoopError::Message(message)
             }
-            CommandRunError::Denied => GoalLoopError::Denied,
+            CommandRunError::PolicyDenied(message) => GoalLoopError::Denied(Some(message)),
+            CommandRunError::Denied => GoalLoopError::Denied(None),
             CommandRunError::Timeout => GoalLoopError::Timeout,
+            CommandRunError::Pending(value) => GoalLoopError::Confirmation(value),
         })?;
-    remaining(deadline).map_err(GoalLoopError::Message)?;
+    remaining(deadline).map_err(|_| GoalLoopError::Timeout)?;
     if let Some(pending) = pending_confirmation(&resp) {
         return Err(GoalLoopError::Confirmation(pending));
     }
     if !resp.success {
+        if resp.code.as_deref() == Some("policy_denied") {
+            return Err(GoalLoopError::Denied(resp.error.clone()));
+        }
         return Err(GoalLoopError::Message(
             resp.error
                 .clone()
@@ -1384,7 +1604,199 @@ fn observe(run: &dyn CommandRunner, deadline: Instant) -> Result<Page, GoalLoopE
         title,
         text,
         elements,
+        unavailable_click_ref: None,
+        unavailable_reason: None,
+        observation_unresolved: false,
     })
+}
+
+fn probe_click(
+    run: &dyn CommandRunner,
+    ref_id: &str,
+    identity: Option<&Value>,
+    deadline: Instant,
+) -> Result<TargetProbe, GoalLoopError> {
+    run.probe_target(ref_id, identity, deadline)
+        .map_err(|error| match error {
+            CommandRunError::Failed(message) | CommandRunError::Uncertain(message) => {
+                GoalLoopError::Message(message)
+            }
+            CommandRunError::PolicyDenied(message) => GoalLoopError::Denied(Some(message)),
+            CommandRunError::Pending(value) => GoalLoopError::Confirmation(value),
+            CommandRunError::Denied => GoalLoopError::Denied(None),
+            CommandRunError::Timeout => GoalLoopError::Timeout,
+        })
+}
+
+/// Poll the original node within this click's fixed local budget. A Ready
+/// sample means actionable, even if the accessibility snapshot is unchanged.
+/// Once the cap has been reported to the model, later WAIT steps may observe
+/// recovery without renewing the original polling allowance.
+fn refresh_after_click(
+    run: &dyn CommandRunner,
+    last: &mut LastClick,
+    previous: &Page,
+    deadline: Instant,
+) -> Result<Page, GoalLoopError> {
+    let local_deadline = last.wait_until.min(deadline);
+    let mut page = previous.clone();
+    if (last.cap_reported || last.progressed)
+        && page.unavailable_click_ref.as_deref() == Some(&last.ref_id)
+    {
+        // A stale redecision does not buy another read. A model WAIT or other
+        // fresh action clears this marker and may observe later recovery.
+        return Ok(page);
+    }
+    if !last.cap_reported && Instant::now() >= local_deadline {
+        last.cap_reported = true;
+        page.unavailable_click_ref = Some(last.ref_id.clone());
+        page.unavailable_reason = Some(format!(
+            "Previous click target is not verified ready ({}); choose another control or WAIT",
+            last.last_detail.as_deref().unwrap_or("page still updating")
+        ));
+        return Ok(page);
+    }
+    let read_deadline = if last.cap_reported {
+        deadline.min(Instant::now() + Duration::from_millis(500))
+    } else {
+        local_deadline
+    };
+    loop {
+        if Instant::now() >= read_deadline {
+            break;
+        }
+        let next = match observe(run, read_deadline) {
+            Ok(next) => next,
+            Err(GoalLoopError::Timeout) if read_deadline < deadline => break,
+            Err(GoalLoopError::Message(_) | GoalLoopError::Timeout)
+                if Instant::now() >= read_deadline && Instant::now() < deadline =>
+            {
+                break
+            }
+            Err(error) => return Err(error),
+        };
+        page = next;
+        // Readiness must be at least as fresh as the snapshot. A spinner can
+        // clear between these operations; an older Covered sample must not
+        // withhold the newly actionable target from the model.
+        let probe = match probe_click(run, &last.ref_id, last.identity.as_ref(), read_deadline) {
+            Ok(probe) => probe,
+            Err(GoalLoopError::Timeout) if read_deadline < deadline => break,
+            Err(GoalLoopError::Message(_) | GoalLoopError::Timeout)
+                if Instant::now() >= read_deadline && Instant::now() < deadline =>
+            {
+                break
+            }
+            Err(error) => return Err(error),
+        };
+        last.last_detail = probe
+            .detail
+            .as_deref()
+            .map(|detail| detail.chars().take(120).collect());
+        if probe.status == TargetReadiness::Unavailable {
+            // This observation was completed before the probe, and already
+            // omitted the old ref. It can safely supply replacement choices;
+            // a changed fingerprint alone cannot prove node retirement.
+            if !page
+                .elements
+                .iter()
+                .any(|element| element.ref_id == last.ref_id)
+            {
+                last.retired = true;
+                return Ok(page);
+            }
+            // The node can be replaced after the observation above. Do not
+            // label that older element list fresh or offer its other indices
+            // to the model after a newer context-change result.
+            // The original click's local cap also bounds this mandatory read.
+            // A failed read cannot make the older snapshot's indices fresh.
+            page = match observe(run, read_deadline) {
+                Ok(fresh) if Instant::now() < read_deadline => fresh,
+                Ok(_) | Err(GoalLoopError::Timeout | GoalLoopError::Message(_)) => {
+                    if Instant::now() >= deadline {
+                        return Err(GoalLoopError::Timeout);
+                    }
+                    last.cap_reported = true;
+                    return Ok(page.unresolved_after_click(&last.ref_id));
+                }
+                Err(error) => return Err(error),
+            };
+            if !page
+                .elements
+                .iter()
+                .any(|element| element.ref_id == last.ref_id)
+            {
+                // The old node is gone. The new page still needs a model
+                // decision; a replacement is never evidence of completion.
+                last.retired = true;
+                return Ok(page);
+            }
+            // The ref still identifies the original node. A missing layout
+            // box can be temporary even while loading text changes the page.
+            // Keep polling within the original cap instead of retiring the
+            // guard or offering this target to the model.
+            last.ready_samples = 0;
+            if last.cap_reported {
+                page.unavailable_click_ref = Some(last.ref_id.clone());
+                page.unavailable_reason = Some(
+                    "Previous click target is not verified ready; choose another control or WAIT"
+                        .into(),
+                );
+                return Ok(page);
+            }
+            let pause = read_deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(CLICK_READY_POLL_MS));
+            std::thread::sleep(pause);
+            continue;
+        }
+        if probe.status == TargetReadiness::Ready {
+            last.ready_samples = last.ready_samples.saturating_add(1);
+            if last.ready_samples >= 2 || last.cap_reported {
+                last.ready_observed = true;
+                return Ok(page);
+            }
+        } else {
+            last.ready_samples = 0;
+        }
+        if probe.status == TargetReadiness::Covered
+            && probe.covering_interface
+            && relevant_page_content(&page) != last.before_content
+        {
+            // The new visible content belongs to the model's next decision.
+            // Keep the covered trigger unavailable; do not call this complete.
+            last.progressed = true;
+            page.unavailable_click_ref = Some(last.ref_id.clone());
+            page.unavailable_reason =
+                Some("The clicked control is covered by new page content".into());
+            return Ok(page);
+        }
+        if last.cap_reported {
+            page.unavailable_click_ref = Some(last.ref_id.clone());
+            page.unavailable_reason = Some(format!(
+                "Previous click target is not verified ready ({}); choose another control or WAIT",
+                probe
+                    .detail
+                    .as_deref()
+                    .unwrap_or("page still updating")
+                    .chars()
+                    .take(120)
+                    .collect::<String>()
+            ));
+            return Ok(page);
+        }
+        let pause = read_deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(CLICK_READY_POLL_MS));
+        std::thread::sleep(pause);
+    }
+    last.cap_reported = true;
+    page.unavailable_click_ref = Some(last.ref_id.clone());
+    page.unavailable_reason = Some(format!(
+        "Previous click target is not verified ready ({}); choose another control or WAIT",
+        last.last_detail.as_deref().unwrap_or("page still updating")
+    ));
+    Ok(page)
 }
 
 /// Refresh terminal metadata without changing the accepted DONE decision or
@@ -1432,7 +1844,7 @@ fn settle_and_observe(
     deadline: Instant,
 ) -> Result<Page, GoalLoopError> {
     let wait_ms = remaining(deadline)
-        .map_err(GoalLoopError::Message)?
+        .map_err(|_| GoalLoopError::Timeout)?
         .as_millis()
         .min(SETTLE_MS as u128) as u64;
     std::thread::sleep(Duration::from_millis(wait_ms));
@@ -1445,7 +1857,7 @@ fn settle_and_observe(
         && started.elapsed() < Duration::from_millis(SUGGESTION_WAIT_MS)
     {
         let wait_ms = remaining(deadline)
-            .map_err(GoalLoopError::Message)?
+            .map_err(|_| GoalLoopError::Timeout)?
             .as_millis()
             .min(SUGGESTION_POLL_MS as u128) as u64;
         std::thread::sleep(Duration::from_millis(wait_ms));
@@ -1472,7 +1884,7 @@ fn group_head_name(operation: &str) -> String {
 fn build_request(goal: &str, page: &Page, history: &[Step]) -> (Value, Value, TargetGroups) {
     let mut flat: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for element in &page.elements {
-        if element.clickable() {
+        if element.clickable() && page.unavailable_click_ref.as_deref() != Some(&element.ref_id) {
             flat.entry("CLICK".into()).or_default().push(element.index);
         }
         if element.editable() {
@@ -1608,7 +2020,7 @@ fn build_request(goal: &str, page: &Page, history: &[Step]) -> (Value, Value, Ta
         })
         .collect();
     let state = json!({
-        "page": { "url": page.url, "title": page.title, "text": page.text },
+        "page": { "url": page.url, "title": page.title, "text": page.text, "unavailable_click": page.unavailable_reason },
         "elements": page.elements.iter().map(Element::summary).collect::<Vec<_>>(),
         "recent_actions": recent,
     });
@@ -1758,14 +2170,16 @@ pub(crate) fn run_goal_loop(
                 confirmation: Some(pending),
             };
         }
-        Err(GoalLoopError::Denied) => {
+        Err(GoalLoopError::Denied(reason)) => {
             return GoalOutcome {
                 status: "denied".into(),
                 url: String::new(),
                 steps: Vec::new(),
                 stale_decisions: 0,
                 elapsed_ms: started.elapsed().as_millis(),
-                error: Some("Action denied; no pending goal action was executed".into()),
+                error: Some(reason.unwrap_or_else(|| {
+                    "Action denied; no pending goal action was executed".into()
+                })),
                 confirmation: None,
             };
         }
@@ -1800,6 +2214,8 @@ pub(crate) fn run_goal_loop(
 
     let mut stale_total = 0usize;
     let mut stale_run = 0usize;
+    let mut last_click: Option<LastClick> = None;
+    let mut pending_click_step: Option<usize> = None;
     let finish =
         |status: &str, page: &Page, history: &[Step], stale: usize, error: Option<String>| {
             GoalOutcome {
@@ -1833,6 +2249,7 @@ pub(crate) fn run_goal_loop(
 
     loop {
         if Instant::now() >= deadline {
+            emit_settled_click_step(&mut history, &mut pending_click_step, false, &mut on_step);
             return finish(
                 "timeout",
                 &page,
@@ -1844,6 +2261,50 @@ pub(crate) fn run_goal_loop(
                 )),
             );
         }
+        if let Some(last) = last_click.as_mut().filter(|last| !last.ready_observed) {
+            let before_fingerprint = last.before_fingerprint.clone();
+            let refreshed = refresh_after_click(run, last, &page, deadline);
+            let observed_progress = refreshed
+                .as_ref()
+                .is_ok_and(|next| next.fingerprint != before_fingerprint);
+            emit_settled_click_step(
+                &mut history,
+                &mut pending_click_step,
+                observed_progress,
+                &mut on_step,
+            );
+            page = match refreshed {
+                Ok(next) => next,
+                Err(GoalLoopError::Confirmation(pending)) => {
+                    return finish_confirmation(&page, &history, stale_total, pending)
+                }
+                Err(GoalLoopError::Denied(reason)) => {
+                    return finish(
+                        "denied",
+                        &page,
+                        &history,
+                        stale_total,
+                        Some(reason.unwrap_or_else(|| "Goal target observation denied".into())),
+                    )
+                }
+                Err(GoalLoopError::Timeout) => {
+                    return finish(
+                        "timeout",
+                        &page,
+                        &history,
+                        stale_total,
+                        Some(timeout_error(config.timeout_ms)),
+                    )
+                }
+                Err(GoalLoopError::Message(error)) => {
+                    return finish("error", &page, &history, stale_total, Some(error))
+                }
+            };
+            if last.retired {
+                last_click = None;
+            }
+        }
+        emit_settled_click_step(&mut history, &mut pending_click_step, false, &mut on_step);
         // The action budget is checked after this evaluation. This permits a
         // final DONE or BLOCKED assessment after action N, but action N+1 is
         // never executed.
@@ -1873,8 +2334,202 @@ pub(crate) fn run_goal_loop(
             );
         }
 
+        if page.observation_unresolved && matches!(decision.operation.as_str(), "DONE" | "BLOCKED")
+        {
+            return finish(
+                "blocked",
+                &page,
+                &history,
+                stale_total,
+                Some("Fresh page observation remained unavailable after the previous click".into()),
+            );
+        }
+
+        // A guarded repeat or terminal decision under an active click guard must use the page
+        // the model saw. Other operations do not inherit a page-wide guard.
+        let same_target_click = decision.operation == "CLICK"
+            && last_click.as_ref().is_some_and(|last| {
+                decision
+                    .target
+                    .and_then(|index| page.elements.get(index - 1))
+                    .is_some_and(|target| target.ref_id == last.ref_id)
+            });
+        if same_target_click
+            || (matches!(decision.operation.as_str(), "DONE" | "BLOCKED") && last_click.is_some())
+        {
+            let fresh = match observe(run, deadline) {
+                Ok(next) => next,
+                Err(GoalLoopError::Confirmation(pending)) => {
+                    return finish_confirmation(&page, &history, stale_total, pending)
+                }
+                Err(GoalLoopError::Denied(reason)) => {
+                    return finish(
+                        "denied",
+                        &page,
+                        &history,
+                        stale_total,
+                        Some(reason.unwrap_or_else(|| "Goal observation denied".into())),
+                    )
+                }
+                Err(GoalLoopError::Timeout) => {
+                    return finish(
+                        "timeout",
+                        &page,
+                        &history,
+                        stale_total,
+                        Some(timeout_error(config.timeout_ms)),
+                    )
+                }
+                Err(GoalLoopError::Message(error)) => {
+                    return finish("error", &page, &history, stale_total, Some(error))
+                }
+            };
+            if fresh.fingerprint != page.fingerprint {
+                credit_delayed_click_progress(&mut history, last_click.as_ref(), &fresh);
+                if stale_run >= MAX_STALE_DECISIONS {
+                    return finish(
+                        "blocked",
+                        &page,
+                        &history,
+                        stale_total,
+                        Some("Page changed during repeated model decisions".into()),
+                    );
+                }
+                stale_run += 1;
+                stale_total += 1;
+                page = fresh;
+                if last_click.as_ref().is_some_and(|last| {
+                    !page
+                        .elements
+                        .iter()
+                        .any(|element| element.ref_id == last.ref_id)
+                }) {
+                    // The original node is retired, but only a new model
+                    // decision can assess the changed page.
+                    last_click = None;
+                }
+                continue;
+            }
+        }
+
+        let mut covered_progress_for_done = false;
+        if matches!(decision.operation.as_str(), "DONE" | "BLOCKED") {
+            if let Some(last) = last_click.as_ref() {
+                let probe = match probe_click(run, &last.ref_id, last.identity.as_ref(), deadline) {
+                    Ok(probe) => probe,
+                    Err(GoalLoopError::Confirmation(pending)) => {
+                        return finish_confirmation(&page, &history, stale_total, pending)
+                    }
+                    Err(GoalLoopError::Denied(reason)) => {
+                        return finish(
+                            "denied",
+                            &page,
+                            &history,
+                            stale_total,
+                            Some(reason.unwrap_or_else(|| "Goal target observation denied".into())),
+                        )
+                    }
+                    Err(GoalLoopError::Timeout) => {
+                        return finish(
+                            "timeout",
+                            &page,
+                            &history,
+                            stale_total,
+                            Some(timeout_error(config.timeout_ms)),
+                        )
+                    }
+                    Err(GoalLoopError::Message(error)) => {
+                        return finish("error", &page, &history, stale_total, Some(error))
+                    }
+                };
+                if probe.status == TargetReadiness::Unavailable
+                    || (page.unavailable_click_ref.is_some()
+                        && probe.status == TargetReadiness::Ready)
+                    || (page.unavailable_click_ref.is_none()
+                        && probe.status != TargetReadiness::Ready)
+                {
+                    if stale_run >= MAX_STALE_DECISIONS {
+                        return finish(
+                            "blocked",
+                            &page,
+                            &history,
+                            stale_total,
+                            Some("Target readiness changed during repeated model decisions".into()),
+                        );
+                    }
+                    stale_run += 1;
+                    stale_total += 1;
+                    page = match observe(run, deadline) {
+                        Ok(next) => next,
+                        Err(GoalLoopError::Confirmation(pending)) => {
+                            return finish_confirmation(&page, &history, stale_total, pending)
+                        }
+                        Err(GoalLoopError::Denied(reason)) => {
+                            return finish(
+                                "denied",
+                                &page,
+                                &history,
+                                stale_total,
+                                Some(reason.unwrap_or_else(|| "Goal observation denied".into())),
+                            )
+                        }
+                        Err(GoalLoopError::Timeout) => {
+                            return finish(
+                                "timeout",
+                                &page,
+                                &history,
+                                stale_total,
+                                Some(timeout_error(config.timeout_ms)),
+                            )
+                        }
+                        Err(GoalLoopError::Message(error)) => {
+                            return finish("error", &page, &history, stale_total, Some(error))
+                        }
+                    };
+                    if let Some(last) = last_click.as_mut() {
+                        if probe.status == TargetReadiness::Unavailable
+                            && !page
+                                .elements
+                                .iter()
+                                .any(|element| element.ref_id == last.ref_id)
+                        {
+                            // Only a fresh page without the original ref
+                            // establishes retirement. A temporary box loss
+                            // leaves the same node and its click guard intact.
+                            last_click = None;
+                        } else {
+                            last.ready_observed = probe.status == TargetReadiness::Ready;
+                            if probe.status == TargetReadiness::Unavailable {
+                                page.unavailable_click_ref = Some(last.ref_id.clone());
+                                page.unavailable_reason = Some(
+                                    "Previous click target is not verified ready; choose another control or WAIT".into(),
+                                );
+                            }
+                        }
+                    }
+                    continue;
+                }
+                covered_progress_for_done = probe.status == TargetReadiness::Covered
+                    && probe.covering_interface
+                    && last.progressed
+                    && relevant_page_content(&page) != last.before_content;
+                if decision.operation == "DONE"
+                    && probe.status != TargetReadiness::Ready
+                    && !covered_progress_for_done
+                {
+                    return finish("blocked", &page, &history, stale_total, Some("The previous click target is not verified ready; completion was not verified".into()));
+                }
+            }
+        }
+
         match decision.operation.as_str() {
             "DONE" => {
+                if page.unavailable_click_ref.is_some() && !covered_progress_for_done {
+                    return finish(
+                        "blocked", &page, &history, stale_total,
+                        Some("The previous click target is still unavailable; completion was not verified".into()),
+                    );
+                }
                 let url = final_url(run, deadline);
                 let mut outcome = finish("done", &page, &history, stale_total, None);
                 if let Some(url) = url {
@@ -1894,6 +2549,19 @@ pub(crate) fn run_goal_loop(
             _ => {}
         }
 
+        // Let the model assess the final allowed action after its bounded
+        // settling. A genuine lack of progress blocks another action only
+        // after that assessment, never before the delayed click is observed.
+        if three_actions_without_progress(&history) {
+            return finish(
+                "blocked",
+                &page,
+                &history,
+                stale_total,
+                Some("Three consecutive actions did not change the page".into()),
+            );
+        }
+
         if history.len() as u64 >= config.max_steps {
             return finish(
                 "blocked",
@@ -1908,6 +2576,78 @@ pub(crate) fn run_goal_loop(
             .target
             .and_then(|i| page.elements.get(i - 1))
             .cloned();
+        let mut click_identity = None;
+        if decision.operation == "CLICK" {
+            let Some(selected) = target.as_ref() else {
+                return finish(
+                    "error",
+                    &page,
+                    &history,
+                    stale_total,
+                    Some("CLICK without a target".into()),
+                );
+            };
+            let expected = last_click
+                .as_ref()
+                .filter(|last| last.ref_id == selected.ref_id)
+                .and_then(|last| last.identity.as_ref());
+            let probe = match probe_click(run, &selected.ref_id, expected, deadline) {
+                Ok(probe) => probe,
+                Err(GoalLoopError::Confirmation(pending)) => {
+                    return finish_confirmation(&page, &history, stale_total, pending)
+                }
+                Err(GoalLoopError::Denied(reason)) => {
+                    return finish(
+                        "denied",
+                        &page,
+                        &history,
+                        stale_total,
+                        Some(reason.unwrap_or_else(|| "Goal target observation denied".into())),
+                    )
+                }
+                Err(GoalLoopError::Timeout) => {
+                    return finish(
+                        "timeout",
+                        &page,
+                        &history,
+                        stale_total,
+                        Some(timeout_error(config.timeout_ms)),
+                    )
+                }
+                Err(GoalLoopError::Message(error)) => {
+                    return finish("error", &page, &history, stale_total, Some(error))
+                }
+            };
+            if probe.identity.is_none()
+                || (same_target_click && probe.status != TargetReadiness::Ready)
+            {
+                if same_target_click {
+                    if let Some(last) = last_click.as_mut() {
+                        last.ready_observed = false;
+                        last.ready_samples = 0;
+                    }
+                }
+                if stale_run >= MAX_STALE_DECISIONS {
+                    return finish(
+                        "blocked",
+                        &page,
+                        &history,
+                        stale_total,
+                        Some("Clicked target remained unavailable".into()),
+                    );
+                }
+                stale_run += 1;
+                stale_total += 1;
+                page.unavailable_click_ref = Some(selected.ref_id.clone());
+                page.unavailable_reason = Some(format!(
+                    "Target is not actionable: {}",
+                    probe.detail.unwrap_or_else(|| "coverage unknown".into())
+                ));
+                continue;
+            } else {
+                click_identity = probe.identity;
+            }
+        }
         let mut text = None;
         let mut text_model = None;
         let mut text_ms = 0;
@@ -2014,7 +2754,11 @@ pub(crate) fn run_goal_loop(
             );
         }
         let started_execute = Instant::now();
-        let executed = run.run(&command, deadline);
+        let executed = if decision.operation == "CLICK" {
+            run.click_with_guard(&command, click_identity.as_ref(), deadline)
+        } else {
+            run.run(&command, deadline)
+        };
         let execute_ms = started_execute.elapsed().as_millis();
         let mut step = Step {
             step: history.len() + 1,
@@ -2039,7 +2783,25 @@ pub(crate) fn run_goal_loop(
             }
             Ok(resp) if resp.success => {
                 action_response = resp.data.map(command_result_data);
+                if decision.operation == "CLICK" {
+                    last_click = target.as_ref().map(|selected| LastClick {
+                        ref_id: selected.ref_id.clone(),
+                        identity: click_identity.clone(),
+                        before_fingerprint: page.fingerprint.clone(),
+                        before_content: relevant_page_content(&page),
+                        wait_until: Instant::now() + Duration::from_millis(CLICK_READY_WAIT_MS),
+                        ready_samples: 0,
+                        last_detail: None,
+                        cap_reported: false,
+                        retired: false,
+                        ready_observed: false,
+                        progressed: false,
+                    });
+                }
                 None
+            }
+            Ok(resp) if resp.code.as_deref() == Some("policy_denied") => {
+                return finish("denied", &page, &history, stale_total, resp.error);
             }
             Ok(resp) => Some(
                 resp.error
@@ -2054,6 +2816,9 @@ pub(crate) fn run_goal_loop(
                     Some("Action denied; the pending goal action was not executed".into()),
                 );
             }
+            Err(CommandRunError::PolicyDenied(reason)) => {
+                return finish("denied", &page, &history, stale_total, Some(reason));
+            }
             Err(CommandRunError::Timeout) => {
                 return finish(
                     "timeout",
@@ -2065,6 +2830,9 @@ pub(crate) fn run_goal_loop(
             }
             Err(CommandRunError::Uncertain(error)) => {
                 return finish("error", &page, &history, stale_total, Some(error));
+            }
+            Err(CommandRunError::Pending(pending)) => {
+                return finish_confirmation(&page, &history, stale_total, pending);
             }
             Err(CommandRunError::Failed(error)) => Some(error),
         };
@@ -2082,7 +2850,16 @@ pub(crate) fn run_goal_loop(
             );
         }
         if let Some(error) = failure {
-            if is_stale_error(&error) && stale_run < MAX_STALE_DECISIONS {
+            let guarded_target_unknown =
+                same_target_click && error.starts_with("Goal target unknown:");
+            if (is_stale_error(&error) || guarded_target_unknown) && stale_run < MAX_STALE_DECISIONS
+            {
+                if same_target_click {
+                    if let Some(last) = last_click.as_mut() {
+                        last.ready_observed = false;
+                        last.ready_samples = 0;
+                    }
+                }
                 // The target moved between snapshot and action. Nothing was
                 // executed, so observe again and let the model decide afresh.
                 stale_run += 1;
@@ -2092,13 +2869,15 @@ pub(crate) fn run_goal_loop(
                     Err(GoalLoopError::Confirmation(pending)) => {
                         return finish_confirmation(&page, &history, stale_total, pending);
                     }
-                    Err(GoalLoopError::Denied) => {
+                    Err(GoalLoopError::Denied(reason)) => {
                         return finish(
                             "denied",
                             &page,
                             &history,
                             stale_total,
-                            Some("Action denied; no pending goal action was executed".into()),
+                            Some(reason.unwrap_or_else(|| {
+                                "Action denied; no pending goal action was executed".into()
+                            })),
                         );
                     }
                     Err(GoalLoopError::Timeout) => {
@@ -2131,14 +2910,40 @@ pub(crate) fn run_goal_loop(
         }
         stale_run = 0;
 
-        let next = match settle_and_observe(run, &decision.operation, deadline) {
+        let settle_deadline = if decision.operation == "CLICK" {
+            last_click
+                .as_ref()
+                .map_or(deadline, |last| deadline.min(last.wait_until))
+        } else {
+            deadline
+        };
+        let next = match settle_and_observe(run, &decision.operation, settle_deadline) {
             Ok(p) => p,
+            Err(error)
+                if decision.operation == "CLICK"
+                    && settle_deadline < deadline
+                    && (matches!(error, GoalLoopError::Timeout)
+                        || (matches!(error, GoalLoopError::Message(_))
+                            && Instant::now() >= settle_deadline)) =>
+            {
+                // The click succeeded. A slow settling read can exhaust only
+                // its local allowance; retain the successful step and let the
+                // next decision see an unavailable target.
+                if let Some(last) = last_click.as_mut() {
+                    last.cap_reported = true;
+                }
+                page.clone().unresolved_after_click(
+                    &target
+                        .as_ref()
+                        .map_or(String::new(), |target| target.ref_id.clone()),
+                )
+            }
             Err(GoalLoopError::Confirmation(pending)) => {
                 history.push(step.clone());
                 on_step(&step);
                 return finish_confirmation(&page, &history, stale_total, pending);
             }
-            Err(GoalLoopError::Denied) => {
+            Err(GoalLoopError::Denied(reason)) => {
                 history.push(step.clone());
                 on_step(&step);
                 return finish(
@@ -2146,7 +2951,9 @@ pub(crate) fn run_goal_loop(
                     &page,
                     &history,
                     stale_total,
-                    Some("Action denied during observation; no later action was executed".into()),
+                    Some(reason.unwrap_or_else(|| {
+                        "Action denied during observation; no later action was executed".into()
+                    })),
                 );
             }
             Err(GoalLoopError::Timeout) => {
@@ -2182,22 +2989,15 @@ pub(crate) fn run_goal_loop(
             .unwrap_or(false);
         step.page_changed = Some(next.fingerprint != page.fingerprint || scroll_moved);
         step.url = next.url.clone();
-        on_step(&step);
         history.push(step);
+        if decision.operation == "CLICK" {
+            pending_click_step = Some(history.len() - 1);
+        } else {
+            on_step(history.last().expect("executed step was recorded"));
+        }
         page = next;
-
-        let stalled = history.len() >= 3
-            && history[history.len() - 3..]
-                .iter()
-                .all(|h| h.page_changed == Some(false) && h.operation != "WAIT");
-        if stalled {
-            return finish(
-                "blocked",
-                &page,
-                &history,
-                stale_total,
-                Some("Three consecutive actions did not change the page".into()),
-            );
+        if !matches!(decision.operation.as_str(), "CLICK" | "WAIT") {
+            last_click = None;
         }
     }
 }
@@ -2502,6 +3302,9 @@ mod tests {
             text,
             elements,
             fingerprint: "x".into(),
+            unavailable_click_ref: None,
+            unavailable_reason: None,
+            observation_unresolved: false,
         };
         let (state, questions, targets) = build_request("goal", &page, &[]);
         assert!(targets.is_empty());
@@ -2523,6 +3326,9 @@ mod tests {
             text,
             elements,
             fingerprint: "x".into(),
+            unavailable_click_ref: None,
+            unavailable_reason: None,
+            observation_unresolved: false,
         };
         let (_, questions, targets) = build_request("goal", &page, &[]);
         assert_eq!(targets["TYPE_TEXT"], vec![vec![2, 3, 4]]);
@@ -2549,6 +3355,9 @@ mod tests {
             text,
             elements,
             fingerprint: "x".into(),
+            unavailable_click_ref: None,
+            unavailable_reason: None,
+            observation_unresolved: false,
         };
         let (_, questions, targets) = build_request("goal", &page, &[]);
         let groups = &targets["CLICK"];
@@ -3718,6 +4527,1367 @@ mod tests {
     const FORM: &str = "- combobox \"Where from?\" [ref=e3]\n- button \"Search\" [ref=e4]\n";
     const RESULTS: &str = "- heading \"Results\" [ref=e1]\n- link \"ZRH to LHR\" [ref=e8]\n";
 
+    const MONTH_JUNE: &str = "- heading \"June\" [ref=e9]\n- button \"Previous\" [ref=e1]\n";
+    const MONTH_JUNE_BUSY: &str =
+        "- heading \"June\" [ref=e9]\n- button \"Previous\" [ref=e1]\n- generic \"\" [ref=e8]\n";
+    const MONTH_JUNE_TEXT_BUSY: &str =
+        "- heading \"June\" [ref=e9]\n- button \"Previous\" [ref=e1]\n- text \"Loading...\" [ref=e8]\n";
+    const MONTH_JUNE_CONSENT: &str = "- heading \"June\" [ref=e9]\n- button \"Previous\" [ref=e1]\n- button \"Dismiss dialog\" [ref=e2]\n- generic \"\" [ref=e8]\n";
+    const MONTH_MAY: &str = "- heading \"May\" [ref=e9]\n- button \"Previous\" [ref=e1]\n";
+    const MONTH_MAY_REPLACED: &str = "- heading \"May\" [ref=e9]\n- button \"Previous\" [ref=e3]\n";
+    const MONTH_APRIL: &str = "- heading \"April\" [ref=e9]\n- button \"Previous\" [ref=e1]\n";
+
+    struct LoadingRunner {
+        phase: std::rc::Rc<std::cell::Cell<usize>>,
+        probes: std::cell::Cell<usize>,
+        covered_probes: usize,
+        clicks: std::cell::Cell<usize>,
+        replacement: bool,
+        dialog: bool,
+        spinner_text: bool,
+    }
+
+    impl LoadingRunner {
+        fn new(covered_probes: usize, replacement: bool) -> Self {
+            Self {
+                phase: std::rc::Rc::new(std::cell::Cell::new(0)),
+                probes: std::cell::Cell::new(0),
+                covered_probes,
+                clicks: std::cell::Cell::new(0),
+                replacement,
+                dialog: false,
+                spinner_text: false,
+            }
+        }
+        fn response(data: Value) -> Result<Response, CommandRunError> {
+            Ok(Response {
+                success: true,
+                data: Some(data),
+                error: None,
+                code: None,
+                warning: None,
+            })
+        }
+    }
+
+    impl CommandRunner for LoadingRunner {
+        fn run(&self, words: &[String], _deadline: Instant) -> Result<Response, CommandRunError> {
+            match words[0].as_str() {
+                "snapshot" => Self::response(json!({"snapshot": match self.phase.get() {
+                    0 => MONTH_JUNE, 1 if self.dialog => MONTH_JUNE_CONSENT,
+                    1 if self.spinner_text => MONTH_JUNE_TEXT_BUSY,
+                    1 => MONTH_JUNE_BUSY,
+                    2 if self.replacement => MONTH_MAY_REPLACED,
+                    2 => MONTH_MAY,
+                    _ => MONTH_APRIL,
+                }})),
+                "get" if words[1] == "url" => {
+                    Self::response(json!({"url":"https://fixture.invalid/calendar"}))
+                }
+                "get" => Self::response(json!({"title":"Calendar"})),
+                "click" => {
+                    self.clicks.set(self.clicks.get() + 1);
+                    self.phase.set(if words[1] == "@e2" {
+                        2
+                    } else if self.clicks.get() == 1 {
+                        1
+                    } else {
+                        3
+                    });
+                    Self::response(json!({"clicked":true}))
+                }
+                "wait" => Self::response(json!({})),
+                _ => panic!("unexpected goal command: {words:?}"),
+            }
+        }
+        fn final_url(&self, _deadline: Instant) -> Result<Response, CommandRunError> {
+            Self::response(json!({"url":"https://fixture.invalid/calendar"}))
+        }
+        fn observe_command(
+            &self,
+            words: &[String],
+            deadline: Instant,
+        ) -> Result<Response, CommandRunError> {
+            self.run(words, deadline)
+        }
+        fn probe_target(
+            &self,
+            ref_id: &str,
+            expected: Option<&Value>,
+            _deadline: Instant,
+        ) -> Result<TargetProbe, CommandRunError> {
+            let count = self.probes.get() + 1;
+            self.probes.set(count);
+            if ref_id == "e2" && self.phase.get() >= 2 {
+                return Ok(TargetProbe {
+                    status: TargetReadiness::Unavailable,
+                    identity: None,
+                    detail: Some("Snapshot target is unavailable".into()),
+                    covering_interface: false,
+                });
+            }
+            let identity = json!({"node": if ref_id == "e2" { 22 } else if self.replacement && self.phase.get() >= 2 { 2 } else { 1 }});
+            if expected.is_some_and(|token| token != &identity) {
+                return Ok(TargetProbe {
+                    status: TargetReadiness::Unavailable,
+                    identity: Some(identity),
+                    detail: Some("Target context changed".into()),
+                    covering_interface: false,
+                });
+            }
+            if ref_id != "e2"
+                && self.phase.get() == 1
+                && count <= self.covered_probes.saturating_add(1)
+            {
+                return Ok(TargetProbe {
+                    status: TargetReadiness::Covered,
+                    identity: Some(identity),
+                    detail: Some("spinner".into()),
+                    covering_interface: self.dialog,
+                });
+            }
+            if self.phase.get() == 1 && !self.dialog {
+                self.phase.set(2);
+            }
+            Ok(TargetProbe {
+                status: TargetReadiness::Ready,
+                identity: Some(identity),
+                detail: None,
+                covering_interface: false,
+            })
+        }
+        fn click_with_guard(
+            &self,
+            words: &[String],
+            _identity: Option<&Value>,
+            deadline: Instant,
+        ) -> Result<Response, CommandRunError> {
+            self.run(words, deadline)
+        }
+    }
+
+    #[test]
+    fn click_waits_for_textless_spinner_and_jev_sees_new_month() {
+        let runner = LoadingRunner::new(3, false);
+        let oracle = FakeOracle::new(vec![("CLICK", Some("1")), ("DONE", None)]);
+        let mut emitted = Vec::new();
+        let outcome = run_goal_loop(&config("Go back one month"), &oracle, &runner, |step| {
+            emitted.push(step.to_json())
+        });
+        assert_eq!(outcome.status, "done");
+        assert_eq!(runner.clicks.get(), 1);
+        assert_eq!(outcome.steps, emitted);
+        assert_eq!(oracle.seen.borrow()[1]["page"]["text"], "May");
+        assert!(runner.probes.get() >= 4);
+    }
+
+    #[test]
+    fn text_bearing_spinner_does_not_advance_model_or_accept_premature_done() {
+        let mut runner = LoadingRunner::new(3, false);
+        runner.spinner_text = true;
+        let oracle = FakeOracle::new(vec![("CLICK", Some("1")), ("DONE", None)]);
+        let mut cfg = config("Go back one month");
+        cfg.max_steps = 1;
+        let outcome = run_goal_loop(&cfg, &oracle, &runner, |_| {});
+        assert_eq!(outcome.status, "done", "{:?}", outcome.error);
+        assert_eq!(runner.clicks.get(), 1);
+        assert_eq!(outcome.steps.len(), 1);
+        assert_eq!(oracle.seen.borrow().len(), 2);
+        assert!(oracle.seen.borrow()[1]["page"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("May"));
+    }
+
+    #[test]
+    fn completed_transition_between_observation_and_probe_keeps_ready_target() {
+        struct RaceRunner {
+            phase: std::cell::Cell<u8>,
+            probes: std::cell::Cell<usize>,
+        }
+        impl CommandRunner for RaceRunner {
+            fn run(&self, words: &[String], _: Instant) -> Result<Response, CommandRunError> {
+                match words[0].as_str() {
+                    "snapshot" => {
+                        if self.phase.get() == 1 {
+                            self.phase.set(2);
+                        }
+                        LoadingRunner::response(
+                            json!({"snapshot": if self.phase.get() == 0 { MONTH_JUNE } else { MONTH_MAY }}),
+                        )
+                    }
+                    "get" if words[1] == "url" => {
+                        LoadingRunner::response(json!({"url":"https://fixture.invalid/calendar"}))
+                    }
+                    "get" => LoadingRunner::response(json!({"title":"Calendar"})),
+                    _ => panic!("unexpected command: {words:?}"),
+                }
+            }
+            fn final_url(&self, deadline: Instant) -> Result<Response, CommandRunError> {
+                self.run(&words(&["get", "url"]), deadline)
+            }
+            fn observe_command(
+                &self,
+                words: &[String],
+                deadline: Instant,
+            ) -> Result<Response, CommandRunError> {
+                self.run(words, deadline)
+            }
+            fn probe_target(
+                &self,
+                _: &str,
+                _: Option<&Value>,
+                _: Instant,
+            ) -> Result<TargetProbe, CommandRunError> {
+                self.probes.set(self.probes.get() + 1);
+                Ok(TargetProbe {
+                    status: if self.phase.get() == 1 {
+                        TargetReadiness::Covered
+                    } else {
+                        TargetReadiness::Ready
+                    },
+                    identity: Some(json!({"node":1})),
+                    detail: Some("dialog backdrop".into()),
+                    covering_interface: self.phase.get() == 1,
+                })
+            }
+            fn click_with_guard(
+                &self,
+                _: &[String],
+                _: Option<&Value>,
+                _: Instant,
+            ) -> Result<Response, CommandRunError> {
+                panic!("the readiness race must not dispatch input")
+            }
+        }
+        let runner = RaceRunner {
+            phase: std::cell::Cell::new(0),
+            probes: std::cell::Cell::new(0),
+        };
+        let global = Instant::now() + Duration::from_secs(1);
+        let previous = observe(&runner, global).unwrap();
+        runner.phase.set(1);
+        let mut last = LastClick {
+            ref_id: "e1".into(),
+            identity: Some(json!({"node":1})),
+            before_fingerprint: previous.fingerprint.clone(),
+            before_content: relevant_page_content(&previous),
+            wait_until: Instant::now() + Duration::from_millis(400),
+            ready_samples: 0,
+            last_detail: None,
+            cap_reported: false,
+            retired: false,
+            ready_observed: false,
+            progressed: false,
+        };
+        let page = refresh_after_click(&runner, &mut last, &previous, global).unwrap();
+        assert_eq!(runner.probes.get(), 2);
+        assert!(last.ready_observed);
+        assert!(page.unavailable_click_ref.is_none());
+        assert!(page.text.contains("May"));
+    }
+
+    #[test]
+    fn replaced_node_after_observation_requires_new_snapshot_before_retirement() {
+        struct ReplacementRace {
+            snapshots: std::cell::Cell<usize>,
+        }
+        impl CommandRunner for ReplacementRace {
+            fn run(&self, words: &[String], _: Instant) -> Result<Response, CommandRunError> {
+                match words[0].as_str() {
+                    "snapshot" => {
+                        let count = self.snapshots.get() + 1;
+                        self.snapshots.set(count);
+                        LoadingRunner::response(json!({"snapshot": if count < 3 {
+                            MONTH_JUNE
+                        } else {
+                            MONTH_MAY_REPLACED
+                        }}))
+                    }
+                    "get" if words[1] == "url" => {
+                        LoadingRunner::response(json!({"url":"https://fixture.invalid/calendar"}))
+                    }
+                    "get" => LoadingRunner::response(json!({"title":"Calendar"})),
+                    _ => panic!("unexpected command: {words:?}"),
+                }
+            }
+            fn final_url(&self, deadline: Instant) -> Result<Response, CommandRunError> {
+                self.run(&words(&["get", "url"]), deadline)
+            }
+            fn observe_command(
+                &self,
+                words: &[String],
+                deadline: Instant,
+            ) -> Result<Response, CommandRunError> {
+                self.run(words, deadline)
+            }
+            fn probe_target(
+                &self,
+                _: &str,
+                _: Option<&Value>,
+                _: Instant,
+            ) -> Result<TargetProbe, CommandRunError> {
+                Ok(TargetProbe {
+                    status: TargetReadiness::Unavailable,
+                    identity: None,
+                    detail: Some("Original node replaced".into()),
+                    covering_interface: false,
+                })
+            }
+            fn click_with_guard(
+                &self,
+                _: &[String],
+                _: Option<&Value>,
+                _: Instant,
+            ) -> Result<Response, CommandRunError> {
+                panic!("replacement must be reobserved without dispatching input")
+            }
+        }
+        let runner = ReplacementRace {
+            snapshots: std::cell::Cell::new(0),
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let previous = observe(&runner, deadline).unwrap();
+        let mut last = LastClick {
+            ref_id: "e1".into(),
+            identity: Some(json!({"node":1})),
+            before_fingerprint: previous.fingerprint.clone(),
+            before_content: relevant_page_content(&previous),
+            wait_until: Instant::now() + Duration::from_millis(400),
+            ready_samples: 0,
+            last_detail: None,
+            cap_reported: false,
+            retired: false,
+            ready_observed: false,
+            progressed: false,
+        };
+        let page = refresh_after_click(&runner, &mut last, &previous, deadline).unwrap();
+        assert_eq!(runner.snapshots.get(), 3);
+        assert!(last.retired);
+        assert!(page.text.contains("May"));
+        assert!(page.elements.iter().any(|element| element.ref_id == "e3"));
+        assert!(!page.elements.iter().any(|element| element.ref_id == "e1"));
+        assert!(page.unavailable_click_ref.is_none());
+    }
+
+    #[test]
+    fn same_ref_without_box_keeps_guard_until_ready_despite_changed_fingerprint() {
+        struct BoxlessTarget {
+            probes: std::cell::Cell<usize>,
+        }
+        impl CommandRunner for BoxlessTarget {
+            fn run(&self, words: &[String], _: Instant) -> Result<Response, CommandRunError> {
+                match words[0].as_str() {
+                    "snapshot" => LoadingRunner::response(json!({"snapshot":
+                        if self.probes.get() < 2 { MONTH_JUNE_TEXT_BUSY } else { MONTH_MAY }
+                    })),
+                    "get" if words[1] == "url" => {
+                        LoadingRunner::response(json!({"url":"https://fixture.invalid/calendar"}))
+                    }
+                    "get" => LoadingRunner::response(json!({"title":"Calendar"})),
+                    _ => panic!("unexpected command: {words:?}"),
+                }
+            }
+            fn final_url(&self, deadline: Instant) -> Result<Response, CommandRunError> {
+                self.run(&words(&["get", "url"]), deadline)
+            }
+            fn observe_command(
+                &self,
+                words: &[String],
+                deadline: Instant,
+            ) -> Result<Response, CommandRunError> {
+                self.run(words, deadline)
+            }
+            fn probe_target(
+                &self,
+                _: &str,
+                _: Option<&Value>,
+                _: Instant,
+            ) -> Result<TargetProbe, CommandRunError> {
+                let count = self.probes.get() + 1;
+                self.probes.set(count);
+                Ok(TargetProbe {
+                    status: if count <= 2 {
+                        TargetReadiness::Unavailable
+                    } else {
+                        TargetReadiness::Ready
+                    },
+                    identity: Some(json!({"node":1})),
+                    detail: Some("Target node is unavailable".into()),
+                    covering_interface: false,
+                })
+            }
+            fn click_with_guard(
+                &self,
+                _: &[String],
+                _: Option<&Value>,
+                _: Instant,
+            ) -> Result<Response, CommandRunError> {
+                panic!("polling must not dispatch input")
+            }
+        }
+        let runner = BoxlessTarget {
+            probes: std::cell::Cell::new(0),
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let previous = Page {
+            fingerprint: fingerprint("https://fixture.invalid/calendar", MONTH_JUNE),
+            url: "https://fixture.invalid/calendar".into(),
+            title: "Calendar".into(),
+            text: "June".into(),
+            elements: parse_snapshot(MONTH_JUNE).0,
+            unavailable_click_ref: None,
+            unavailable_reason: None,
+            observation_unresolved: false,
+        };
+        let original_cap = Instant::now() + Duration::from_millis(500);
+        let mut last = LastClick {
+            ref_id: "e1".into(),
+            identity: Some(json!({"node":1})),
+            before_fingerprint: previous.fingerprint.clone(),
+            before_content: relevant_page_content(&previous),
+            wait_until: original_cap,
+            ready_samples: 0,
+            last_detail: None,
+            cap_reported: false,
+            retired: false,
+            ready_observed: false,
+            progressed: false,
+        };
+        let page = refresh_after_click(&runner, &mut last, &previous, deadline).unwrap();
+        assert!(runner.probes.get() >= 4);
+        assert_eq!(page.text, "May");
+        assert!(page.unavailable_click_ref.is_none());
+        assert!(last.ready_observed && !last.retired);
+        assert_eq!(last.wait_until, original_cap);
+    }
+
+    #[test]
+    fn failed_mandatory_reobservation_withholds_old_indices_until_wait_recovery() {
+        struct ReplacementReadFault {
+            snapshots: std::cell::Cell<usize>,
+            fault: &'static str,
+            read_deadline: std::cell::Cell<Option<Instant>>,
+        }
+        impl CommandRunner for ReplacementReadFault {
+            fn run(
+                &self,
+                words: &[String],
+                deadline: Instant,
+            ) -> Result<Response, CommandRunError> {
+                match words[0].as_str() {
+                    "snapshot" => {
+                        let count = self.snapshots.get() + 1;
+                        self.snapshots.set(count);
+                        if count == 3 {
+                            self.read_deadline.set(Some(deadline));
+                            return match self.fault {
+                                "timeout" => Err(CommandRunError::Timeout),
+                                "message" => Err(CommandRunError::Failed("read failed".into())),
+                                "late" => {
+                                    std::thread::sleep(Duration::from_millis(100));
+                                    LoadingRunner::response(json!({"snapshot": MONTH_MAY_REPLACED}))
+                                }
+                                "late_global" => {
+                                    std::thread::sleep(Duration::from_millis(300));
+                                    LoadingRunner::response(json!({"snapshot": MONTH_MAY_REPLACED}))
+                                }
+                                _ => unreachable!(),
+                            };
+                        }
+                        LoadingRunner::response(
+                            json!({"snapshot": if count < 3 { MONTH_JUNE } else { MONTH_MAY_REPLACED }}),
+                        )
+                    }
+                    "get" if words[1] == "url" => {
+                        LoadingRunner::response(json!({"url":"https://fixture.invalid/calendar"}))
+                    }
+                    "get" => LoadingRunner::response(json!({"title":"Calendar"})),
+                    "wait" => LoadingRunner::response(json!({"waited":true})),
+                    _ => panic!("unexpected command: {words:?}"),
+                }
+            }
+            fn final_url(&self, deadline: Instant) -> Result<Response, CommandRunError> {
+                self.run(&words(&["get", "url"]), deadline)
+            }
+            fn observe_command(
+                &self,
+                words: &[String],
+                deadline: Instant,
+            ) -> Result<Response, CommandRunError> {
+                self.run(words, deadline)
+            }
+            fn probe_target(
+                &self,
+                _: &str,
+                _: Option<&Value>,
+                _: Instant,
+            ) -> Result<TargetProbe, CommandRunError> {
+                Ok(TargetProbe {
+                    status: TargetReadiness::Unavailable,
+                    identity: None,
+                    detail: Some("node replaced".into()),
+                    covering_interface: false,
+                })
+            }
+            fn click_with_guard(
+                &self,
+                _: &[String],
+                _: Option<&Value>,
+                _: Instant,
+            ) -> Result<Response, CommandRunError> {
+                panic!("stale element must never dispatch")
+            }
+        }
+        for fault in ["timeout", "message", "late"] {
+            let runner = ReplacementReadFault {
+                snapshots: std::cell::Cell::new(0),
+                fault,
+                read_deadline: std::cell::Cell::new(None),
+            };
+            let global = Instant::now() + Duration::from_secs(2);
+            let previous = observe(&runner, global).unwrap();
+            let cap = Instant::now() + Duration::from_millis(80);
+            let mut last = LastClick {
+                ref_id: "e1".into(),
+                identity: Some(json!({"node":1})),
+                before_fingerprint: previous.fingerprint.clone(),
+                before_content: relevant_page_content(&previous),
+                wait_until: cap,
+                ready_samples: 0,
+                last_detail: None,
+                cap_reported: false,
+                retired: false,
+                ready_observed: false,
+                progressed: false,
+            };
+            let page = refresh_after_click(&runner, &mut last, &previous, global).unwrap();
+            assert_eq!(runner.snapshots.get(), 3, "{fault}");
+            assert!(runner.read_deadline.get().unwrap() <= cap, "{fault}");
+            assert!(last.cap_reported && !last.retired, "{fault}");
+            assert!(page.observation_unresolved, "{fault}");
+            assert!(page.elements.is_empty(), "{fault}");
+            assert!(!page.text.contains("June"), "{fault}");
+            let (_, questions, _) = build_request("Go back", &page, &[]);
+            assert!(
+                questions["operation"]["criteria"].get("CLICK").is_none(),
+                "{fault}"
+            );
+            assert!(
+                runner
+                    .run(&words(&["wait", "400"]), global)
+                    .unwrap()
+                    .success
+            );
+            let recovered = observe(&runner, global).unwrap();
+            assert!(!recovered.observation_unresolved, "{fault}");
+            assert!(recovered.text.contains("May"), "{fault}");
+            assert!(
+                recovered
+                    .elements
+                    .iter()
+                    .any(|element| element.ref_id == "e3"),
+                "{fault}"
+            );
+        }
+        let runner = ReplacementReadFault {
+            snapshots: std::cell::Cell::new(0),
+            fault: "late_global",
+            read_deadline: std::cell::Cell::new(None),
+        };
+        let previous = observe(&runner, Instant::now() + Duration::from_secs(1)).unwrap();
+        let global = Instant::now() + Duration::from_millis(200);
+        let mut last = LastClick {
+            ref_id: "e1".into(),
+            identity: Some(json!({"node":1})),
+            before_fingerprint: previous.fingerprint.clone(),
+            before_content: relevant_page_content(&previous),
+            wait_until: Instant::now() + Duration::from_millis(180),
+            ready_samples: 0,
+            last_detail: None,
+            cap_reported: false,
+            retired: false,
+            ready_observed: false,
+            progressed: false,
+        };
+        assert!(matches!(
+            refresh_after_click(&runner, &mut last, &previous, global),
+            Err(GoalLoopError::Timeout)
+        ));
+    }
+
+    #[test]
+    fn native_policy_denial_during_reobservation_stops_without_another_decision() {
+        struct DeniedRead {
+            snapshots: std::cell::Cell<usize>,
+            clicks: std::cell::Cell<usize>,
+        }
+        impl CommandRunner for DeniedRead {
+            fn run(&self, words: &[String], _: Instant) -> Result<Response, CommandRunError> {
+                match words[0].as_str() {
+                    "snapshot" => {
+                        let n = self.snapshots.get() + 1;
+                        self.snapshots.set(n);
+                        if n == 3 {
+                            return Ok(Response {
+                                success: false,
+                                error: Some(
+                                    "Action 'snapshot' denied by policy: fixture rule".into(),
+                                ),
+                                code: Some("policy_denied".into()),
+                                ..Response::default()
+                            });
+                        }
+                        LoadingRunner::response(json!({"snapshot": MONTH_JUNE}))
+                    }
+                    "get" if words[1] == "url" => {
+                        LoadingRunner::response(json!({"url":"https://fixture.invalid/calendar"}))
+                    }
+                    "get" => LoadingRunner::response(json!({"title":"Calendar"})),
+                    _ => panic!("unexpected command: {words:?}"),
+                }
+            }
+            fn final_url(&self, deadline: Instant) -> Result<Response, CommandRunError> {
+                self.run(&words(&["get", "url"]), deadline)
+            }
+            fn observe_command(
+                &self,
+                words: &[String],
+                deadline: Instant,
+            ) -> Result<Response, CommandRunError> {
+                self.run(words, deadline)
+            }
+            fn probe_target(
+                &self,
+                _: &str,
+                _: Option<&Value>,
+                _: Instant,
+            ) -> Result<TargetProbe, CommandRunError> {
+                Ok(TargetProbe {
+                    status: if self.clicks.get() == 0 {
+                        TargetReadiness::Ready
+                    } else {
+                        TargetReadiness::Unavailable
+                    },
+                    identity: Some(json!({"node": 1})),
+                    detail: None,
+                    covering_interface: false,
+                })
+            }
+            fn click_with_guard(
+                &self,
+                _: &[String],
+                _: Option<&Value>,
+                _: Instant,
+            ) -> Result<Response, CommandRunError> {
+                self.clicks.set(self.clicks.get() + 1);
+                LoadingRunner::response(json!({"clicked":true}))
+            }
+        }
+        let runner = DeniedRead {
+            snapshots: std::cell::Cell::new(0),
+            clicks: std::cell::Cell::new(0),
+        };
+        let oracle = FakeOracle::new(vec![("CLICK", Some("1"))]);
+        let outcome = run_goal_loop(&config("Click Previous once"), &oracle, &runner, |_| {});
+        assert_eq!(outcome.status, "denied");
+        assert!(outcome.error.unwrap().contains("fixture rule"));
+        assert_eq!(runner.clicks.get(), 1);
+        assert_eq!(runner.snapshots.get(), 3);
+        assert_eq!(oracle.seen.borrow().len(), 1);
+        assert_eq!(outcome.steps.len(), 1);
+    }
+
+    #[test]
+    fn wait_recovers_replaced_ref_inside_post_cap_read_band() {
+        struct BandRead {
+            phase: std::cell::Cell<usize>,
+            after_wait_reads: std::cell::Cell<usize>,
+            clicks: std::cell::Cell<usize>,
+        }
+        impl CommandRunner for BandRead {
+            fn run(&self, words: &[String], _: Instant) -> Result<Response, CommandRunError> {
+                match words[0].as_str() {
+                    "snapshot" => {
+                        if self.phase.get() == 2 {
+                            self.after_wait_reads.set(self.after_wait_reads.get() + 1);
+                            std::thread::sleep(Duration::from_millis(300));
+                        }
+                        LoadingRunner::response(json!({"snapshot": match self.phase.get() {
+                            0 => MONTH_JUNE, 1 => MONTH_JUNE_BUSY, _ => MONTH_MAY_REPLACED,
+                        }}))
+                    }
+                    "get" if words[1] == "url" => {
+                        LoadingRunner::response(json!({"url":"https://fixture.invalid/calendar"}))
+                    }
+                    "get" => LoadingRunner::response(json!({"title":"Calendar"})),
+                    "wait" => {
+                        self.phase.set(2);
+                        LoadingRunner::response(json!({}))
+                    }
+                    _ => panic!("unexpected command: {words:?}"),
+                }
+            }
+            fn final_url(&self, deadline: Instant) -> Result<Response, CommandRunError> {
+                self.run(&words(&["get", "url"]), deadline)
+            }
+            fn observe_command(
+                &self,
+                words: &[String],
+                deadline: Instant,
+            ) -> Result<Response, CommandRunError> {
+                self.run(words, deadline)
+            }
+            fn probe_target(
+                &self,
+                _: &str,
+                _: Option<&Value>,
+                _: Instant,
+            ) -> Result<TargetProbe, CommandRunError> {
+                Ok(TargetProbe {
+                    status: match self.phase.get() {
+                        0 => TargetReadiness::Ready,
+                        1 => TargetReadiness::Covered,
+                        _ => TargetReadiness::Unavailable,
+                    },
+                    identity: Some(json!({"node": 1})),
+                    detail: None,
+                    covering_interface: false,
+                })
+            }
+            fn click_with_guard(
+                &self,
+                _: &[String],
+                _: Option<&Value>,
+                _: Instant,
+            ) -> Result<Response, CommandRunError> {
+                self.clicks.set(self.clicks.get() + 1);
+                self.phase.set(1);
+                LoadingRunner::response(json!({"clicked":true}))
+            }
+        }
+        let runner = BandRead {
+            phase: std::cell::Cell::new(0),
+            after_wait_reads: std::cell::Cell::new(0),
+            clicks: std::cell::Cell::new(0),
+        };
+        let oracle = FakeOracle::new(vec![("CLICK", Some("1")), ("WAIT", None), ("DONE", None)]);
+        let mut goal = config("Click Previous once, then wait for May");
+        goal.max_steps = 2;
+        goal.timeout_ms = 6000;
+        let outcome = run_goal_loop(&goal, &oracle, &runner, |_| {});
+        assert_eq!(outcome.status, "done", "{:?}", outcome.error);
+        assert_eq!(runner.clicks.get(), 1);
+        assert_eq!(runner.after_wait_reads.get(), 2);
+        assert_eq!(oracle.seen.borrow()[2]["page"]["text"], "May");
+        assert_eq!(outcome.steps.len(), 2);
+    }
+
+    #[test]
+    fn two_month_goal_can_click_same_or_replaced_node() {
+        for replacement in [false, true] {
+            let runner = LoadingRunner::new(2, replacement);
+            let oracle = FakeOracle::new(vec![
+                ("CLICK", Some("1")),
+                ("CLICK", Some("1")),
+                ("DONE", None),
+            ]);
+            let outcome = run_goal_loop(&config("Go back two months"), &oracle, &runner, |_| {});
+            assert_eq!(
+                outcome.status, "done",
+                "replacement={replacement}: {:?}",
+                outcome.error
+            );
+            assert_eq!(runner.clicks.get(), 2, "replacement={replacement}");
+            assert_eq!(oracle.seen.borrow()[1]["page"]["text"], "May");
+            assert_eq!(oracle.seen.borrow()[2]["page"]["text"], "April");
+        }
+    }
+
+    #[test]
+    fn progress_during_model_evaluation_credits_click_once_without_hiding_real_stalls() {
+        struct DelayedMonth {
+            visible: std::rc::Rc<std::cell::Cell<usize>>,
+            clicks: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+        impl CommandRunner for DelayedMonth {
+            fn run(&self, words: &[String], _: Instant) -> Result<Response, CommandRunError> {
+                match words[0].as_str() {
+                    "snapshot" => {
+                        let month = ["June", "May", "April", "March", "February"]
+                            [self.visible.get().min(4)];
+                        LoadingRunner::response(json!({"snapshot":format!(
+                            "- heading \"{month}\" [ref=e9]\n- button \"Previous\" [ref=e1]\n"
+                        )}))
+                    }
+                    "get" if words[1] == "url" => {
+                        LoadingRunner::response(json!({"url":"https://fixture.invalid/calendar"}))
+                    }
+                    "get" => LoadingRunner::response(json!({"title":"Calendar"})),
+                    "click" => {
+                        self.clicks.set(self.clicks.get() + 1);
+                        LoadingRunner::response(json!({"clicked":true}))
+                    }
+                    _ => panic!("unexpected command: {words:?}"),
+                }
+            }
+            fn final_url(&self, deadline: Instant) -> Result<Response, CommandRunError> {
+                self.run(&words(&["get", "url"]), deadline)
+            }
+            fn observe_command(
+                &self,
+                words: &[String],
+                deadline: Instant,
+            ) -> Result<Response, CommandRunError> {
+                self.run(words, deadline)
+            }
+            fn probe_target(
+                &self,
+                _: &str,
+                _: Option<&Value>,
+                _: Instant,
+            ) -> Result<TargetProbe, CommandRunError> {
+                Ok(TargetProbe {
+                    status: TargetReadiness::Ready,
+                    identity: Some(json!({"node":1})),
+                    detail: None,
+                    covering_interface: false,
+                })
+            }
+            fn click_with_guard(
+                &self,
+                words: &[String],
+                _: Option<&Value>,
+                deadline: Instant,
+            ) -> Result<Response, CommandRunError> {
+                self.run(words, deadline)
+            }
+        }
+
+        for progresses_during_model in [true, false] {
+            let visible = std::rc::Rc::new(std::cell::Cell::new(0));
+            let clicks = std::rc::Rc::new(std::cell::Cell::new(0));
+            let runner = DelayedMonth {
+                visible: visible.clone(),
+                clicks: clicks.clone(),
+            };
+            let answers = if progresses_during_model {
+                vec![
+                    ("CLICK", Some("1")),
+                    ("CLICK", Some("1")),
+                    ("CLICK", Some("1")),
+                    ("CLICK", Some("1")),
+                    ("CLICK", Some("1")),
+                    ("CLICK", Some("1")),
+                    ("CLICK", Some("1")),
+                    ("DONE", None),
+                    ("DONE", None),
+                ]
+            } else {
+                vec![("CLICK", Some("1")); 4]
+            };
+            let mut oracle = FakeOracle::new(answers);
+            oracle.on_evaluate = Some(Box::new(move |_| {
+                if progresses_during_model && clicks.get() > visible.get() {
+                    visible.set(clicks.get());
+                }
+            }));
+            let mut cfg = config("Go back four months to February");
+            cfg.max_steps = 4;
+            let mut emitted = Vec::new();
+            let outcome = run_goal_loop(&cfg, &oracle, &runner, |step| {
+                emitted.push(step.to_json());
+            });
+            let expected = if progresses_during_model { 4 } else { 3 };
+            assert_eq!(runner.clicks.get(), expected);
+            assert_eq!(outcome.steps.len(), expected);
+            assert_eq!(emitted.len(), expected, "each click is emitted once");
+            assert!(emitted.iter().all(|step| step["pageChanged"] == false));
+            assert!(outcome.steps.iter().all(|step| {
+                step["operation"] == "CLICK"
+                    && step["target"]["name"] == "Previous"
+                    && step["pageChanged"] == progresses_during_model
+            }));
+            if progresses_during_model {
+                assert_eq!(outcome.status, "done", "{:?}", outcome.error);
+                assert_eq!(outcome.stale_decisions, 4);
+                assert!(oracle.seen.borrow().last().unwrap()["page"]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("February"));
+                assert!(oracle
+                    .seen
+                    .borrow()
+                    .iter()
+                    .any(|state| { state["recent_actions"][0]["page_changed"] == true }));
+            } else {
+                assert_eq!(outcome.status, "blocked");
+                assert!(outcome.error.unwrap().contains("Three consecutive actions"));
+                assert_eq!(outcome.stale_decisions, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn unchanged_and_retired_production_refs_allow_fresh_goal_decisions() {
+        struct RefRunner {
+            mode: &'static str,
+            phase: std::cell::Cell<usize>,
+            clicks: std::cell::Cell<usize>,
+        }
+        impl CommandRunner for RefRunner {
+            fn run(&self, words: &[String], _: Instant) -> Result<Response, CommandRunError> {
+                match words[0].as_str() {
+                    "snapshot" => {
+                        let snapshot = match (self.mode, self.phase.get()) {
+                            (_, 0) | ("unchanged", _) => MONTH_JUNE,
+                            ("removed", _) => "- heading \"May\" [ref=e9]\n",
+                            ("navigation", _) => "- heading \"Welcome\" [ref=e9]\n",
+                            (_, 1) => {
+                                "- heading \"May\" [ref=e9]\n- button \"Previous\" [ref=e5]\n"
+                            }
+                            _ => "- heading \"April\" [ref=e9]\n- button \"Previous\" [ref=e6]\n",
+                        };
+                        LoadingRunner::response(json!({"snapshot":snapshot}))
+                    }
+                    "get" if words[1] == "url" => LoadingRunner::response(json!({"url":
+                        if self.mode == "navigation" && self.phase.get() > 0 { "https://fixture.invalid/welcome" } else { "https://fixture.invalid/calendar" }
+                    })),
+                    "get" => LoadingRunner::response(json!({"title":"Fixture"})),
+                    "click" => {
+                        self.clicks.set(self.clicks.get() + 1);
+                        self.phase.set(self.phase.get() + 1);
+                        LoadingRunner::response(json!({"clicked":true}))
+                    }
+                    _ => panic!("unexpected command: {words:?}"),
+                }
+            }
+            fn final_url(&self, deadline: Instant) -> Result<Response, CommandRunError> {
+                self.run(&words(&["get", "url"]), deadline)
+            }
+            fn observe_command(
+                &self,
+                words: &[String],
+                deadline: Instant,
+            ) -> Result<Response, CommandRunError> {
+                self.run(words, deadline)
+            }
+            fn probe_target(
+                &self,
+                ref_id: &str,
+                expected: Option<&Value>,
+                _: Instant,
+            ) -> Result<TargetProbe, CommandRunError> {
+                let current = if self.mode == "unchanged" || self.phase.get() == 0 {
+                    "e1"
+                } else if self.phase.get() == 1 {
+                    "e5"
+                } else {
+                    "e6"
+                };
+                let identity = json!({"node":current});
+                let status = if ref_id == current && expected.is_none_or(|token| token == &identity)
+                {
+                    TargetReadiness::Ready
+                } else {
+                    TargetReadiness::Unavailable
+                };
+                Ok(TargetProbe {
+                    status,
+                    identity: Some(identity),
+                    detail: Some("Snapshot target is unavailable".into()),
+                    covering_interface: false,
+                })
+            }
+            fn click_with_guard(
+                &self,
+                words: &[String],
+                _: Option<&Value>,
+                deadline: Instant,
+            ) -> Result<Response, CommandRunError> {
+                self.run(words, deadline)
+            }
+        }
+        for (mode, operations, expected_clicks) in [
+            (
+                "unchanged",
+                vec![("CLICK", Some("1")), ("CLICK", Some("1")), ("DONE", None)],
+                2,
+            ),
+            ("removed", vec![("CLICK", Some("1")), ("DONE", None)], 1),
+            (
+                "replacement",
+                vec![("CLICK", Some("1")), ("CLICK", Some("1")), ("DONE", None)],
+                2,
+            ),
+            ("navigation", vec![("CLICK", Some("1")), ("DONE", None)], 1),
+        ] {
+            let runner = RefRunner {
+                mode,
+                phase: std::cell::Cell::new(0),
+                clicks: std::cell::Cell::new(0),
+            };
+            let oracle = FakeOracle::new(operations);
+            let outcome = run_goal_loop(&config("Finish the fixture"), &oracle, &runner, |_| {});
+            assert_eq!(outcome.status, "done", "{mode}: {:?}", outcome.error);
+            assert_eq!(runner.clicks.get(), expected_clicks, "{mode}");
+            assert_eq!(outcome.stale_decisions, 0, "{mode}");
+        }
+    }
+
+    #[test]
+    fn unrelated_live_region_does_not_stale_a_nonrepeat_action() {
+        let daemon = FakeDaemon::new(vec![FORM, RESULTS]);
+        let changes = std::cell::Cell::new(0usize);
+        let runner = |words: &[String], deadline: Instant| {
+            let mut response = daemon.runner()(words, deadline)?;
+            if words[0] == "snapshot" && daemon.served.get() > 0 {
+                changes.set(changes.get() + 1);
+                response.data = Some(json!({
+                    "snapshot": format!("{}- text Live {}\n", RESULTS, changes.get())
+                }));
+            }
+            Ok(response)
+        };
+        let oracle = FakeOracle::new(vec![
+            ("CLICK", Some("2")),
+            ("SCROLL_DOWN", None),
+            ("DONE", None),
+        ]);
+        let outcome = run_goal_loop(&config("Scroll after search"), &oracle, &runner, |_| {});
+        assert_eq!(outcome.status, "done", "{:?}", outcome.error);
+        assert_eq!(outcome.stale_decisions, 0);
+        assert_eq!(
+            *daemon.commands.borrow(),
+            vec!["click @e4", "scroll down 560"]
+        );
+    }
+
+    #[test]
+    fn month_change_during_model_call_discards_old_click_decision() {
+        let runner = LoadingRunner::new(0, false);
+        let phase = runner.phase.clone();
+        let mut oracle = FakeOracle::new(vec![
+            ("CLICK", Some("1")),
+            ("CLICK", Some("1")),
+            ("DONE", None),
+        ]);
+        let evaluated = std::cell::Cell::new(0);
+        oracle.on_evaluate = Some(Box::new(move |state| {
+            if state["recent_actions"]
+                .as_array()
+                .is_some_and(|actions| !actions.is_empty())
+            {
+                let count = evaluated.get() + 1;
+                evaluated.set(count);
+                if count == 1 {
+                    assert!(state["page"]["text"].as_str().unwrap().contains("May"));
+                    phase.set(3);
+                } else {
+                    assert!(state["page"]["text"].as_str().unwrap().contains("April"));
+                }
+            }
+        }));
+        let outcome = run_goal_loop(&config("Go back"), &oracle, &runner, |_| {});
+        assert_eq!(outcome.status, "done");
+        assert_eq!(runner.clicks.get(), 1);
+        assert_eq!(outcome.stale_decisions, 1);
+    }
+
+    #[test]
+    fn ready_click_terminal_decision_reobserves_change_during_model_call() {
+        let runner = LoadingRunner::new(0, false);
+        let phase = runner.phase.clone();
+        let mut oracle =
+            FakeOracle::new(vec![("CLICK", Some("1")), ("DONE", None), ("DONE", None)]);
+        let evaluated = std::cell::Cell::new(0);
+        oracle.on_evaluate = Some(Box::new(move |state| {
+            if state["recent_actions"]
+                .as_array()
+                .is_some_and(|actions| !actions.is_empty())
+            {
+                let count = evaluated.get() + 1;
+                evaluated.set(count);
+                if count == 1 {
+                    assert!(state["page"]["text"].as_str().unwrap().contains("May"));
+                    phase.set(3);
+                } else {
+                    assert!(state["page"]["text"].as_str().unwrap().contains("April"));
+                }
+            }
+        }));
+        let outcome = run_goal_loop(&config("Go back"), &oracle, &runner, |_| {});
+        assert_eq!(outcome.status, "done", "{:?}", outcome.error);
+        assert_eq!(runner.clicks.get(), 1);
+        assert_eq!(outcome.stale_decisions, 1);
+    }
+
+    #[test]
+    fn persistent_overlay_withholds_previous_but_allows_dialog_dismiss() {
+        let mut runner = LoadingRunner::new(usize::MAX, false);
+        runner.dialog = true;
+        let oracle = FakeOracle::new(vec![
+            ("CLICK", Some("1")),
+            ("CLICK", Some("2")),
+            ("DONE", None),
+        ]);
+        let outcome = run_goal_loop(
+            &config("Dismiss dialog and go back"),
+            &oracle,
+            &runner,
+            |_| {},
+        );
+        assert_eq!(outcome.status, "done", "{:?}", outcome.error);
+        assert_eq!(runner.clicks.get(), 2);
+        let seen = oracle.seen.borrow();
+        assert!(seen[1]["page"]["unavailable_click"]
+            .as_str()
+            .unwrap()
+            .contains("covered"));
+        assert!(seen[1]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|element| element
+                .as_str()
+                .is_some_and(|line| line.contains("Dismiss dialog"))));
+    }
+
+    #[test]
+    fn fresh_model_can_finish_progressed_dialog_while_trigger_stays_covered() {
+        let mut runner = LoadingRunner::new(usize::MAX, false);
+        runner.dialog = true;
+        let oracle = FakeOracle::new(vec![("CLICK", Some("1")), ("DONE", None)]);
+        let mut emitted = Vec::new();
+        let outcome = run_goal_loop(&config("Open the dialog"), &oracle, &runner, |step| {
+            emitted.push(step.to_json())
+        });
+        assert_eq!(outcome.status, "done", "{:?}", outcome.error);
+        assert_eq!(runner.clicks.get(), 1);
+        assert_eq!(outcome.steps, emitted);
+        assert_eq!(outcome.steps.len(), 1);
+        let seen = oracle.seen.borrow();
+        assert!(seen[1]["page"]["unavailable_click"].is_string());
+        assert!(seen[1]["elements"].as_array().unwrap().iter().any(|entry| {
+            entry
+                .as_str()
+                .is_some_and(|line| line.contains("Dismiss dialog"))
+        }));
+    }
+
+    #[test]
+    fn typed_local_probe_expiry_reports_cap_before_wall_clock_expiry() {
+        struct EarlyExpiry(LoadingRunner);
+        impl CommandRunner for EarlyExpiry {
+            fn run(
+                &self,
+                words: &[String],
+                deadline: Instant,
+            ) -> Result<Response, CommandRunError> {
+                self.0.run(words, deadline)
+            }
+            fn final_url(&self, deadline: Instant) -> Result<Response, CommandRunError> {
+                self.0.final_url(deadline)
+            }
+            fn observe_command(
+                &self,
+                words: &[String],
+                deadline: Instant,
+            ) -> Result<Response, CommandRunError> {
+                self.0.observe_command(words, deadline)
+            }
+            fn probe_target(
+                &self,
+                _: &str,
+                _: Option<&Value>,
+                _: Instant,
+            ) -> Result<TargetProbe, CommandRunError> {
+                Err(CommandRunError::Timeout)
+            }
+            fn click_with_guard(
+                &self,
+                words: &[String],
+                identity: Option<&Value>,
+                deadline: Instant,
+            ) -> Result<Response, CommandRunError> {
+                self.0.click_with_guard(words, identity, deadline)
+            }
+        }
+        let runner = EarlyExpiry(LoadingRunner::new(0, false));
+        let global = Instant::now() + Duration::from_secs(2);
+        let previous = observe(&runner, global).unwrap();
+        let local = Instant::now() + Duration::from_millis(500);
+        let mut last = LastClick {
+            ref_id: "e1".into(),
+            identity: Some(json!({"node":1})),
+            before_fingerprint: previous.fingerprint.clone(),
+            before_content: relevant_page_content(&previous),
+            wait_until: local,
+            ready_samples: 0,
+            last_detail: None,
+            cap_reported: false,
+            retired: false,
+            ready_observed: false,
+            progressed: false,
+        };
+        let page = refresh_after_click(&runner, &mut last, &previous, global).unwrap();
+        assert!(
+            Instant::now() < local,
+            "typed deadline should not need wall-clock expiry"
+        );
+        assert!(last.cap_reported);
+        assert_eq!(page.unavailable_click_ref.as_deref(), Some("e1"));
+    }
+
+    #[test]
+    fn covered_target_cap_does_not_renew_on_reobservation() {
+        let runner = LoadingRunner::new(usize::MAX, false);
+        runner.phase.set(1);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let previous = observe(&runner, deadline).unwrap();
+        let last = LastClick {
+            ref_id: "e1".into(),
+            identity: Some(json!({"node":1})),
+            before_fingerprint: fingerprint("https://fixture.invalid/calendar", MONTH_JUNE),
+            before_content: relevant_page_content(&previous),
+            wait_until: Instant::now() + Duration::from_millis(30),
+            ready_samples: 0,
+            last_detail: None,
+            cap_reported: false,
+            retired: false,
+            ready_observed: false,
+            progressed: false,
+        };
+        let mut last = last;
+        let first = refresh_after_click(&runner, &mut last, &previous, deadline).unwrap();
+        assert_eq!(first.unavailable_click_ref.as_deref(), Some("e1"));
+        let first_probes = runner.probes.get();
+        let second = refresh_after_click(&runner, &mut last, &first, deadline).unwrap();
+        assert_eq!(second.unavailable_click_ref.as_deref(), Some("e1"));
+        assert_eq!(runner.probes.get(), first_probes);
+        let (_, questions, _) = build_request("Go back", &second, &[]);
+        assert!(questions["operation"]["criteria"].get("CLICK").is_none());
+        assert!(second.unavailable_reason.unwrap().contains("spinner"));
+    }
+
+    #[test]
+    fn flickering_readiness_requires_consecutive_ready_samples() {
+        struct FlickerRunner {
+            states: std::cell::RefCell<std::collections::VecDeque<TargetReadiness>>,
+            probes: std::cell::Cell<usize>,
+        }
+        impl CommandRunner for FlickerRunner {
+            fn run(
+                &self,
+                words: &[String],
+                _deadline: Instant,
+            ) -> Result<Response, CommandRunError> {
+                match words[0].as_str() {
+                    "snapshot" => LoadingRunner::response(json!({"snapshot":MONTH_MAY})),
+                    "get" if words[1] == "url" => {
+                        LoadingRunner::response(json!({"url":"https://fixture.invalid/calendar"}))
+                    }
+                    "get" => LoadingRunner::response(json!({"title":"Calendar"})),
+                    _ => panic!("unexpected action"),
+                }
+            }
+            fn final_url(&self, _deadline: Instant) -> Result<Response, CommandRunError> {
+                LoadingRunner::response(json!({"url":"https://fixture.invalid/calendar"}))
+            }
+            fn observe_command(
+                &self,
+                words: &[String],
+                deadline: Instant,
+            ) -> Result<Response, CommandRunError> {
+                self.run(words, deadline)
+            }
+            fn probe_target(
+                &self,
+                _ref_id: &str,
+                _expected: Option<&Value>,
+                _deadline: Instant,
+            ) -> Result<TargetProbe, CommandRunError> {
+                self.probes.set(self.probes.get() + 1);
+                Ok(TargetProbe {
+                    status: self
+                        .states
+                        .borrow_mut()
+                        .pop_front()
+                        .unwrap_or(TargetReadiness::Ready),
+                    identity: Some(json!({"node":1})),
+                    detail: None,
+                    covering_interface: false,
+                })
+            }
+            fn click_with_guard(
+                &self,
+                words: &[String],
+                _identity: Option<&Value>,
+                deadline: Instant,
+            ) -> Result<Response, CommandRunError> {
+                self.run(words, deadline)
+            }
+        }
+        let runner = FlickerRunner {
+            states: std::cell::RefCell::new(
+                [
+                    TargetReadiness::Ready,
+                    TargetReadiness::Covered,
+                    TargetReadiness::Ready,
+                    TargetReadiness::Ready,
+                ]
+                .into(),
+            ),
+            probes: std::cell::Cell::new(0),
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let previous = observe(&runner, deadline).unwrap();
+        let mut last = LastClick {
+            ref_id: "e1".into(),
+            identity: Some(json!({"node":1})),
+            before_fingerprint: fingerprint("https://fixture.invalid/calendar", MONTH_JUNE),
+            before_content: relevant_page_content(&previous),
+            wait_until: Instant::now() + Duration::from_millis(500),
+            ready_samples: 0,
+            last_detail: None,
+            cap_reported: false,
+            retired: false,
+            ready_observed: false,
+            progressed: false,
+        };
+        let page = refresh_after_click(&runner, &mut last, &previous, deadline).unwrap();
+        assert_eq!(runner.probes.get(), 4);
+        assert!(page.unavailable_click_ref.is_none());
+        assert!(page.text.contains("May"));
+    }
+
+    #[test]
+    fn unresolved_spinner_does_not_accept_terminal_done() {
+        let runner = LoadingRunner::new(usize::MAX, false);
+        let oracle = FakeOracle::new(vec![("CLICK", Some("1")), ("DONE", None)]);
+        let outcome = run_goal_loop(&config("Go back one month"), &oracle, &runner, |_| {});
+        assert_eq!(outcome.status, "blocked");
+        assert_eq!(runner.clicks.get(), 1);
+        assert_eq!(outcome.steps.len(), 1);
+        assert!(outcome.error.unwrap().contains("not verified ready"));
+    }
+
+    #[test]
+    fn malformed_or_missing_native_probe_is_never_ready() {
+        assert_eq!(
+            TargetProbe::from_response(Some(&json!({"status":"ready"}))).status,
+            TargetReadiness::Unknown
+        );
+        assert_eq!(
+            TargetProbe::from_response(Some(&json!({"status":"surprising","identity":{}}))).status,
+            TargetReadiness::Unknown
+        );
+        assert_eq!(
+            TargetProbe::from_response(None).status,
+            TargetReadiness::Unknown
+        );
+    }
+
     #[test]
     fn loop_executes_chosen_targets_by_ref_and_stops_on_done() {
         let daemon = FakeDaemon::new(vec![FORM, FORM, RESULTS]);
@@ -3757,15 +5927,23 @@ mod tests {
         const NEW_URL: &str = "https://example.com/results";
         let daemon = FakeDaemon::new(vec![FORM, RESULTS]);
         let live_url = std::rc::Rc::new(std::cell::Cell::new(OLD_URL));
-        let mut oracle = FakeOracle::new(vec![("CLICK", Some("2")), ("DONE", None)]);
+        let mut oracle =
+            FakeOracle::new(vec![("CLICK", Some("2")), ("DONE", None), ("DONE", None)]);
         let decision_url = live_url.clone();
+        let decision_count = std::rc::Rc::new(std::cell::Cell::new(0));
+        let hook_count = decision_count.clone();
         oracle.on_evaluate = Some(Box::new(move |state| {
             if !state["recent_actions"].as_array().unwrap().is_empty() {
-                // The post-click snapshot has changed, but its observed URL
-                // still predates the navigation that completes during DONE.
-                assert_eq!(state["page"]["url"], OLD_URL);
+                let count = hook_count.get();
+                hook_count.set(count + 1);
+                assert_eq!(
+                    state["page"]["url"],
+                    if count == 0 { OLD_URL } else { NEW_URL }
+                );
                 assert!(state["page"]["text"].as_str().unwrap().contains("Results"));
-                decision_url.set(NEW_URL);
+                if count == 0 {
+                    decision_url.set(NEW_URL);
+                }
             }
         }));
         let calls = std::cell::RefCell::new(Vec::new());
@@ -3787,27 +5965,14 @@ mod tests {
         assert_eq!(outcome.url, NEW_URL);
         assert_eq!(outcome.error, None);
         assert_eq!(outcome.confirmation, None);
-        assert_eq!(outcome.stale_decisions, 0);
+        assert_eq!(outcome.stale_decisions, 1);
         assert_eq!(outcome.steps.len(), 1);
         assert_eq!(outcome.steps[0]["url"], OLD_URL);
         assert_eq!(outcome.steps[0]["pageChanged"], true);
         assert_eq!(outcome.steps, emitted, "emitted history stays unchanged");
-        assert_eq!(oracle.seen.borrow().len(), 2);
+        assert_eq!(oracle.seen.borrow().len(), 3);
         assert_eq!(*daemon.commands.borrow(), vec!["click @e4"]);
-        assert_eq!(
-            *daemon.requests.borrow(),
-            vec![
-                "snapshot",
-                "get url",
-                "get title",
-                "click @e4",
-                "snapshot",
-                "get url",
-                "get title",
-                "get url",
-            ],
-            "DONE performs exactly one URL read and no other observation or action"
-        );
+        assert_eq!(daemon.requests.borrow().last().unwrap(), "get url");
         let calls = calls.borrow();
         let (read_started, read_deadline) = calls.last().unwrap();
         assert!(
@@ -3850,6 +6015,29 @@ mod tests {
                     code: None,
                     warning: None,
                 })
+            }
+            fn observe_command(
+                &self,
+                words: &[String],
+                deadline: Instant,
+            ) -> Result<Response, CommandRunError> {
+                self.run(words, deadline)
+            }
+            fn probe_target(
+                &self,
+                _ref_id: &str,
+                _expected: Option<&Value>,
+                _deadline: Instant,
+            ) -> Result<TargetProbe, CommandRunError> {
+                Ok(TargetProbe::unknown())
+            }
+            fn click_with_guard(
+                &self,
+                words: &[String],
+                _identity: Option<&Value>,
+                deadline: Instant,
+            ) -> Result<Response, CommandRunError> {
+                self.run(words, deadline)
             }
         }
 
@@ -4002,7 +6190,7 @@ mod tests {
                     return Ok(response);
                 }
                 url_reads.set(url_reads.get() + 1);
-                if url_reads.get() != 3 {
+                if url_reads.get() != 6 {
                     return Ok(response);
                 }
                 response.data = match failure {
@@ -4073,18 +6261,19 @@ mod tests {
             assert_eq!(oracle.seen.borrow().len(), 2, "{failure}");
             assert_eq!(*daemon.commands.borrow(), vec!["click @e4"], "{failure}");
             assert_eq!(
-                *daemon.requests.borrow(),
-                vec![
-                    "snapshot",
-                    "get url",
-                    "get title",
-                    "click @e4",
-                    "snapshot",
-                    "get url",
-                    "get title",
-                    "get url",
-                ],
-                "{failure}: no retry or extra observation"
+                daemon
+                    .requests
+                    .borrow()
+                    .iter()
+                    .filter(|command| *command == "click @e4")
+                    .count(),
+                1,
+                "{failure}: no action replay"
+            );
+            assert_eq!(
+                daemon.requests.borrow().last().unwrap(),
+                "get url",
+                "{failure}: final read is last"
             );
         }
     }
@@ -4400,16 +6589,13 @@ mod tests {
         assert_eq!(*daemon.commands.borrow(), vec!["click @e4"]);
         assert!(outcome.error.unwrap().contains("1-step budget"));
         assert_eq!(
-            *daemon.requests.borrow(),
-            vec![
-                "snapshot",
-                "get url",
-                "get title",
-                "click @e4",
-                "snapshot",
-                "get url",
-                "get title",
-            ]
+            daemon
+                .requests
+                .borrow()
+                .iter()
+                .filter(|command| command.starts_with("click"))
+                .count(),
+            1
         );
     }
 

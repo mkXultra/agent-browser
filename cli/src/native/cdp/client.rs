@@ -470,6 +470,20 @@ impl CdpClient {
         params: Option<Value>,
         session_id: Option<&str>,
     ) -> Result<Value, String> {
+        self.send_command_inner(method, params, session_id, None)
+            .await
+    }
+
+    async fn send_command_inner(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        session_id: Option<&str>,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Value, String> {
+        if deadline.is_some_and(|limit| std::time::Instant::now() >= limit) {
+            return Err("Goal deadline expired before CDP send".into());
+        }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
         let cmd = CdpCommand {
@@ -495,6 +509,11 @@ impl CdpClient {
             let mut ws_tx = self.ws_tx.lock().await;
             self.ensure_open()?;
             let mut pending = self.pending.lock().await;
+            // Lock acquisition can resume after the goal deadline. Check at
+            // the last synchronous point before the guarded input is queued.
+            if deadline.is_some_and(|limit| std::time::Instant::now() >= limit) {
+                return Err("Goal deadline expired before CDP send".into());
+            }
             pending.insert(id, tx);
             drop(pending);
             if let Err(error) = ws_tx.send(Message::Text(json)).await {
@@ -579,6 +598,24 @@ impl CdpClient {
             .map_err(|e| format!("Failed to serialize params: {}", e))?;
         let result = self
             .send_command(method, Some(params_value), session_id)
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|e| format!("Failed to deserialize CDP response for {}: {}", method, e))
+    }
+
+    /// Guarded goal input uses this path so waiting for CDP sender locks
+    /// cannot initiate browser input after its absolute deadline.
+    pub async fn send_command_typed_before<P: serde::Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        params: &P,
+        session_id: Option<&str>,
+        deadline: std::time::Instant,
+    ) -> Result<R, String> {
+        let params_value = serde_json::to_value(params)
+            .map_err(|e| format!("Failed to serialize params: {}", e))?;
+        let result = self
+            .send_command_inner(method, Some(params_value), session_id, Some(deadline))
             .await?;
         serde_json::from_value(result)
             .map_err(|e| format!("Failed to deserialize CDP response for {}: {}", method, e))
@@ -745,6 +782,82 @@ mod tests {
             None
         );
         assert_eq!(extract_command_id(r#"{"id":0,"result":{}}"#), None);
+    }
+
+    #[tokio::test]
+    async fn guarded_input_expiring_behind_sender_lock_never_reaches_websocket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            tokio::time::timeout(Duration::from_millis(120), ws.next())
+                .await
+                .is_err()
+        });
+        let client = Arc::new(CdpClient::connect(&url).await.unwrap());
+        let sender_lock = client.ws_tx.lock().await;
+        let sending = client.clone();
+        let task = tokio::spawn(async move {
+            sending
+                .send_command_typed_before::<_, Value>(
+                    "Input.dispatchMouseEvent",
+                    &json!({"type":"mouseReleased","x":42,"y":42}),
+                    None,
+                    std::time::Instant::now() + Duration::from_millis(25),
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        drop(sender_lock);
+        let error = task.await.unwrap().unwrap_err();
+        assert!(
+            error.contains("deadline expired before CDP send"),
+            "{error}"
+        );
+        assert_eq!(client.pending_len().await, 0);
+        assert!(
+            server.await.unwrap(),
+            "expired input was sent to the browser"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn guarded_exact_node_scroll_cannot_enqueue_after_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            tokio::time::timeout(Duration::from_millis(140), ws.next())
+                .await
+                .is_err()
+        });
+        let client = Arc::new(CdpClient::connect(&url).await.unwrap());
+        let expired = std::time::Instant::now() - Duration::from_millis(1);
+        assert!(
+            crate::native::element::scroll_goal_node_into_view(&client, "s1", 42, expired)
+                .await
+                .is_err()
+        );
+        let sender_lock = client.ws_tx.lock().await;
+        let sending = client.clone();
+        let task = tokio::spawn(async move {
+            crate::native::element::scroll_goal_node_into_view(
+                &sending,
+                "s1",
+                42,
+                std::time::Instant::now() + Duration::from_millis(25),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        drop(sender_lock);
+        // The sender lock is available when the task resumes, but its timer
+        // is also ready. The enqueue gate must win over timeout_at poll order.
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(task.await.unwrap().is_err());
+        assert!(server.await.unwrap(), "late exact-node scroll reached CDP");
     }
 
     #[tokio::test]

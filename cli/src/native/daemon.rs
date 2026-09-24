@@ -13,7 +13,7 @@ use tokio::sync::{Notify, RwLock};
 
 use super::actions::{
     auto_save_restore_state, close_all_browser_backends, close_current_browser, execute_command,
-    maybe_autosave_restore_state, DaemonState,
+    goal_deadline_remaining, maybe_autosave_restore_state, DaemonState,
 };
 use super::cdp::client::CdpClient;
 use super::state;
@@ -549,14 +549,49 @@ async fn handle_connection<S>(
                     .unwrap_or_default()
                     .to_string();
 
-                let response = {
-                    let mut s = state.lock().await;
+                // A private goal request cannot restart its allowance after
+                // waiting behind another command's state lock. Confirmations
+                // carry the pending command's deadline into execute_command.
+                let locked = if cmd.get("goalDeadlineUnixMs").is_some() {
+                    let mut watch_disconnect = true;
+                    loop {
+                        let Ok(remaining) = goal_deadline_remaining(&cmd) else {
+                            break None;
+                        };
+                        tokio::select! {
+                            biased;
+                            _ = tokio::time::sleep(remaining) => break None,
+                            buffered = buf_reader.fill_buf(), if watch_disconnect => {
+                                match buffered {
+                                    Ok([]) => break None,
+                                    // A pipelined next command must stay in the
+                                    // buffer, but is not a disconnect signal.
+                                    Ok(_) => watch_disconnect = false,
+                                    // A reset client cannot receive this result.
+                                    // Never let its queued private read reach
+                                    // policy or browser work after a read error.
+                                    Err(_) => break None,
+                                }
+                            }
+                            guard = state.lock() => break Some(guard),
+                        }
+                    }
+                } else {
+                    Some(state.lock().await)
+                };
+                let response = if let Some(mut s) = locked {
                     let response = execute_command(&cmd, &mut s).await;
                     // Refresh while the state lock is still held. An idle
                     // timer waiting on this command will observe the updated
                     // clock as soon as it acquires the lock.
                     idle_activity.mark();
                     response
+                } else {
+                    serde_json::json!({
+                        "id": cmd.get("id"),
+                        "success": false,
+                        "error": "Goal deadline expired before daemon execution"
+                    })
                 };
 
                 let mut resp = serde_json::to_string(&response).unwrap_or_default();
@@ -676,6 +711,153 @@ fn get_port_for_session(session: &str) -> u16 {
 mod tests {
     #[allow(unused_imports)]
     use super::*;
+
+    async fn queued_private_goal_read_never_reaches_policy(disconnect: bool) {
+        let policy = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(policy.path(), r#"{"confirm":["snapshot"]}"#).unwrap();
+        let mut initial = DaemonState::new();
+        initial.policy = Some(
+            crate::native::policy::ActionPolicy::load(policy.path().to_str().unwrap()).unwrap(),
+        );
+        let state = Arc::new(tokio::sync::Mutex::new(initial));
+        let held = state.lock().await;
+        let (mut client, daemon) = tokio::io::duplex(8192);
+        let task = tokio::spawn(handle_connection(
+            daemon,
+            state.clone(),
+            Arc::new(IdleActivity::new()),
+            None,
+            Arc::new(Notify::new()),
+        ));
+        let expiry = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + if disconnect { 1000 } else { 50 };
+        let request = serde_json::json!({
+            "id":"queued-goal", "action":"snapshot", "goalExistingOnly":true,
+            "goalTimeoutMs":1000, "goalDeadlineUnixMs":expiry
+        });
+        client
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+        if disconnect {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(client);
+        } else {
+            let mut response = String::new();
+            tokio::time::timeout(
+                Duration::from_millis(300),
+                BufReader::new(&mut client).read_line(&mut response),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(response.contains("Goal deadline expired"), "{response}");
+            drop(client);
+        }
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(state.lock().await.pending_confirmation.is_none());
+    }
+
+    #[tokio::test]
+    async fn private_goal_read_expiring_in_state_queue_does_no_late_work() {
+        queued_private_goal_read_never_reaches_policy(false).await;
+    }
+
+    #[tokio::test]
+    async fn disconnected_private_goal_read_does_no_late_work() {
+        queued_private_goal_read_never_reaches_policy(true).await;
+    }
+
+    #[tokio::test]
+    async fn reset_error_while_private_read_is_queued_never_reaches_policy() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+        // The first poll supplies a complete request. The disconnect watch's
+        // next read deterministically returns the reset error that a real
+        // Unix client with an unread prior response can produce.
+        struct ResetAfterRequest {
+            request: Vec<u8>,
+            offset: usize,
+        }
+        impl AsyncRead for ResetAfterRequest {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                if self.offset == self.request.len() {
+                    return Poll::Ready(Err(std::io::ErrorKind::ConnectionReset.into()));
+                }
+                let remaining = &self.request[self.offset..];
+                let count = remaining.len().min(buf.remaining());
+                buf.put_slice(&remaining[..count]);
+                self.offset += count;
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl AsyncWrite for ResetAfterRequest {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Poll::Ready(Ok(bytes.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let policy = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(policy.path(), r#"{"confirm":["snapshot"]}"#).unwrap();
+        let mut initial = DaemonState::new();
+        initial.policy = Some(
+            crate::native::policy::ActionPolicy::load(policy.path().to_str().unwrap()).unwrap(),
+        );
+        let state = Arc::new(tokio::sync::Mutex::new(initial));
+        let held = state.lock().await;
+        let expiry = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 1000;
+        let request = serde_json::json!({
+            "id":"queued-reset", "action":"snapshot", "goalExistingOnly":true,
+            "goalTimeoutMs":1000, "goalDeadlineUnixMs":expiry
+        });
+        let stream = ResetAfterRequest {
+            request: format!("{request}\n").into_bytes(),
+            offset: 0,
+        };
+        let task = tokio::spawn(handle_connection(
+            stream,
+            state.clone(),
+            Arc::new(IdleActivity::new()),
+            None,
+            Arc::new(Notify::new()),
+        ));
+        tokio::time::timeout(Duration::from_millis(200), task)
+            .await
+            .expect("reset must cancel queued read without waiting for state")
+            .unwrap();
+        drop(held);
+        assert!(state.lock().await.pending_confirmation.is_none());
+    }
 
     /// Exercise the actual per-connection executor and its shared state lock.
     /// Keeping the first executor as a pinned future lets the fixture make a

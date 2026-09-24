@@ -32,6 +32,14 @@ pub struct PendingRelease {
     pub button: String,
 }
 
+/// Coordinates and renderer identity established before click dispatch.
+pub struct ClickPoint<'a> {
+    pub page_session: &'a str,
+    pub target_session: &'a str,
+    pub x: f64,
+    pub y: f64,
+}
+
 pub async fn click(
     client: &CdpClient,
     session_id: &str,
@@ -49,23 +57,69 @@ pub async fn click(
         iframe_sessions,
     )
     .await?;
+    click_at_inner(
+        client,
+        ClickPoint {
+            page_session: session_id,
+            target_session: &effective_session_id,
+            x,
+            y,
+        },
+        (button, click_count),
+        iframe_sessions,
+        None,
+    )
+    .await
+}
+
+/// A goal click uses the verified point with a shared deadline through both
+/// press and release. The caller has already scrolled and re-probed the node.
+pub async fn click_at_before(
+    client: &CdpClient,
+    point: ClickPoint<'_>,
+    button: &str,
+    click_count: i32,
+    iframe_sessions: &HashMap<String, String>,
+    deadline: std::time::Instant,
+) -> Result<ClickResult, String> {
+    click_at_inner(
+        client,
+        point,
+        (button, click_count),
+        iframe_sessions,
+        Some(deadline),
+    )
+    .await
+}
+
+async fn click_at_inner(
+    client: &CdpClient,
+    point: ClickPoint<'_>,
+    click: (&str, i32),
+    iframe_sessions: &HashMap<String, String>,
+    deadline: Option<std::time::Instant>,
+) -> Result<ClickResult, String> {
     // A click-triggered dialog can fire on the frame's own session (OOPIF) or
     // on the top-level page session; both count as "ours". A dialog on any
     // other session belongs to a background tab and must not abort this click.
-    let offset =
-        session_viewport_offset(client, session_id, &effective_session_id, iframe_sessions).await?;
+    let offset = session_viewport_offset(
+        client,
+        point.page_session,
+        point.target_session,
+        iframe_sessions,
+    )
+    .await?;
     let mut result = dispatch_click(
         client,
-        &effective_session_id,
-        &[effective_session_id.as_str(), session_id],
-        x,
-        y,
-        button,
-        click_count,
+        point.target_session,
+        &[point.target_session, point.page_session],
+        (point.x, point.y),
+        click,
+        deadline,
     )
     .await?;
     // Compute before dispatch: a click may navigate or open a blocking dialog.
-    result.position = (x + offset.0, y + offset.1);
+    result.position = (point.x + offset.0, point.y + offset.1);
     (result.x, result.y) = result.position;
     Ok(result)
 }
@@ -1056,13 +1110,32 @@ async fn dispatch_mouse_or_dialog(
     session_id: &str,
     accept_sessions: &[&str],
     params: &DispatchMouseEventParams,
+    deadline: Option<std::time::Instant>,
 ) -> Result<bool, String> {
     use tokio::sync::broadcast::error::RecvError;
 
     // Subscribe before sending so the dialog event cannot slip past us.
     let mut events = client.subscribe();
-    let send =
-        client.send_command_typed::<_, Value>("Input.dispatchMouseEvent", params, Some(session_id));
+    let send = async {
+        if let Some(limit) = deadline {
+            client
+                .send_command_typed_before::<_, Value>(
+                    "Input.dispatchMouseEvent",
+                    params,
+                    Some(session_id),
+                    limit,
+                )
+                .await
+        } else {
+            client
+                .send_command_typed::<_, Value>(
+                    "Input.dispatchMouseEvent",
+                    params,
+                    Some(session_id),
+                )
+                .await
+        }
+    };
     tokio::pin!(send);
     loop {
         tokio::select! {
@@ -1102,30 +1175,41 @@ async fn dispatch_click(
     client: &CdpClient,
     session_id: &str,
     accept_sessions: &[&str],
-    x: f64,
-    y: f64,
-    button: &str,
-    click_count: i32,
+    point: (f64, f64),
+    click: (&str, i32),
+    deadline: Option<std::time::Instant>,
 ) -> Result<ClickResult, String> {
-    // Move
-    if dispatch_mouse_or_dialog(
-        client,
-        session_id,
-        accept_sessions,
-        &DispatchMouseEventParams {
-            event_type: "mouseMoved".to_string(),
-            x,
-            y,
-            button: None,
-            buttons: None,
-            click_count: None,
-            delta_x: None,
-            delta_y: None,
-            modifiers: None,
-        },
-    )
-    .await?
-    {
+    let (x, y) = point;
+    let (button, click_count) = click;
+    // A guarded goal click uses the freshly hit-tested point directly. There
+    // is no pre-press CDP round trip during which a timed-out goal could later
+    // dispatch a mutation. Ordinary clicks retain their usual mouse move.
+    let moved = async {
+        dispatch_mouse_or_dialog(
+            client,
+            session_id,
+            accept_sessions,
+            &DispatchMouseEventParams {
+                event_type: "mouseMoved".to_string(),
+                x,
+                y,
+                button: None,
+                buttons: None,
+                click_count: None,
+                delta_x: None,
+                delta_y: None,
+                modifiers: None,
+            },
+            None,
+        )
+        .await
+    };
+    let moved = if deadline.is_none() {
+        moved.await?
+    } else {
+        false
+    };
+    if moved {
         // No button was pressed yet, nothing to release.
         return Ok(ClickResult {
             position: (x, y),
@@ -1143,25 +1227,44 @@ async fn dispatch_click(
         _ => 1,
     };
 
+    if deadline.is_some_and(|limit| std::time::Instant::now() >= limit) {
+        return Err("Goal deadline expired before click".into());
+    }
+
     // Press
-    if dispatch_mouse_or_dialog(
-        client,
-        session_id,
-        accept_sessions,
-        &DispatchMouseEventParams {
-            event_type: "mousePressed".to_string(),
-            x,
-            y,
-            button: Some(button.to_string()),
-            buttons: Some(button_value),
-            click_count: Some(click_count),
-            delta_x: None,
-            delta_y: None,
-            modifiers: None,
-        },
-    )
-    .await?
-    {
+    let press_params = DispatchMouseEventParams {
+        event_type: "mousePressed".to_string(),
+        x,
+        y,
+        button: Some(button.to_string()),
+        buttons: Some(button_value),
+        click_count: Some(click_count),
+        delta_x: None,
+        delta_y: None,
+        modifiers: None,
+    };
+    let pressed =
+        dispatch_mouse_or_dialog(client, session_id, accept_sessions, &press_params, deadline);
+    let pressed = if let Some(limit) = deadline {
+        match tokio::time::timeout_at(tokio::time::Instant::from_std(limit), pressed).await {
+            Ok(Ok(pressed)) => pressed,
+            Ok(Err(_)) => {
+                release_uncertain_goal_press(client, session_id, button).await;
+                return Err(GOAL_INPUT_UNCERTAIN.into());
+            }
+            Err(_) => {
+                release_uncertain_goal_press(client, session_id, button).await;
+                return Err(GOAL_INPUT_UNCERTAIN.into());
+            }
+        }
+    } else {
+        pressed.await?
+    };
+    if deadline.is_some_and(|limit| std::time::Instant::now() >= limit) {
+        release_uncertain_goal_press(client, session_id, button).await;
+        return Err(GOAL_INPUT_UNCERTAIN.into());
+    }
+    if pressed {
         // Dialog opened from the mousedown handler: the button is held and the
         // release will never arrive on its own. Hand the caller what it needs
         // to release once the dialog is resolved.
@@ -1182,23 +1285,48 @@ async fn dispatch_click(
 
     // Release. A dialog here fired from the click/mouseup handler, which runs
     // after the button is already up, so there is nothing left to release.
-    let dialog_opened = dispatch_mouse_or_dialog(
+    let release_params = DispatchMouseEventParams {
+        event_type: "mouseReleased".to_string(),
+        x,
+        y,
+        button: Some(button.to_string()),
+        buttons: Some(0),
+        click_count: Some(click_count),
+        delta_x: None,
+        delta_y: None,
+        modifiers: None,
+    };
+    // timeout_at polls a ready acknowledgement before its timer. This gate
+    // prevents a normal on-target release after the press deadline expired.
+    if deadline.is_some_and(|limit| std::time::Instant::now() >= limit) {
+        release_uncertain_goal_press(client, session_id, button).await;
+        return Err(GOAL_INPUT_UNCERTAIN.into());
+    }
+    let released = dispatch_mouse_or_dialog(
         client,
         session_id,
         accept_sessions,
-        &DispatchMouseEventParams {
-            event_type: "mouseReleased".to_string(),
-            x,
-            y,
-            button: Some(button.to_string()),
-            buttons: Some(0),
-            click_count: Some(click_count),
-            delta_x: None,
-            delta_y: None,
-            modifiers: None,
-        },
-    )
-    .await?;
+        &release_params,
+        deadline,
+    );
+    let dialog_opened = if let Some(limit) = deadline {
+        match tokio::time::timeout_at(tokio::time::Instant::from_std(limit), released).await {
+            Ok(Ok(released)) => released,
+            Ok(Err(_)) => {
+                release_uncertain_goal_press(client, session_id, button).await;
+                return Err(GOAL_INPUT_UNCERTAIN.into());
+            }
+            Err(_) => {
+                release_uncertain_goal_press(client, session_id, button).await;
+                return Err(GOAL_INPUT_UNCERTAIN.into());
+            }
+        }
+    } else {
+        released.await?
+    };
+    if deadline.is_some_and(|limit| std::time::Instant::now() >= limit) {
+        return Err(GOAL_INPUT_UNCERTAIN.into());
+    }
     Ok(ClickResult {
         position: (x, y),
         dialog_opened,
@@ -1207,6 +1335,60 @@ async fn dispatch_click(
         y,
         button_pressed: true,
     })
+}
+
+/// Hover at the checked point before a guarded click's final native probe.
+/// The final probe then sees hover-driven overlays or layout changes.
+pub async fn hover_goal_point_before(
+    client: &CdpClient,
+    session: &str,
+    point: (f64, f64),
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    let params = DispatchMouseEventParams {
+        event_type: "mouseMoved".to_string(),
+        x: point.0,
+        y: point.1,
+        button: None,
+        buttons: None,
+        click_count: None,
+        delta_x: None,
+        delta_y: None,
+        modifiers: None,
+    };
+    let dialog = tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline),
+        dispatch_mouse_or_dialog(client, session, &[session], &params, Some(deadline)),
+    )
+    .await
+    .map_err(|_| "Goal deadline expired before click")??;
+    if dialog {
+        Err("Goal hover opened a dialog before click".into())
+    } else {
+        Ok(())
+    }
+}
+
+/// A press or release may already be queued in Chrome when its reply is late.
+/// Release away from the target to avoid intentionally firing its onclick.
+/// Pointer capture or an already processed release can still have effects, so
+/// callers must report uncertainty and must never replay the click.
+pub const GOAL_INPUT_UNCERTAIN: &str =
+    "Goal click outcome uncertain; input may have reached the browser";
+
+async fn release_uncertain_goal_press(client: &CdpClient, session: &str, button: &str) {
+    let _ = tokio::time::timeout(
+        tokio::time::Duration::from_millis(50),
+        client.send_command(
+            "Input.dispatchMouseEvent",
+            Some(serde_json::json!({
+                "type": "mouseReleased", "x": -1, "y": -1,
+                "button": button, "buttons": 0, "clickCount": 1
+            })),
+            Some(session),
+        ),
+    )
+    .await;
 }
 
 /// Best-effort mouseReleased to clear a button left logically down when a
@@ -1345,6 +1527,67 @@ fn named_key_info(key: &str) -> (String, String, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use serde_json::{json, Value};
+    use tokio::net::TcpListener;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ready_press_ack_after_deadline_cannot_dispatch_target_release() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let press = ws.next().await.unwrap().unwrap().into_text().unwrap();
+            let press: Value = serde_json::from_str(&press).unwrap();
+            assert_eq!(press["params"]["type"], "mousePressed");
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"id": press["id"], "result": {}}).to_string(),
+            ))
+            .await
+            .unwrap();
+            // On this single-thread runtime, the response is available when
+            // dispatch_click resumes, but its deadline has already passed.
+            std::thread::sleep(std::time::Duration::from_millis(45));
+            let mut releases = Vec::new();
+            while let Ok(Some(Ok(message))) =
+                tokio::time::timeout(std::time::Duration::from_millis(100), ws.next()).await
+            {
+                let command: Value = serde_json::from_str(&message.into_text().unwrap()).unwrap();
+                if command["params"]["type"] == "mouseReleased" {
+                    releases.push((
+                        command["params"]["x"].as_f64().unwrap(),
+                        command["params"]["y"].as_f64().unwrap(),
+                    ));
+                }
+                ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({"id": command["id"], "result": {}}).to_string(),
+                ))
+                .await
+                .unwrap();
+            }
+            releases
+        });
+        let client = CdpClient::connect(&url).await.unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
+        let error = dispatch_click(
+            &client,
+            "s1",
+            &["s1"],
+            (42.0, 42.0),
+            ("left", 1),
+            Some(deadline),
+        )
+        .await
+        .err()
+        .expect("expired press cannot complete a guarded click");
+        assert_eq!(error, GOAL_INPUT_UNCERTAIN);
+        let releases = server.await.unwrap();
+        assert!(
+            !releases.contains(&(42.0, 42.0)),
+            "normal target release escaped the deadline"
+        );
+    }
 
     #[test]
     fn scroll_result_distinguishes_movement_from_a_boundary_noop() {
